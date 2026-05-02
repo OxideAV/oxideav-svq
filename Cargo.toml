@@ -1,16 +1,16 @@
 [package]
-name = "oxideav-svq1"
+name = "oxideav-svq"
 version = "0.0.1"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT"
-repository = "https://github.com/OxideAV/oxideav-svq1"
+repository = "https://github.com/OxideAV/oxideav-svq"
 authors = ["Mark Karpeles"]
-description = "Pure-Rust Sorenson SVQ1 video decoder for the oxideav framework"
+description = "Pure-Rust Sorenson Video family decoder (SVQ1; SVQ3 planned) for the oxideav framework"
 
 readme = "README.md"
-homepage = "https://github.com/OxideAV/oxideav-svq1"
-keywords = ["multimedia", "svq1", "video", "codec", "quicktime"]
+homepage = "https://github.com/OxideAV/oxideav-svq"
+keywords = ["multimedia", "svq", "video", "codec", "quicktime"]
 categories = ["multimedia::encoding", "multimedia::video"]
 
 [dependencies]

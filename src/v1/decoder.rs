@@ -27,8 +27,8 @@ use oxideav_core::{
     CodecId, CodecParameters, Decoder, Error, Frame, Packet, PixelFormat, Result, VideoFrame,
 };
 
-use crate::header::{parse_header, FrameHeader, FrameType};
-use crate::vq::{crop_plane, decode_plane_flat, upsample_chroma_410_to_420, PlaneDims};
+use super::header::{parse_header, FrameHeader, FrameType};
+use super::vq::{crop_plane, decode_plane_flat, upsample_chroma_410_to_420, PlaneDims};
 
 /// Decoder state.
 #[derive(Debug)]

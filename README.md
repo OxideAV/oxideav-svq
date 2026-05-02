@@ -1,4 +1,4 @@
-# oxideav-svq1
+# oxideav-svq
 
 Pure-Rust **Sorenson Video 1 (SVQ1)** video decoder for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
@@ -70,7 +70,7 @@ mid-grey for the moment.
 ```toml
 [dependencies]
 oxideav-core = "0.1"
-oxideav-svq1 = "0.0"
+oxideav-svq = "0.0"
 ```
 
 ## Quick use
@@ -79,7 +79,7 @@ oxideav-svq1 = "0.0"
 use oxideav_core::CodecRegistry;
 
 let mut codecs = CodecRegistry::new();
-oxideav_svq1::register(&mut codecs);
+oxideav_svq::register(&mut codecs);
 ```
 
 The decoder claims the QuickTime FourCC `SVQ1` (and its lowercase

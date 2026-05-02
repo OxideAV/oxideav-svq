@@ -30,7 +30,7 @@
 //! `decode_plane_quadtree` and the recursion in [`Quadtree::walk`]
 //! will start consuming bits.
 
-use crate::codebook::{LEAF_DIMS, MAX_LEVEL};
+use super::codebook::{LEAF_DIMS, MAX_LEVEL};
 
 /// Round a positive integer up to the nearest multiple of `align`.
 #[inline]
