@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use oxideav_core::{CodecId, Decoder, Frame, Packet, TimeBase};
-use oxideav_svq::decoder::Svq1Decoder;
+use oxideav_svq::v1::decoder::Svq1Decoder;
 
 fn ffmpeg_available() -> bool {
     Command::new("ffmpeg")
