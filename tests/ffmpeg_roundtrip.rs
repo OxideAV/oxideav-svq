@@ -10,14 +10,16 @@
 //! 3. Compare the decoder's output planes to the original `testsrc`
 //!    decoded by ffmpeg back to `yuv420p` — measure PSNR.
 //!
-//! With the round-1 flat-fill body decoder the PSNR is the floor we
-//! get from "every plane is 128" — for `testsrc` that's roughly
-//! 7-12 dB, but the test only asserts that the test ran end-to-end
-//! without errors and that PSNR is finite (i.e. the decoded planes
-//! actually have the declared shape and `width × height`).
+//! With the round-2 partial decoder (VLC + multistage walker + the four
+//! 4×2 / 4×4 / 8×4 / 8×8 codebooks landed; the L=4/5 codebooks remain
+//! BLOCKED on a trace-doc gap) the PSNR for testsrc is roughly 9-12 dB
+//! — bit-position correct but pixel-correct only on leaves that descend
+//! to L=0..3. Solid-gray fixtures (where every leaf is L=5 mean-only)
+//! decode bit-exactly; see `tests/gray_fixture.rs` for that case.
 //!
-//! When the codebook lands and `decode_plane_quadtree` replaces
-//! `decode_plane_flat`, the assertion threshold tightens to ~25 dB.
+//! The threshold here only asserts end-to-end runnability and a finite
+//! positive PSNR; the bit-exact threshold lands when the L=4/5
+//! codebooks arrive in the trace doc.
 
 use std::fs;
 use std::path::PathBuf;

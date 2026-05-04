@@ -30,6 +30,8 @@
 pub mod codebook;
 pub mod decoder;
 pub mod header;
+pub mod tables;
+pub mod vlc;
 pub mod vq;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecRegistry, CodecTag};

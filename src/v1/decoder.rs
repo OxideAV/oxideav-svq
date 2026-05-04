@@ -1,8 +1,8 @@
 //! Top-level packet → `Frame::Video` decoder for SVQ1.
 //!
-//! This module wires together [`crate::header`] (frame header parse)
-//! and [`crate::vq`] (per-plane body walk + flat-fill fallback) into
-//! the [`oxideav_core::Decoder`] trait.
+//! This module wires together [`crate::v1::header`] (frame header parse)
+//! and [`crate::v1::vq`] (per-plane body walk) into the
+//! [`oxideav_core::Decoder`] trait.
 //!
 //! ## Output pipeline
 //!
@@ -13,10 +13,10 @@
 //!    width/height.
 //! 2. Build the three `Yuv410p` planes (luma at the declared size,
 //!    chroma at W/4 × H/4 with at-least-one-MB padding).
-//! 3. **Round-1 flat-fill**: each plane is filled with the per-
-//!    component midpoint (`128`). The body bits are not yet
-//!    semantically parsed pending the multistage VLC + codebook tables
-//!    becoming available — see [`crate::vq`] for the rationale.
+//! 3. **I-frame**: walk every MB through the hierarchical multistage
+//!    VQ decoder ([`crate::v1::vq::decode_plane_intra`]).
+//!    **P-frame**: round-2 falls back to flat-fill mid-grey at every
+//!    MB; motion comp + INTER VQ residual lands in round 3.
 //! 4. Crop padded planes back to declared dimensions; upsample chroma
 //!    2x in each axis to land on `Yuv420P` (the closest `oxideav_core`
 //!    pixel format to native 4:1:0).
@@ -28,7 +28,10 @@ use oxideav_core::{
 };
 
 use super::header::{parse_header, FrameHeader, FrameType};
-use super::vq::{crop_plane, decode_plane_flat, upsample_chroma_410_to_420, PlaneDims};
+use super::vq::{
+    crop_plane, decode_plane_flat, decode_plane_intra, upsample_chroma_410_to_420, PlaneDims,
+    VlcBundle,
+};
 
 /// Decoder state.
 #[derive(Debug)]
@@ -76,7 +79,7 @@ impl Decoder for Svq1Decoder {
                 Err(Error::NeedMore)
             };
         };
-        let (header, _br) = parse_header(&pkt.data, self.prev_dims)?;
+        let (header, mut br) = parse_header(&pkt.data, self.prev_dims)?;
 
         // Update reference dims when this frame is itself a reference,
         // or when we don't yet have any (P-non-ref frame as the first
@@ -85,7 +88,17 @@ impl Decoder for Svq1Decoder {
             self.prev_dims = Some((header.width, header.height));
         }
 
-        let frame = render_flat_fill(&header, pkt.pts);
+        let frame = match header.frame_type {
+            FrameType::Intra => render_intra(&header, pkt.pts, &mut br)?,
+            FrameType::Predicted | FrameType::PNonReference => {
+                // Round 2 stub: P-frames are decoded as flat-fill
+                // mid-grey. Motion compensation + INTER VQ residual
+                // arrive in round 3; until then the I-frame pipeline
+                // already exercises every VLC, every codebook, and
+                // every quad-tree branch.
+                render_flat_fill(&header, pkt.pts)
+            }
+        };
         Ok(Frame::Video(frame))
     }
 
@@ -102,18 +115,55 @@ impl Decoder for Svq1Decoder {
     }
 }
 
-/// Render the round-1 flat-fill `Yuv420P` frame for a parsed header.
+/// Render an I-frame by walking the per-plane multistage VQ tree.
+fn render_intra(
+    header: &FrameHeader,
+    pts: Option<i64>,
+    br: &mut oxideav_core::bits::BitReader<'_>,
+) -> Result<VideoFrame> {
+    let luma_dims = PlaneDims::for_luma(header.width, header.height);
+    let chroma_dims = PlaneDims::for_chroma(header.width, header.height);
+
+    let vlcs = VlcBundle::build();
+
+    let y_padded = decode_plane_intra(br, &vlcs, &luma_dims)?;
+    let u_padded = decode_plane_intra(br, &vlcs, &chroma_dims)?;
+    let v_padded = decode_plane_intra(br, &vlcs, &chroma_dims)?;
+
+    let y = crop_plane(&y_padded, &luma_dims);
+    let u_410 = crop_plane(&u_padded, &chroma_dims);
+    let v_410 = crop_plane(&v_padded, &chroma_dims);
+    let (u_420, c_w, _c_h) =
+        upsample_chroma_410_to_420(&u_410, &chroma_dims, header.width, header.height);
+    let (v_420, _, _) =
+        upsample_chroma_410_to_420(&v_410, &chroma_dims, header.width, header.height);
+
+    Ok(VideoFrame {
+        pts,
+        planes: vec![
+            VideoPlane {
+                stride: luma_dims.width,
+                data: y,
+            },
+            VideoPlane {
+                stride: c_w,
+                data: u_420,
+            },
+            VideoPlane {
+                stride: c_w,
+                data: v_420,
+            },
+        ],
+    })
+}
+
+/// Render a flat-fill `Yuv420P` frame for a parsed header (P-frame
+/// fallback in round 2).
 fn render_flat_fill(header: &FrameHeader, pts: Option<i64>) -> VideoFrame {
     let luma_dims = PlaneDims::for_luma(header.width, header.height);
     let chroma_dims = PlaneDims::for_chroma(header.width, header.height);
 
-    // INTRA mid-grey, INTER residual centre — both happen to be 128
-    // in unsigned-8-bit luma units. The sentinel is intentionally
-    // identical so the output remains a recognisable mid-grey card.
-    let luma_value = match header.frame_type {
-        FrameType::Intra => 128u8,
-        FrameType::Predicted | FrameType::PNonReference => 128u8,
-    };
+    let luma_value = 128u8;
     let chroma_value: u8 = 128;
 
     let y_padded = decode_plane_flat(&luma_dims, luma_value);
@@ -160,36 +210,41 @@ mod tests {
     use super::*;
     use oxideav_core::TimeBase;
 
-    /// Synthesise a minimal valid I-frame packet (same shape as
-    /// `header::tests::build_minimal_iframe`).
+    /// Synthesise a minimal valid I-frame packet (160×120, all-MB
+    /// flat-fill at mean=128).
+    ///
+    /// Body layout per MB (level 5 leaf): split=0; multistage L5
+    /// count=0 → "1" (1 bit); intra_mean(128) → row 128 of §14.4 =
+    /// "01001001" (8 bits). Total 10 bits/MB.
     fn minimal_iframe_packet() -> Vec<u8> {
-        let chunks: [(u64, u32); 9] = [
-            (0x20, 22),
-            (0, 8),
-            (0, 2),
-            (0b10, 2),
-            (0, 2),
-            (0, 1),
-            (0, 3),
-            (0, 1),
-            (0, 1),
-        ];
-        let mut acc: u128 = 0;
-        let mut bits: u32 = 0;
-        for &(v, n) in &chunks {
-            acc = (acc << n) | (v as u128);
-            bits += n;
+        use oxideav_core::bits::BitWriter;
+        let mut bw = BitWriter::new();
+        // Header chunks (same as header::tests::build_minimal_iframe):
+        bw.write_u32(0x20, 22);
+        bw.write_u32(0, 8);
+        bw.write_u32(0, 2); // frame_type=Intra
+        bw.write_u32(0b10, 2); // reserved
+        bw.write_u32(0, 2); // reserved
+        bw.write_u32(0, 1); // reserved
+        bw.write_u32(0, 3); // size_code=0 → 160x120
+        bw.write_u32(0, 1); // checksum_block_flag
+        bw.write_u32(0, 1); // extra_data_block_flag
+                            // Body: write per-MB pattern for all luma MBs (160x128 padded → 80 MBs)
+                            // and all chroma MBs (40x32 padded to 48x32 → 6 MBs each).
+                            // 160×120 luma → padded 160×128 → 80 MBs.
+        let luma_mbs = (160 / 16) * (128 / 16);
+        // 160×120 chroma at 4:1:0 → 40×30 → padded 48×32 → 6 MBs per chroma plane.
+        let chroma_padded_w = (40usize + 15) & !15;
+        let chroma_padded_h = (30usize + 15) & !15;
+        let chroma_mbs = (chroma_padded_w / 16) * (chroma_padded_h / 16);
+        for _ in 0..(luma_mbs + 2 * chroma_mbs) {
+            bw.write_bit(false); // split=0 at L5
+            bw.write_u32(0b1, 1); // multistage L5: count=0
+            bw.write_u32(0b0100_1001, 8); // intra_mean(128)
         }
-        let pad = (8 - bits % 8) % 8;
-        acc <<= pad;
-        let total_bytes = ((bits + pad) / 8) as usize;
-        let mut out = vec![0u8; total_bytes];
-        for i in 0..total_bytes {
-            let shift = (total_bytes - 1 - i) * 8;
-            out[i] = ((acc >> shift) & 0xff) as u8;
-        }
-        out.extend_from_slice(&[0u8; 4]);
-        out
+        // Pad some
+        bw.write_u32(0, 8);
+        bw.into_bytes()
     }
 
     #[test]
