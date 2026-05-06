@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-svq/compare/v0.0.1...v0.0.2) - 2026-05-06
+
+### Other
+
+- prepend retirement notice (docs audit 2026-05-06)
+
 ### Added (round 3 — diagnostic)
 
 - `tests/trace_first_mbs.rs` — bit-by-bit walker trace of the first 20
