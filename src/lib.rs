@@ -1,21 +1,26 @@
 //! Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec.
 //!
-//! **Round 3 — SVQ3 SEQH + slice-header parser, structural only.**
+//! **Round 4 — SVQ3 macroblock-type tree walk, structural only.**
 //!
-//! Round 2 wired SVQ1 into the framework registry. Round 3 adds the
-//! SVQ3 sequence-header (`SEQH` extradata) parser and the per-slice
-//! header parser per
-//! `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Sequence Header" /
-//! §"Slice Header", plus the SVQ3 `SVQ3` FourCC registration alongside
-//! SVQ1 in [`oxideav_core::CodecRegistry`]. The SVQ3 decoder reuses
-//! the SVQ1 framework plumbing but `receive_frame` continues to
-//! return [`oxideav_core::Error::Unsupported`] — round 3 is
-//! structural-only and the macroblock layer (motion compensation,
-//! residual / Golomb decode) is out of scope. See
-//! [`svq3::Svq3SequenceHeader`] and [`svq3::Svq3SliceHeader`] for the
-//! parsed shapes.
+//! Round 3 landed the SVQ3 sequence- and slice-header parsers. Round
+//! 4 adds the per-macroblock type-Golomb walk + classification per
+//! `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock layer",
+//! plus the two fixed tables documented in §"Intra macroblock
+//! information decoding" (the 25-entry intra-mode pair table and the
+//! 6×6×5 intra-mode context-lookup table) and the 4×4 intra scan
+//! order. The macroblock walker [`svq3_mb::read_mb_type`] decodes a
+//! single `ue(v)` exp-Golomb code, classifies it against the
+//! enclosing slice's frame type, and returns a typed
+//! [`svq3_mb::Svq3MbType`]. CBP / motion-vector / residual decoding
+//! remain out of scope — those sub-streams either depend on the
+//! H.264 CBP table (cross-spec back-reference) or on the SVQ3 MV
+//! component VLC, neither of which is exercised in round 4.
 //!
 //! ## Earlier rounds (carried forward)
+//!
+//! Round 3 — SVQ3 SEQH + slice-header parser, structural only.
+//! Round 2 wired SVQ1 into the framework registry, gated behind the
+//! default-on `registry` cargo feature.
 //!
 //! Round 2 — `oxideav-core` framework integration.
 //!
@@ -90,6 +95,7 @@ mod bitreader;
 mod error;
 mod header;
 pub mod svq3;
+pub mod svq3_mb;
 
 #[cfg(feature = "registry")]
 mod registry;

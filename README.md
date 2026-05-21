@@ -5,19 +5,31 @@ Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 
 ## Status
 
-**Round 3 — SVQ3 SEQH + slice-header parser (structural).** The
-SVQ3 family is now structurally parsed: `SEQH` extradata yields a
-typed `Svq3SequenceHeader` (frame-size code, dimensions, halfpel /
+**Round 4 — SVQ3 macroblock-type tree walk (structural).** The
+per-macroblock type-Golomb decode + classification from the wiki
+spec's §"Macroblock layer" now lands in the new `svq3_mb` module:
+`read_mb_type(&mut BitReader, Svq3FrameType)` walks a single `ue(v)`
+exp-Golomb code at the bit-reader cursor and returns a typed
+`Svq3MbType` (I-frame intra / P-frame inter / P-frame intra /
+B-frame inter / B-frame intra). The 25-entry intra-mode pair table,
+the 6×6×5 intra-mode context-lookup table, and the 4×4 intra
+sub-block scan order from §"Intra macroblock information decoding"
+land as `pub const` arrays alongside the walker. Round 4 remains
+structural — the macroblock payload past the type code (CBP / intra
+mode pair / motion vectors / residual coefficients) is not yet
+decoded; `Svq3DecoderHandle::receive_frame` continues to return
+`oxideav_core::Error::Unsupported`.
+
+Carried forward from round 3: **SVQ3 SEQH + slice-header parser
+(structural).** `SEQH` extradata yields a typed
+`Svq3SequenceHeader` (frame-size code, dimensions, halfpel /
 thirdpel-precision flags, no-B-frames flag, optional-byte trailer,
 protected flag) and each on-wire slice yields a typed
 `Svq3SliceHeader` (version, slice-size, frame type, frame number,
 slice quantiser, …) after the wiki spec's byte-permutation is
 reversed. The `SVQ3` FourCC is wired into
 [`oxideav_core::CodecRegistry`](https://docs.rs/oxideav-core)
-alongside SVQ1. `Svq3DecoderHandle::receive_frame` returns
-`oxideav_core::Error::Unsupported` — round 3 is structural-only and
-the macroblock layer (motion compensation, residual Golomb decode)
-is out of scope.
+alongside SVQ1.
 
 Carried forward from round 2: **`oxideav-core` framework
 integration** for SVQ1. The round-1 structural SVQ1 frame-header
@@ -81,6 +93,24 @@ What round 2 covers (carried from round 1):
 * Four documented structural error conditions plus the truncation
   guard.
 
+What round 4 adds on top of round 3:
+
+* The `svq3_mb` module: `read_mb_type` /
+  `classify_mb_type` walker + the typed `Svq3MbType` /
+  `IFrameMbType` / `PFrameInterMode` / `BFrameInterMode` enums and
+  the `is_intra` / `is_inter` / `is_skip` / `num_motion_vectors` /
+  `intra` predicate helpers.
+* `INTRA_PRED_PAIRS` (`[(u8, u8); 25]`), `INTRA_PRED_TABLE`
+  (`[[[i8; 5]; 6]; 6]`), `INTRA_4X4_SCAN_ORDER` (`[u8; 16]`) — the
+  three fixed tables from §"Intra macroblock information decoding"
+  landed verbatim for use by a future intra-prediction stage.
+* Per-slice constants: `I_FRAME_MB_TYPE_MAX = 25`,
+  `P_FRAME_MB_TYPE_MAX = 33`, `B_FRAME_MB_TYPE_MAX = 29`,
+  `P_FRAME_INTRA_OFFSET = 8`, `B_FRAME_INTRA_OFFSET = 4`.
+* +24 tests covering exhaustive code-table classification, Golomb
+  decode round-trips, MV-count predicates, table-shape invariants
+  (81 → 105 total).
+
 What round 3 adds on top of round 2:
 
 * The `svq3` module: typed `Svq3SequenceHeader` / `Svq3SliceHeader`
@@ -100,13 +130,24 @@ What round 3 adds on top of round 2:
 * +29 tests covering the new SEQH + slice-header + permutation +
   Golomb paths (52 → 81 total).
 
-What round 3 still does **not** cover:
+What round 4 still does **not** cover:
 
-* The SVQ3 macroblock-layer decode (motion compensation, residual
-  Golomb / VLC decode, intra prediction, dequantisation). Tracked
-  for a future round once the slice descramble algorithm is
-  documented and the wiki spec's macroblock-layer sections are
-  audited end-to-end.
+* CBP / luma intra mode / chroma DC. The wiki spec's CBP coding is
+  a back-reference to H.264; the intra-mode-pair Golomb walk is
+  documented but its decoded value maps to the
+  [`svq3_mb::INTRA_PRED_PAIRS`] table which round 4 lands without
+  also wiring the consumer.
+* Per-partition motion-vector decoding. The wiki spec describes the
+  precision-selector + signed-VLC layout for the MV component
+  differences but the underlying VLC table is not enumerated
+  bit-for-bit in `docs/`.
+* The coefficient Golomb codeword tables (codes for 2×2 chroma DC,
+  alternative-scan blocks, all other block types) are tabulated in
+  the wiki spec; round 4 leaves them for a follow-up round that
+  also tackles the quantiser table and the IDCT.
+* The SVQ3 macroblock-layer decode beyond the type-tree walk —
+  motion compensation, residual Golomb / VLC decode, intra
+  prediction, dequantisation. Tracked for a future round.
 * The SVQ3 protected-stream watermark sub-record. The
   variable-length-code encoding of the watermark width / height /
   unknown fields and the role of the deflated watermark image as
@@ -187,7 +228,30 @@ The standalone `svq3` module surface (always available):
 * `SVQ3_FOURCC_CODES` / `SVQ3_CODEC_ID_STR` re-exports at the
   crate root.
 
+The standalone `svq3_mb` module surface (always available):
+
+* `svq3_mb::read_mb_type(&mut BitReader, Svq3FrameType) ->
+  Result<Svq3MbType>` /
+  `svq3_mb::classify_mb_type(Svq3FrameType, u32) ->
+  Result<Svq3MbType>` — the macroblock-type Golomb walker + the
+  pre-decoded-code classifier.
+* `Svq3MbType` / `IFrameMbType` / `PFrameInterMode` /
+  `BFrameInterMode` enums + the predicate helpers `is_intra` /
+  `is_inter` / `is_skip` / `num_motion_vectors` / `intra`.
+* `svq3_mb::INTRA_PRED_PAIRS` (`[(u8, u8); 25]`) /
+  `svq3_mb::INTRA_PRED_TABLE` (`[[[i8; 5]; 6]; 6]`) /
+  `svq3_mb::INTRA_4X4_SCAN_ORDER` (`[u8; 16]`) — the three fixed
+  tables from §"Intra macroblock information decoding".
+* `svq3_mb::I_FRAME_MB_TYPE_MAX` / `P_FRAME_MB_TYPE_MAX` /
+  `B_FRAME_MB_TYPE_MAX` / `P_FRAME_INTRA_OFFSET` /
+  `B_FRAME_INTRA_OFFSET` constants.
+
 ## Clean-room provenance
+
+Round 4 was implemented strictly from
+`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock layer" /
+§"Intra macroblock information decoding" of the same local mirror
+the round-3 work drew from.
 
 Round 3 was implemented strictly from
 `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Sequence Header" /
@@ -205,7 +269,7 @@ CC-BY-SA per multimedia.cx terms).
 
 No external library source (FFmpeg / libavcodec / MPlayer / etc.),
 no archived `old` branch of this crate, and no online cross-checks
-were consulted across any of the three rounds. The wiki spec's
+were consulted across any of the four rounds. The wiki spec's
 "Appendix A: SVQ1 Data Tables" lists upstream source-tree pointers
 for the SVQ1 codebook + VLC byte arrays; those pointers are
 explicitly **not** followed. The SVQ3 macroblock-layer sections of

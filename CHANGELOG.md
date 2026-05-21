@@ -8,6 +8,62 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 4 — SVQ3 macroblock-type tree walk (structural).** The
+  per-macroblock type-Golomb decode + classification from
+  `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock layer"
+  lands in the new `svq3_mb` module, alongside the intra-prediction
+  pair / context-lookup tables and the 4×4 intra scan order from
+  §"Intra macroblock information decoding". Round 4 remains
+  structural — the macroblock body past the type code (CBP / intra
+  mode pair / motion vectors / residual coefficients) is **not**
+  decoded; the decoder handle still returns
+  `oxideav_core::Error::Unsupported` from `receive_frame`.
+  - `svq3_mb::read_mb_type(&mut BitReader, Svq3FrameType) ->
+    Result<Svq3MbType>` — reads a single `ue(v)` exp-Golomb code at
+    the bit-reader's current position and classifies it against the
+    enclosing slice's frame type per the wiki spec table.
+  - `svq3_mb::classify_mb_type(Svq3FrameType, u32) ->
+    Result<Svq3MbType>` — pre-decoded-code variant for callers that
+    need to expose the raw value for CBP / mode-pair follow-up.
+  - `Svq3MbType` enum with five variants: `IIntra(IFrameMbType)`,
+    `PInter(PFrameInterMode)`, `PIntra(IFrameMbType)`,
+    `BInter(BFrameInterMode)`, `BIntra(IFrameMbType)`. Carries the
+    underlying I-frame intra MB type for P / B intra MBs after
+    peeling the per-slice intra offset (`P_FRAME_INTRA_OFFSET = 8`,
+    `B_FRAME_INTRA_OFFSET = 4`).
+  - `IFrameMbType` enum: `LumaDcSeparate` (code 0),
+    `PredefinedCbpMode(u32)` (codes 1..=24, raw value preserved),
+    `LumaDcSeparateNoOthers` (code 25).
+  - `PFrameInterMode` enum: `Skip`, `Inter16x16`, `Inter8x16`,
+    `Inter16x8`, `Inter8x8`, `Inter4x8`, `Inter8x4`, `Inter4x4`
+    (codes 0..=7).
+  - `BFrameInterMode` enum: `Direct`, `Forward`, `Backward`,
+    `Bidirectional` (codes 0..=3).
+  - Predicate helpers: `Svq3MbType::is_intra()` / `is_inter()` /
+    `is_skip()` / `num_motion_vectors()` / `intra()` — let the
+    downstream residual / MC stage classify without rebuilding the
+    enum match.
+  - `INTRA_PRED_PAIRS: [(u8, u8); 25]` — the wiki spec's 4×4
+    intra-mode pair table in the documented triangular listing
+    order. Round 4 lands the table verbatim for a future intra-mode
+    Golomb-walk stage.
+  - `INTRA_PRED_TABLE: [[[i8; 5]; 6]; 6]` — the wiki spec's
+    `pred_table[top + 1][left + 1][idx]` context-lookup table.
+    Stored as `i8` so the `-1` sentinel ("out-of-slice predictor"
+    per the wiki spec) is representable.
+  - `INTRA_4X4_SCAN_ORDER: [u8; 16]` — the wiki spec's 4×4 intra
+    sub-block scan order (`(0, 1)(4, 5) … (10, 11)(14, 15)`)
+    flattened row-major.
+  - Per-slice constants: `I_FRAME_MB_TYPE_MAX = 25`,
+    `P_FRAME_MB_TYPE_MAX = 33`, `B_FRAME_MB_TYPE_MAX = 29`,
+    `P_FRAME_INTRA_OFFSET = 8`, `B_FRAME_INTRA_OFFSET = 4`.
+  - +24 tests covering: I/P/B-frame code-table classification
+    (exhaustive), out-of-range rejection, Golomb-decode round trips
+    for representative codes in each frame type, MV-count predicate
+    correctness, intra-table shape + sentinel + invariants, scan
+    order permutation check. Total crate test count
+    81 → 105 (+24).
+
 - **Round 3 — SVQ3 SEQH + slice-header parser (structural).** The
   SVQ3 sequence-header (`SEQH` extradata) and per-slice header
   parsers from
@@ -134,15 +190,18 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `docs/`. The encoded plane-data layer is blocked on that data
   landing in `docs/video/svq1/spec/` or `docs/video/svq1/tables/`.
 - **Docs gap (SVQ3 macroblock layer):** the wiki spec's
-  §"Macroblock layer" / §"Coefficient decoding" /
-  §"Intra macroblock information decoding" /
-  §"Inter macroblock information decoding" /
-  §"Macroblock transform and dequantization" / §"Intra prediction"
-  / §"Motion Compensation" sections are present in the local mirror
-  but round 3 deliberately scoped to structural parse only;
-  follow-up rounds will exercise them once the slice-payload
-  descramble algorithm and the protected-stream watermark sub-record
-  encoding are documented.
+  §"Macroblock layer" + §"Intra macroblock information decoding"
+  type-tree + intra-mode pair table + context-lookup table are now
+  covered by round 4. Still open downstream of those: the wiki
+  spec's §"Coefficient decoding" tables 1/2/3 (handed-off-but-not-
+  yet-implemented data tables for the three Golomb-codeword
+  branches), §"Inter macroblock information decoding" MV component
+  VLC bit-listing (the wiki spec describes the precision-selector
+  but not the VLC table itself), §"Macroblock transform and
+  dequantization" quantizer table (present in the wiki as
+  `svq3_dequant_coeff`; can land alongside coefficient decoding),
+  and §"Intra prediction" (mostly a back-reference to H.264 plus
+  the three named SVQ3-specific quirks).
 - **SVQ3 protected-stream watermark sub-record:** the wiki spec
   describes the byte layout but the variable-length-code encoding
   of the watermark width / height / unknown fields is not pinned,
@@ -170,9 +229,14 @@ CC-BY-SA per multimedia.cx terms). The SVQ1 wiki file's
 `FRAME_SIZE_TABLE` is re-used by the SVQ3 parser (the two formats
 share the seven standard dimension pairs).
 
+Round 4 was implemented strictly from
+`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock layer" /
+§"Intra macroblock information decoding" of the same local mirror.
+No additional spec documents were opened during round 4.
+
 No external library source (FFmpeg / libavcodec / MPlayer / etc.),
 no archived `old` branch of this crate, and no online cross-checks
-were consulted in any of the three rounds.
+were consulted in any of the four rounds.
 
 ## [0.0.1] — Round 0 — clean-room rebuild scaffold
 
