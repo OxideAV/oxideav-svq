@@ -1,6 +1,23 @@
 //! Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec.
 //!
-//! **Round 2 — `oxideav-core` framework integration.**
+//! **Round 3 — SVQ3 SEQH + slice-header parser, structural only.**
+//!
+//! Round 2 wired SVQ1 into the framework registry. Round 3 adds the
+//! SVQ3 sequence-header (`SEQH` extradata) parser and the per-slice
+//! header parser per
+//! `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Sequence Header" /
+//! §"Slice Header", plus the SVQ3 `SVQ3` FourCC registration alongside
+//! SVQ1 in [`oxideav_core::CodecRegistry`]. The SVQ3 decoder reuses
+//! the SVQ1 framework plumbing but `receive_frame` continues to
+//! return [`oxideav_core::Error::Unsupported`] — round 3 is
+//! structural-only and the macroblock layer (motion compensation,
+//! residual / Golomb decode) is out of scope. See
+//! [`svq3::Svq3SequenceHeader`] and [`svq3::Svq3SliceHeader`] for the
+//! parsed shapes.
+//!
+//! ## Earlier rounds (carried forward)
+//!
+//! Round 2 — `oxideav-core` framework integration.
 //!
 //! Round 1 landed the structural SVQ1 frame-header parser. Round 2
 //! wires that parser into the framework registry via the default-on
@@ -72,6 +89,7 @@
 mod bitreader;
 mod error;
 mod header;
+pub mod svq3;
 
 #[cfg(feature = "registry")]
 mod registry;
@@ -85,11 +103,15 @@ pub use crate::header::{
 
 #[cfg(feature = "registry")]
 pub use crate::registry::{
-    __oxideav_entry, make_decoder, probe_svq1, register, register_codecs, Svq1DecoderHandle,
+    __oxideav_entry, make_decoder, make_svq3_decoder, probe_svq1, probe_svq3, register,
+    register_codecs, Svq1DecoderHandle, Svq3DecoderHandle,
 };
 
-/// Stable codec id used in the framework registry.
+/// Stable codec id used in the framework registry for SVQ1.
 pub const CODEC_ID_STR: &str = "svq1";
+
+/// Stable codec id used in the framework registry for SVQ3.
+pub const SVQ3_CODEC_ID_STR: &str = "svq3";
 
 /// FourCC codes the wiki spec attaches to SVQ1 in QuickTime / AVI
 /// containers (`docs/video/svq1/wiki/Sorenson_Video_1.wiki` line 9 —
@@ -97,3 +119,8 @@ pub const CODEC_ID_STR: &str = "svq1";
 /// enumerates them. Both `svq1` and `SVQ1` upper-case to the same
 /// `CodecTag::fourcc` value; `svqi` is its own tag.
 pub const SVQ1_FOURCC_CODES: &[&[u8; 4]] = &[b"svq1", b"SVQ1", b"svqi"];
+
+/// FourCC codes the wiki spec attaches to SVQ3 (`docs/video/svq3/
+/// wiki/Sorenson_Video_3.wiki` line 7 — "FOURCCs: SVQ3"). Listed in
+/// the order the wiki page enumerates them.
+pub const SVQ3_FOURCC_CODES: &[&[u8; 4]] = &[b"SVQ3"];

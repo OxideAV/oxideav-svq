@@ -8,6 +8,66 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 3 — SVQ3 SEQH + slice-header parser (structural).** The
+  SVQ3 sequence-header (`SEQH` extradata) and per-slice header
+  parsers from
+  `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Sequence Header" /
+  §"Slice Header" land in the new `svq3` module, and the SVQ3 `SVQ3`
+  FourCC is registered alongside SVQ1 in
+  `oxideav_core::CodecRegistry`. Round 3 is structural-only —
+  `Svq3DecoderHandle::receive_frame` returns
+  `oxideav_core::Error::Unsupported`; the macroblock layer (motion
+  compensation, Golomb-coded residual) is out of round-3 scope.
+  - `svq3::SVQ3_SEQH_MAGIC` (`"SEQH"`) + `svq3::SVQ3_FRAME_END`
+    (`0xFF`) constants.
+  - `svq3::strip_seqh_prefix(&[u8])` — validates the 4-byte SEQH
+    marker + 4-byte big-endian length and returns the payload slice.
+  - `svq3::parse_sequence_header(&[u8]) -> Result<Svq3SequenceHeader>`
+    — walks the bit-packed `3 + (24)? + 1 + 1 + 4 + 1 + (1+8)* + 1`
+    layout and returns the typed sequence header. The 7-entry
+    `FRAME_SIZE_TABLE` lookup is shared with the SVQ1 parser; the
+    code-7 escape reads 12+12-bit explicit dimensions.
+  - `svq3::parse_extradata(&[u8])` — convenience wrapper combining
+    the two steps above.
+  - `svq3::num_macroblocks(&Svq3SequenceHeader)` — derives the
+    macroblock count from the parsed sequence header (used by the
+    v2 slice-header to compute the macroblock-offset field width).
+  - `svq3::unpermute_slice_payload(body, slice_size_size)` — reverses
+    the wiki spec's `"first 0-2 bytes ... stored at the very end of
+    the slice"` permutation. The further "may be further scrambled"
+    descramble step is deferred until the algorithm is documented.
+  - `svq3::parse_slice_header(unpermuted_body, version,
+    slice_size_size, slice_size, num_mbs, protected)` — parses the
+    Golomb-coded frame-code (`0=P`, `1=B`, `2=I`), the
+    version-dependent `has_more_slices_v1` / `mb_offset_v2` field,
+    the 8-bit frame number, 5-bit slice quantiser, delta-qp /
+    unknown / protected-unknown flags, and the optional-byte
+    trailer loop. Returns a typed `Svq3SliceHeader`.
+  - `svq3::parse_wire_slice(wire_slice, num_mbs, protected)` —
+    end-to-end helper: reads the 1-byte version/size-size prefix +
+    1-3 byte slice-size field, unpermutes the body, parses the
+    slice header, and surfaces the macroblock-layer remainder for
+    future use.
+  - `svq3::read_ue_golomb(&mut BitReader)` — unsigned exp-Golomb
+    decoder (`ue(v)`) per the wiki spec's "extensively uses Golomb
+    coding" note + the "based on an early H.264 draft" provenance.
+  - `Svq3FrameType` / `SliceVersion` enums + `Svq3SequenceHeader`
+    / `Svq3SliceHeader` structs typing every wiki-spec'd field.
+  - Registry: `SVQ3_CODEC_ID_STR = "svq3"`, `SVQ3_FOURCC_CODES =
+    [b"SVQ3"]`, `make_svq3_decoder` factory, `probe_svq3` probe
+    accepting any first-byte whose high 3 bits land in 1..=3 and
+    whose low 5 bits decode to version 1 or 2.
+  - `Svq3DecoderHandle` implementing `oxideav_core::Decoder`:
+    `send_packet` parses the slice header eagerly (or accepts the
+    `0xFF` frame-end sentinel without parsing); `receive_frame`
+    returns `Error::Unsupported`; `sequence_header()` /
+    `last_slice_header()` accessors expose parsed state for
+    integrators. The extradata is parsed eagerly at construction.
+  - +29 tests covering the new SEQH + slice-header + permutation +
+    Golomb paths, the SVQ3 registry registration, and the
+    decoder-handle state machine. Total crate test count
+    52 → 81 (+29).
+
 - **Round 2 — `oxideav-core` framework integration.** The structural
   SVQ1 frame-header parser is now wired into the framework registry.
   - Default-on `registry` cargo feature gating the `oxideav-core`
@@ -68,14 +128,32 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Notes
 
-- **Docs gap (still tracked):** the SVQ1 multi-stage VQ codebooks and
-  per-level VLC tables enumerated in the wiki spec's "Appendix A:
-  SVQ1 Data Tables" are not yet pinned in `docs/`. Round 3 (the
-  encoded plane-data layer) is blocked on that data landing in
-  `docs/video/svq1/spec/` or `docs/video/svq1/tables/`. Confirmed
-  still open at round-2 dispatch.
-- **SVQ3 deferred:** `docs/video/svq3/wiki/Sorenson_Video_3.wiki`
-  exists but neither round-1 nor round-2 touched it.
+- **Docs gap (SVQ1 codebooks, still tracked):** the SVQ1 multi-stage
+  VQ codebooks and per-level VLC tables enumerated in the wiki
+  spec's "Appendix A: SVQ1 Data Tables" are not yet pinned in
+  `docs/`. The encoded plane-data layer is blocked on that data
+  landing in `docs/video/svq1/spec/` or `docs/video/svq1/tables/`.
+- **Docs gap (SVQ3 macroblock layer):** the wiki spec's
+  §"Macroblock layer" / §"Coefficient decoding" /
+  §"Intra macroblock information decoding" /
+  §"Inter macroblock information decoding" /
+  §"Macroblock transform and dequantization" / §"Intra prediction"
+  / §"Motion Compensation" sections are present in the local mirror
+  but round 3 deliberately scoped to structural parse only;
+  follow-up rounds will exercise them once the slice-payload
+  descramble algorithm and the protected-stream watermark sub-record
+  encoding are documented.
+- **SVQ3 protected-stream watermark sub-record:** the wiki spec
+  describes the byte layout but the variable-length-code encoding
+  of the watermark width / height / unknown fields is not pinned,
+  and the deflated watermark image's role as decryption input is
+  out of round-3 scope. Captured at a structural level via
+  `Svq3SequenceHeader::protected`.
+- **SVQ3 slice descramble:** the wiki spec's note "Additionally
+  slice data may be further scrambled probably in order to prevent
+  unauthorised playback" is not yet pinned in `docs/`; round 3
+  applies the documented byte-permutation step (first 0-2 bytes
+  moved to slice trailer) but not the additional descramble.
 
 ### Provenance
 
@@ -84,11 +162,17 @@ Round 1 was implemented strictly from
 Header". Round 2 added line 9 (FourCC list) from the same file and
 the `oxideav-core` public API (`Decoder` / `CodecRegistry` /
 `CodecParameters` / `Packet` / `ProbeContext` / `register!` macro).
-The wiki file is a verbatim local mirror of the multimedia.cx
-Sorenson_Video_1 wiki page (fetched 2026-05-06, CC-BY-SA per
-multimedia.cx terms). No external library source, no archived `old`
-branch of this crate, and no online cross-checks were consulted in
-either round.
+Round 3 was implemented strictly from
+`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Sequence Header" /
+§"Slice Header" / §"Packetization" (a verbatim local mirror of the
+multimedia.cx Sorenson_Video_3 wiki page, fetched 2026-05-06,
+CC-BY-SA per multimedia.cx terms). The SVQ1 wiki file's
+`FRAME_SIZE_TABLE` is re-used by the SVQ3 parser (the two formats
+share the seven standard dimension pairs).
+
+No external library source (FFmpeg / libavcodec / MPlayer / etc.),
+no archived `old` branch of this crate, and no online cross-checks
+were consulted in any of the three rounds.
 
 ## [0.0.1] — Round 0 — clean-room rebuild scaffold
 
