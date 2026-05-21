@@ -8,6 +8,36 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 2 — `oxideav-core` framework integration.** The structural
+  SVQ1 frame-header parser is now wired into the framework registry.
+  - Default-on `registry` cargo feature gating the `oxideav-core`
+    dependency. With `default-features = false` the crate exposes only
+    the standalone `parse_frame_header` / `Svq1FrameHeader` / `BitReader`
+    / `Error` surface.
+  - `register(&mut RuntimeContext)` / `register_codecs(&mut
+    CodecRegistry)` entry points plus the `__oxideav_entry` symbol the
+    `oxideav_core::register!` macro expands to.
+  - `Svq1DecoderHandle` implementing `oxideav_core::Decoder`:
+    `send_packet` parses the frame header eagerly (structural failures
+    surface at `send_packet` rather than later); the parsed
+    `Svq1FrameHeader` is exposed via `Svq1DecoderHandle::last_header()`.
+    `receive_frame` returns `Error::Unsupported` because the codebook
+    docs-gap is still open.
+  - `probe_svq1(&ProbeContext)` registered alongside the FourCC tags:
+    `1.0` on a structurally valid header, `0.5` on a truncated header
+    or on the no-packet case (FourCC alone is highly disambiguating),
+    `0.0` on a structurally invalid header.
+  - `From<crate::Error> for oxideav_core::Error` conversion mapping
+    every structural failure to `InvalidData(msg)` with a descriptive
+    string; `NotImplemented` maps to `Unsupported`.
+  - FourCC declarations: `SVQ1` (canonical, also covers `svq1` since
+    `CodecTag::fourcc` upper-cases) and `svqi`, sourced from line 9 of
+    `docs/video/svq1/wiki/Sorenson_Video_1.wiki`.
+  - Inline `ci-standalone` GitHub Actions job exercising the
+    `--no-default-features` build + test path so regressions where a
+    standalone module accidentally re-imports `oxideav-core` are caught
+    at PR time.
+
 - **Round 1 — SVQ1 frame-header parser.** `parse_frame_header` walks
   the bit-packed SVQ1 chunk header documented in
   `docs/video/svq1/wiki/Sorenson_Video_1.wiki` §"Stream Format And
@@ -38,20 +68,27 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Notes
 
-- **Docs gap (tracked separately):** the SVQ1 multi-stage VQ
-  codebooks and per-level VLC tables enumerated in the wiki spec's
-  "Appendix A: SVQ1 Data Tables" are not yet pinned in `docs/`.
-  Round 2 (the encoded plane-data layer) is blocked on that data
-  landing in `docs/video/svq1/spec/` or `docs/video/svq1/tables/`.
+- **Docs gap (still tracked):** the SVQ1 multi-stage VQ codebooks and
+  per-level VLC tables enumerated in the wiki spec's "Appendix A:
+  SVQ1 Data Tables" are not yet pinned in `docs/`. Round 3 (the
+  encoded plane-data layer) is blocked on that data landing in
+  `docs/video/svq1/spec/` or `docs/video/svq1/tables/`. Confirmed
+  still open at round-2 dispatch.
+- **SVQ3 deferred:** `docs/video/svq3/wiki/Sorenson_Video_3.wiki`
+  exists but neither round-1 nor round-2 touched it.
 
 ### Provenance
 
 Round 1 was implemented strictly from
 `docs/video/svq1/wiki/Sorenson_Video_1.wiki` §"Stream Format And
-Header" — a verbatim local mirror of the multimedia.cx
+Header". Round 2 added line 9 (FourCC list) from the same file and
+the `oxideav-core` public API (`Decoder` / `CodecRegistry` /
+`CodecParameters` / `Packet` / `ProbeContext` / `register!` macro).
+The wiki file is a verbatim local mirror of the multimedia.cx
 Sorenson_Video_1 wiki page (fetched 2026-05-06, CC-BY-SA per
 multimedia.cx terms). No external library source, no archived `old`
-branch of this crate, and no online cross-checks were consulted.
+branch of this crate, and no online cross-checks were consulted in
+either round.
 
 ## [0.0.1] — Round 0 — clean-room rebuild scaffold
 
