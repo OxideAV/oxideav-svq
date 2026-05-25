@@ -5,20 +5,33 @@ Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 
 ## Status
 
-**Round 4 — SVQ3 macroblock-type tree walk (structural).** The
-per-macroblock type-Golomb decode + classification from the wiki
-spec's §"Macroblock layer" now lands in the new `svq3_mb` module:
-`read_mb_type(&mut BitReader, Svq3FrameType)` walks a single `ue(v)`
-exp-Golomb code at the bit-reader cursor and returns a typed
-`Svq3MbType` (I-frame intra / P-frame inter / P-frame intra /
-B-frame inter / B-frame intra). The 25-entry intra-mode pair table,
-the 6×6×5 intra-mode context-lookup table, and the 4×4 intra
-sub-block scan order from §"Intra macroblock information decoding"
-land as `pub const` arrays alongside the walker. Round 4 remains
-structural — the macroblock payload past the type code (CBP / intra
-mode pair / motion vectors / residual coefficients) is not yet
-decoded; `Svq3DecoderHandle::receive_frame` continues to return
-`oxideav_core::Error::Unsupported`.
+**Round 5 — SVQ3 residual coefficient walker.** The per-block
+Golomb-coded `(run, value)` residual coefficient stream from the
+wiki spec's §"Coefficient decoding" now lands in the new
+`svq3_coeff` module: three coefficient-table variants (2×2 chroma
+DC, alternative-scan 4×4 luma-intra-with-low-quantiser, normal-
+zigzag everything else) plus the two run-correction arrays
+(`INTRA_RUN_CORRECTION`, `INTER_RUN_CORRECTION`). Each per-table
+single-coefficient reader (`read_chroma_dc_coefficient` /
+`read_alt_scan_coefficient` / `read_normal_scan_coefficient`)
+decodes one Golomb code + sign bit, returning `Ok(None)` on
+end-of-block. The block-level walkers (`read_chroma_dc_block` /
+`read_alt_scan_half` / `read_normal_scan_block`) loop until the
+end-of-block sentinel is seen or the per-block coefficient cap is
+reached; structural overflow surfaces as `Error::BadBitWidth`.
+Round 5 remains structural — de-zigzag, dequantisation, and IDCT
+are not yet wired; `Svq3DecoderHandle::receive_frame` continues to
+return `oxideav_core::Error::Unsupported`.
+
+Carried forward from round 4: **SVQ3 macroblock-type tree walk
+(structural).** `read_mb_type(&mut BitReader, Svq3FrameType)`
+walks a single `ue(v)` exp-Golomb code at the bit-reader cursor
+and returns a typed `Svq3MbType` (I-frame intra / P-frame inter /
+P-frame intra / B-frame inter / B-frame intra). The 25-entry
+intra-mode pair table, the 6×6×5 intra-mode context-lookup table,
+and the 4×4 intra sub-block scan order from §"Intra macroblock
+information decoding" land as `pub const` arrays alongside the
+walker.
 
 Carried forward from round 3: **SVQ3 SEQH + slice-header parser
 (structural).** `SEQH` extradata yields a typed
@@ -93,6 +106,31 @@ What round 2 covers (carried from round 1):
 * Four documented structural error conditions plus the truncation
   guard.
 
+What round 5 adds on top of round 4:
+
+* The `svq3_coeff` module: three per-table single-coefficient
+  readers (`read_chroma_dc_coefficient` /
+  `read_alt_scan_coefficient` / `read_normal_scan_coefficient`) +
+  three block-level walkers (`read_chroma_dc_block` /
+  `read_alt_scan_half` / `read_normal_scan_block`) + the
+  `Coefficient { run, value }` typed result struct.
+* `INTRA_RUN_CORRECTION: [i32; 8]` and `INTER_RUN_CORRECTION:
+  [i32; 17]` — the two run-correction arrays from the wiki spec
+  landed verbatim. Tail handling (`[minus ones]` for alt-scan,
+  `[zeroes]` for normal-scan) is implemented by the per-table
+  extension formulas.
+* `ALT_SCAN_TABLE_0_15: [(u32, i32); 16]` and
+  `NORMAL_SCAN_TABLE_0_15: [(u32, i32); 16]` — verbatim
+  transcriptions of the wiki spec's first 16 codes for each table.
+* Block-capacity constants: `COEFFS_PER_4X4_BLOCK = 16`,
+  `COEFFS_PER_CHROMA_DC_BLOCK = 4`, `COEFFS_PER_ALT_SCAN_HALF =
+  8`.
+* +36 tests covering single-coefficient table lookups (explicit
+  codes + closed-form extensions), sign-bit application,
+  end-of-block sentinel detection, block-walker capacity caps,
+  run-overflow rejection, and truncation propagation (105 → 141
+  total).
+
 What round 4 adds on top of round 3:
 
 * The `svq3_mb` module: `read_mb_type` /
@@ -130,24 +168,28 @@ What round 3 adds on top of round 2:
 * +29 tests covering the new SEQH + slice-header + permutation +
   Golomb paths (52 → 81 total).
 
-What round 4 still does **not** cover:
+What round 5 still does **not** cover:
 
-* CBP / luma intra mode / chroma DC. The wiki spec's CBP coding is
-  a back-reference to H.264; the intra-mode-pair Golomb walk is
-  documented but its decoded value maps to the
-  [`svq3_mb::INTRA_PRED_PAIRS`] table which round 4 lands without
-  also wiring the consumer.
+* CBP coding. The wiki spec back-references the H.264 CBP table for
+  4×4-predicted blocks; the lookup is not enumerated bit-for-bit in
+  the local SVQ3 mirror.
+* The intra-mode-pair Golomb walk that consumes
+  [`svq3_mb::INTRA_PRED_PAIRS`]. The pair → mode lookup is landed,
+  but the per-MB Golomb-code-to-pair-index reader is not yet wired.
 * Per-partition motion-vector decoding. The wiki spec describes the
   precision-selector + signed-VLC layout for the MV component
   differences but the underlying VLC table is not enumerated
   bit-for-bit in `docs/`.
-* The coefficient Golomb codeword tables (codes for 2×2 chroma DC,
-  alternative-scan blocks, all other block types) are tabulated in
-  the wiki spec; round 4 leaves them for a follow-up round that
-  also tackles the quantiser table and the IDCT.
-* The SVQ3 macroblock-layer decode beyond the type-tree walk —
-  motion compensation, residual Golomb / VLC decode, intra
-  prediction, dequantisation. Tracked for a future round.
+* De-zigzag of the decoded coefficient stream into the 4×4
+  transform-coefficient matrix. The scan order is documented in the
+  wiki spec but the placement step is left for the round that wires
+  the walker output to the IDCT input.
+* Dequantisation + IDCT. The wiki spec gives `svq3_dequant_coeff[Q]`
+  and the dequant formula in §"Macroblock transform and
+  dequantization"; both land in a later round alongside the IDCT.
+* The SVQ3 macroblock-layer decode beyond the residual coefficient
+  walker — motion compensation, intra prediction, dequantisation.
+  Tracked for future rounds.
 * The SVQ3 protected-stream watermark sub-record. The
   variable-length-code encoding of the watermark width / height /
   unknown fields and the role of the deflated watermark image as
@@ -246,7 +288,38 @@ The standalone `svq3_mb` module surface (always available):
   `B_FRAME_MB_TYPE_MAX` / `P_FRAME_INTRA_OFFSET` /
   `B_FRAME_INTRA_OFFSET` constants.
 
+The standalone `svq3_coeff` module surface (always available):
+
+* `svq3_coeff::read_chroma_dc_coefficient(&mut BitReader) ->
+  Result<Option<Coefficient>>` /
+  `svq3_coeff::read_alt_scan_coefficient(...)` /
+  `svq3_coeff::read_normal_scan_coefficient(...)` — the three
+  per-table single-coefficient readers.
+* `svq3_coeff::read_chroma_dc_block(...)` /
+  `svq3_coeff::read_alt_scan_half(...)` /
+  `svq3_coeff::read_normal_scan_block(...)` — the three block-level
+  walkers that gather coefficient triples up to the per-block
+  capacity.
+* `Coefficient { run: u32, value: i32 }` typed result struct.
+* `svq3_coeff::INTRA_RUN_CORRECTION` (`[i32; 8]`) /
+  `svq3_coeff::INTER_RUN_CORRECTION` (`[i32; 17]`) /
+  `svq3_coeff::ALT_SCAN_TABLE_0_15` /
+  `svq3_coeff::NORMAL_SCAN_TABLE_0_15` — the two run-correction
+  arrays and the two 16-entry explicit lookups from
+  §"Coefficient decoding".
+* `svq3_coeff::COEFFS_PER_4X4_BLOCK` /
+  `svq3_coeff::COEFFS_PER_CHROMA_DC_BLOCK` /
+  `svq3_coeff::COEFFS_PER_ALT_SCAN_HALF` constants.
+
 ## Clean-room provenance
+
+Round 5 was implemented strictly from
+`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Coefficient decoding"
+of the same local mirror the prior SVQ3 rounds drew from. The three
+coefficient-table variants and both run-correction arrays are
+transcribed verbatim from the wiki spec's tables; the closed-form
+extension formulas for codes `>= 16` mirror the wiki spec's `code &
+0x7` / `code >> 3` / `code & 0xF` / `code >> 4` expressions exactly.
 
 Round 4 was implemented strictly from
 `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock layer" /

@@ -1,25 +1,42 @@
 //! Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec.
 //!
-//! **Round 4 — SVQ3 macroblock-type tree walk, structural only.**
+//! **Round 5 — SVQ3 residual coefficient walker.**
 //!
-//! Round 3 landed the SVQ3 sequence- and slice-header parsers. Round
-//! 4 adds the per-macroblock type-Golomb walk + classification per
-//! `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock layer",
-//! plus the two fixed tables documented in §"Intra macroblock
+//! Round 4 landed the SVQ3 macroblock-type tree walk + the intra-
+//! prediction lookup tables. Round 5 adds the per-block residual
+//! coefficient walker described in
+//! `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Coefficient
+//! decoding": the three coefficient-table variants the wiki spec
+//! enumerates (2×2 chroma DC, alternative-scan 4×4 luma-intra-with-
+//! low-quantiser, normal-zigzag everything else) plus the two
+//! run-correction arrays (`intra_run`, `inter_run`). The block-level
+//! walkers ([`svq3_coeff::read_chroma_dc_block`],
+//! [`svq3_coeff::read_alt_scan_half`],
+//! [`svq3_coeff::read_normal_scan_block`]) loop until either the
+//! end-of-block sentinel (`code = 0`) is seen or the block's
+//! coefficient capacity is reached; structural overflow returns
+//! [`Error::BadBitWidth`].
+//!
+//! ## Earlier rounds (carried forward)
+//!
+//! Round 4 added the per-macroblock type-Golomb walk + classification
+//! per `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock
+//! layer", plus the two fixed tables documented in §"Intra macroblock
 //! information decoding" (the 25-entry intra-mode pair table and the
 //! 6×6×5 intra-mode context-lookup table) and the 4×4 intra scan
 //! order. The macroblock walker [`svq3_mb::read_mb_type`] decodes a
 //! single `ue(v)` exp-Golomb code, classifies it against the
 //! enclosing slice's frame type, and returns a typed
-//! [`svq3_mb::Svq3MbType`]. CBP / motion-vector / residual decoding
-//! remain out of scope — those sub-streams either depend on the
-//! H.264 CBP table (cross-spec back-reference) or on the SVQ3 MV
-//! component VLC, neither of which is exercised in round 4.
+//! [`svq3_mb::Svq3MbType`]. CBP / motion-vector / intra-mode-pair
+//! Golomb / intra-prediction wiring remain out of scope — those
+//! sub-streams either depend on the H.264 CBP table (cross-spec
+//! back-reference) or on the SVQ3 MV component VLC, neither of which
+//! is enumerated bit-for-bit in the local mirror.
 //!
 //! ## Earlier rounds (carried forward)
 //!
-//! Round 3 — SVQ3 SEQH + slice-header parser, structural only.
-//! Round 2 wired SVQ1 into the framework registry, gated behind the
+//! Round 3 — SVQ3 SEQH + slice-header parser, structural only. Round
+//! 2 wired SVQ1 into the framework registry, gated behind the
 //! default-on `registry` cargo feature.
 //!
 //! Round 2 — `oxideav-core` framework integration.
@@ -95,6 +112,7 @@ mod bitreader;
 mod error;
 mod header;
 pub mod svq3;
+pub mod svq3_coeff;
 pub mod svq3_mb;
 
 #[cfg(feature = "registry")]

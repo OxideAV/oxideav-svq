@@ -8,6 +8,44 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 5 — SVQ3 residual coefficient walker.** The per-block
+  Golomb-coded `(run, value)` residual coefficient stream described in
+  `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Coefficient decoding"
+  lands in the new `svq3_coeff` module. Three coefficient-table
+  variants (2×2 chroma DC, alternative-scan 4×4 luma-intra-with-low-
+  quantiser, normal-zigzag everything else) plus the two run-correction
+  arrays (`intra_run`, `inter_run`) are implemented verbatim from the
+  wiki spec. The block-level walkers loop until either the end-of-block
+  sentinel (`code = 0`) is seen or the block's coefficient capacity is
+  reached; structural overflow returns `Error::BadBitWidth`. Round 5
+  remains structural — de-zigzag, dequantisation, and IDCT remain out
+  of scope.
+  - `svq3_coeff::read_chroma_dc_coefficient` /
+    `read_alt_scan_coefficient` / `read_normal_scan_coefficient` —
+    decode one coefficient (Golomb code + sign bit) per call,
+    returning `Ok(None)` on end-of-block / `Ok(Some(Coefficient))`
+    otherwise / `Err(Error::Truncated)` on short input.
+  - `svq3_coeff::read_chroma_dc_block` / `read_alt_scan_half` /
+    `read_normal_scan_block` — block-level walkers that gather the
+    `Coefficient` triples up to the per-block coefficient cap (4 /
+    8 / 16) and surface structural overflow as
+    `Error::BadBitWidth(scan_position)`.
+  - `Coefficient { run: u32, value: i32 }` typed result struct.
+  - `INTRA_RUN_CORRECTION: [i32; 8]` and
+    `INTER_RUN_CORRECTION: [i32; 17]` — the two run-correction arrays
+    landed verbatim, with the `[minus ones]` / `[zeroes]` shorthand
+    tails handled by the per-table extension formulas.
+  - `ALT_SCAN_TABLE_0_15: [(u32, i32); 16]` and
+    `NORMAL_SCAN_TABLE_0_15: [(u32, i32); 16]` — verbatim
+    transcriptions of the wiki spec's first 16 rows.
+  - `COEFFS_PER_4X4_BLOCK = 16`, `COEFFS_PER_CHROMA_DC_BLOCK = 4`,
+    `COEFFS_PER_ALT_SCAN_HALF = 8` — block-capacity constants.
+  - +36 tests covering single-coefficient table lookups (explicit
+    codes + closed-form extensions for both alt-scan and normal-scan),
+    sign-bit application, end-of-block sentinel detection, block-
+    walker capacity caps, run-overflow rejection, and truncation
+    propagation (105 → 141 total).
+
 - **Round 4 — SVQ3 macroblock-type tree walk (structural).** The
   per-macroblock type-Golomb decode + classification from
   `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock layer"
