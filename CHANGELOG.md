@@ -8,6 +8,36 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 7 — SVQ3 intra-4×4 predictor-from-neighbour resolution
+  helper.** The per-sub-block predictor lookup described in
+  `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Intra macroblock
+  information decoding" — `pred_table[top + 1][left + 1][idx]` plus
+  the two substitution rules ("when predictors lie outside of slice,
+  -1 is used instead", "for 16x16 intra and any inter blocks value of
+  2 is used as the predictor") — is now a typed helper in the
+  `svq3_mb` module.
+  - `svq3_mb::IntraNeighbour { Outside, Intra16x16OrInter, Mode4x4(u8) }`
+    — typed neighbour classification carrying the substitution rule
+    information.
+  - `svq3_mb::IntraNeighbour::lookup_index() -> Result<u8>` — returns
+    the `0..=5` index along the table's first / second axis after the
+    spec's `+ 1` adjustment, honouring both substitution rules. Errors
+    with `Error::BadBitWidth` when `Mode4x4(mode > 4)` is passed.
+  - `svq3_mb::resolve_intra_4x4_predictor(top, left, idx) ->
+    Result<u8>` — performs the table lookup. Returns the resolved
+    intra-prediction mode `0..=4` on success; returns the new
+    `Error::InvalidIntraPrediction(top_idx, left_idx, idx)` when the
+    looked-up entry is the `-1` sentinel (spec: "input data was
+    incorrect or intra modes were predicted incorrectly"); returns
+    `Error::BadBitWidth` when `idx > 4`.
+  - `svq3_mb::resolve_intra_4x4_pair(top, left, (a, b)) ->
+    Result<(u8, u8)>` — walks both elements of an `INTRA_PRED_PAIRS`
+    entry against the same neighbour context.
+  - `Error::InvalidIntraPrediction(u8, u8, u8)` — new error variant
+    surfacing the spec's "table value is -1" malformed-bitstream
+    condition. Mapped to `oxideav_core::Error::InvalidData` via the
+    existing `From<crate::Error> for oxideav_core::Error` impl.
+
 - **Round 6 — SVQ3 inter-MB motion-vector precision selector.** The
   three-branch decision described in
   `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Inter macroblock

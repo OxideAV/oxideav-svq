@@ -31,6 +31,14 @@ pub enum Error {
     /// The bit-reader was asked for an out-of-range field width (0 or
     /// >32). Indicates a bug in the parser, not a malformed stream.
     BadBitWidth(u32),
+    /// The intra-4×4 prediction `(top, left, idx)` lookup landed on an
+    /// `INTRA_PRED_TABLE` entry holding the sentinel `-1`. Per
+    /// `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Intra macroblock
+    /// information decoding" — "If table value is -1 then input data
+    /// was incorrect or intra modes were predicted incorrectly." The
+    /// tuple is `(top_index, left_index, idx)` after the spec's
+    /// `top + 1` / `left + 1` adjustment.
+    InvalidIntraPrediction(u8, u8, u8),
     /// Reserved scaffold variant. Surfaces from API endpoints (codec
     /// registration, frame decode) that the round-1 frame-header
     /// parser has not yet wired up.
@@ -59,6 +67,13 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "oxideav-svq: bit-reader rejected width {n} (must be 1..=32)"
+                )
+            }
+            Error::InvalidIntraPrediction(top, left, idx) => {
+                write!(
+                    f,
+                    "oxideav-svq: intra-4x4 prediction lookup landed on -1 sentinel \
+                     at INTRA_PRED_TABLE[{top}][{left}][{idx}]"
                 )
             }
             Error::NotImplemented => f.write_str(

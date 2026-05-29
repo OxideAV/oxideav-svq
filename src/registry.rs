@@ -52,6 +52,10 @@ impl From<crate::Error> for Error {
             crate::Error::BadBitWidth(n) => {
                 Error::other(format!("oxideav-svq: bit-reader rejected width {n}"))
             }
+            crate::Error::InvalidIntraPrediction(top, left, idx) => Error::InvalidData(format!(
+                "oxideav-svq: SVQ3 intra-4x4 prediction lookup landed on -1 sentinel \
+                 at INTRA_PRED_TABLE[{top}][{left}][{idx}]"
+            )),
             crate::Error::NotImplemented => Error::unsupported(
                 "oxideav-svq: SVQ1 pixel decode blocked on codebook docs-gap — see crates/oxideav-svq/README.md",
             ),

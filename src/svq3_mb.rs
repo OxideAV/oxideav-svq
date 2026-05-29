@@ -459,6 +459,135 @@ pub const INTRA_PRED_TABLE: [[[i8; 5]; 6]; 6] = [
     ],
 ];
 
+/// Classification of the neighbour macroblock / sub-block whose
+/// previously-decoded intra-prediction mode the current 4×4 sub-block's
+/// predictor lookup depends on.
+///
+/// Per `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Intra macroblock
+/// information decoding" the per-sub-block predictor lookup
+/// `pred_table[top + 1][left + 1][idx]` is fed by the previously-decoded
+/// top and left neighbours of the current 4×4 sub-block, with two
+/// substitution rules baked into the surrounding prose:
+///
+/// 1. **"When predictors lie outside of slice, -1 is used instead."** —
+///    the neighbour is unavailable because the sub-block sits on the
+///    top edge / left edge of the slice. The lookup index becomes
+///    `-1 + 1 = 0` (the first row / column of the table).
+/// 2. **"For 16×16 intra and any inter blocks value of 2 is used as the
+///    predictor."** — the neighbour exists but is not a 4×4 intra-coded
+///    sub-block. The lookup index becomes `2 + 1 = 3`.
+///
+/// Both substitutions are applied independently per neighbour (so the
+/// top can be `Outside` while the left is `Intra16x16OrInter`, for
+/// example).
+///
+/// Decoders that have a 4×4-coded neighbour pass [`Self::Mode4x4`] with
+/// the neighbour's previously-decoded prediction mode in `0..=4`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntraNeighbour {
+    /// Neighbour sub-block lies outside the current slice (top edge /
+    /// left edge of the slice). Lookup index is `0` (`-1 + 1`).
+    Outside,
+    /// Neighbour macroblock is a 16×16 intra-coded MB or any inter
+    /// macroblock. Lookup index is `3` (`2 + 1`).
+    Intra16x16OrInter,
+    /// Neighbour is a 4×4 intra-coded sub-block with the carried
+    /// prediction mode (one of `0..=4`). Lookup index is `mode + 1`.
+    Mode4x4(u8),
+}
+
+impl IntraNeighbour {
+    /// Number of valid 4×4 intra-prediction mode values per the wiki
+    /// spec's `INTRA_PRED_TABLE` shape — the lookup's second axis
+    /// spans `0..=5` (`-1..=4` after the spec's `+ 1` adjustment).
+    pub const NUM_MODES: u8 = 5;
+
+    /// Convert this neighbour classification to the `0..=5` lookup
+    /// index per the wiki spec's `top + 1` / `left + 1` adjustment.
+    ///
+    /// Returns [`Error::BadBitWidth`] (re-used as a generic
+    /// argument-domain error since the SVQ3 4×4 intra-prediction mode
+    /// space is `0..=4`) when [`IntraNeighbour::Mode4x4`] carries an
+    /// out-of-range mode value (`> 4`). The error preserves the
+    /// rejected mode value so the caller can surface a diagnostic.
+    pub fn lookup_index(self) -> Result<u8> {
+        match self {
+            Self::Outside => Ok(0),
+            Self::Mode4x4(mode) if mode < Self::NUM_MODES => Ok(mode + 1),
+            Self::Mode4x4(mode) => Err(Error::BadBitWidth(u32::from(mode))),
+            Self::Intra16x16OrInter => Ok(3),
+        }
+    }
+}
+
+/// Resolve a 4×4 intra-prediction mode from the per-sub-block predictor
+/// table given the two neighbour classifications and the per-pair
+/// candidate index `idx`.
+///
+/// Implements the per-sub-block predictor lookup documented in
+/// `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Intra macroblock
+/// information decoding":
+///
+/// > "Each element of the pair is then used as an index in the
+/// > prediction table (the proper order is
+/// > `pred_table[top + 1][left + 1][idx]`). When predictors lie outside
+/// > of slice, -1 is used instead. For 16x16 intra and any inter blocks
+/// > value of 2 is used as the predictor. If table value is -1 then
+/// > input data was incorrect or intra modes were predicted
+/// > incorrectly."
+///
+/// The `idx` argument is one of the two elements of the
+/// [`INTRA_PRED_PAIRS`] entry the slice's intra-mode VLC selected.
+/// Pairs are `(u8, u8)` with each element in `0..=4`; each element is
+/// independently resolved by a separate call to this helper.
+///
+/// Returns the resolved intra-prediction mode (one of `0..=4`) on
+/// success. Returns [`Error::InvalidIntraPrediction`] when the table
+/// entry is the `-1` sentinel — the spec defines this as a malformed
+/// bitstream / mispredicted intra-mode condition. Returns
+/// [`Error::BadBitWidth`] when `idx > 4` (the table's third axis is
+/// `0..=4`).
+pub fn resolve_intra_4x4_predictor(
+    top: IntraNeighbour,
+    left: IntraNeighbour,
+    idx: u8,
+) -> Result<u8> {
+    if idx >= IntraNeighbour::NUM_MODES {
+        return Err(Error::BadBitWidth(u32::from(idx)));
+    }
+    let t = top.lookup_index()?;
+    let l = left.lookup_index()?;
+    let raw = INTRA_PRED_TABLE[t as usize][l as usize][idx as usize];
+    if raw < 0 {
+        return Err(Error::InvalidIntraPrediction(t, l, idx));
+    }
+    // raw is one of 0..=4 per spec.
+    Ok(raw as u8)
+}
+
+/// Resolve both elements of an [`INTRA_PRED_PAIRS`] entry against the
+/// same neighbour pair, returning the `(top_mode, left_mode)` tuple the
+/// caller can feed into the per-sub-block intra-prediction stage.
+///
+/// The wiki spec describes the pair as "Each element of the pair is
+/// then used as an index in the prediction table" — both elements are
+/// resolved against the **same** `(top_neighbour, left_neighbour)`
+/// context but with different `idx` values. The pair's first element
+/// resolves the top intra-prediction mode for the current 4×4 sub-block
+/// and the second resolves the left intra-prediction mode.
+///
+/// Returns the resolved `(top_mode, left_mode)` tuple on success.
+/// Errors propagate from [`resolve_intra_4x4_predictor`].
+pub fn resolve_intra_4x4_pair(
+    top: IntraNeighbour,
+    left: IntraNeighbour,
+    pair: (u8, u8),
+) -> Result<(u8, u8)> {
+    let top_mode = resolve_intra_4x4_predictor(top, left, pair.0)?;
+    let left_mode = resolve_intra_4x4_predictor(top, left, pair.1)?;
+    Ok((top_mode, left_mode))
+}
+
 /// Per-macroblock motion-vector sample-grid precision used by an
 /// SVQ3 inter macroblock.
 ///
@@ -1215,5 +1344,186 @@ mod tests {
         let p = Svq3MvPrecision::Halfpel;
         let q = p;
         assert_eq!(p, q);
+    }
+
+    #[test]
+    fn neighbour_lookup_index_outside_is_zero() {
+        // Per the wiki spec "When predictors lie outside of slice,
+        // -1 is used instead" → `-1 + 1 = 0`.
+        assert_eq!(IntraNeighbour::Outside.lookup_index().unwrap(), 0);
+    }
+
+    #[test]
+    fn neighbour_lookup_index_intra16x16_or_inter_is_three() {
+        // Per the wiki spec "For 16x16 intra and any inter blocks
+        // value of 2 is used as the predictor" → `2 + 1 = 3`.
+        assert_eq!(IntraNeighbour::Intra16x16OrInter.lookup_index().unwrap(), 3);
+    }
+
+    #[test]
+    fn neighbour_lookup_index_mode4x4_offsets_by_one() {
+        // Per the wiki spec the table is indexed `top + 1` /
+        // `left + 1`. A 4×4-coded neighbour with mode `m` resolves
+        // to `m + 1`.
+        for m in 0..=4u8 {
+            assert_eq!(IntraNeighbour::Mode4x4(m).lookup_index().unwrap(), m + 1);
+        }
+    }
+
+    #[test]
+    fn neighbour_lookup_rejects_out_of_range_mode() {
+        // The 4×4 intra-prediction mode space is `0..=4` per the
+        // wiki spec; the table's second axis only spans those five
+        // entries plus the `-1` sentinel. Anything `> 4` is bad input.
+        let err = IntraNeighbour::Mode4x4(5).lookup_index().unwrap_err();
+        assert!(matches!(err, Error::BadBitWidth(5)));
+        let err = IntraNeighbour::Mode4x4(255).lookup_index().unwrap_err();
+        assert!(matches!(err, Error::BadBitWidth(255)));
+    }
+
+    #[test]
+    fn resolve_intra_4x4_predictor_both_outside_returns_two() {
+        // `pred_table[0][0]` per the wiki spec is `[2, -1, -1, -1, -1]`.
+        // `idx = 0` resolves to `2`.
+        assert_eq!(
+            resolve_intra_4x4_predictor(IntraNeighbour::Outside, IntraNeighbour::Outside, 0)
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn resolve_intra_4x4_predictor_outside_sentinel_idx_errors() {
+        // `pred_table[0][0][1..=4]` per the wiki spec is all `-1`. The
+        // spec defines this as "input data was incorrect or intra modes
+        // were predicted incorrectly" — surface as
+        // `InvalidIntraPrediction`.
+        for idx in 1..=4u8 {
+            let err =
+                resolve_intra_4x4_predictor(IntraNeighbour::Outside, IntraNeighbour::Outside, idx)
+                    .unwrap_err();
+            assert!(matches!(err, Error::InvalidIntraPrediction(0, 0, i) if i == idx));
+        }
+    }
+
+    #[test]
+    fn resolve_intra_4x4_predictor_idx_too_large_errors() {
+        // The table's third axis is `0..=4`. `idx >= 5` is bad input.
+        let err = resolve_intra_4x4_predictor(IntraNeighbour::Outside, IntraNeighbour::Outside, 5)
+            .unwrap_err();
+        assert!(matches!(err, Error::BadBitWidth(5)));
+    }
+
+    #[test]
+    fn resolve_intra_4x4_predictor_matches_table_entry() {
+        // Spot-check several `(top, left, idx)` combinations against
+        // the spec table. `pred_table[1][1]` is `[0, 2, 1, 4, 3]` so
+        // `(Mode4x4(0), Mode4x4(0), 0..=4)` should yield `0, 2, 1, 4, 3`.
+        let expected = [0u8, 2, 1, 4, 3];
+        for (idx, &want) in expected.iter().enumerate() {
+            assert_eq!(
+                resolve_intra_4x4_predictor(
+                    IntraNeighbour::Mode4x4(0),
+                    IntraNeighbour::Mode4x4(0),
+                    idx as u8,
+                )
+                .unwrap(),
+                want
+            );
+        }
+        // `pred_table[5][5]` is `[4, 2, 1, 0, 3]`.
+        let expected = [4u8, 2, 1, 0, 3];
+        for (idx, &want) in expected.iter().enumerate() {
+            assert_eq!(
+                resolve_intra_4x4_predictor(
+                    IntraNeighbour::Mode4x4(4),
+                    IntraNeighbour::Mode4x4(4),
+                    idx as u8,
+                )
+                .unwrap(),
+                want
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_intra_4x4_predictor_intra16x16_neighbour_uses_index_three() {
+        // `Intra16x16OrInter` substitutes to lookup index `3`. With
+        // `top = Intra16x16OrInter` and `left = Mode4x4(1)` the lookup
+        // is `pred_table[3][2]` which is `[1, 2, 0, 4, 3]` per the
+        // wiki spec.
+        let expected = [1u8, 2, 0, 4, 3];
+        for (idx, &want) in expected.iter().enumerate() {
+            assert_eq!(
+                resolve_intra_4x4_predictor(
+                    IntraNeighbour::Intra16x16OrInter,
+                    IntraNeighbour::Mode4x4(1),
+                    idx as u8,
+                )
+                .unwrap(),
+                want
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_intra_4x4_pair_resolves_both_elements() {
+        // Pick a pair from `INTRA_PRED_PAIRS` — entry `[4]` is `(1, 1)`,
+        // both elements are `1`. With both neighbours `Mode4x4(0)` the
+        // lookup is `pred_table[1][1][1] = 2` for both elements.
+        let (top_mode, left_mode) = resolve_intra_4x4_pair(
+            IntraNeighbour::Mode4x4(0),
+            IntraNeighbour::Mode4x4(0),
+            (1, 1),
+        )
+        .unwrap();
+        assert_eq!(top_mode, 2);
+        assert_eq!(left_mode, 2);
+
+        // Entry `[10]` is `(0, 4)` — `pred_table[1][1][0] = 0` and
+        // `pred_table[1][1][4] = 3`.
+        let (top_mode, left_mode) = resolve_intra_4x4_pair(
+            IntraNeighbour::Mode4x4(0),
+            IntraNeighbour::Mode4x4(0),
+            (0, 4),
+        )
+        .unwrap();
+        assert_eq!(top_mode, 0);
+        assert_eq!(left_mode, 3);
+    }
+
+    #[test]
+    fn resolve_intra_4x4_pair_propagates_sentinel_error() {
+        // `pred_table[0][0][1] = -1`. Resolving the pair `(0, 1)` with
+        // both neighbours outside should error on the second element
+        // (the first element `idx = 0` resolves to `2`; the second
+        // `idx = 1` hits the `-1` sentinel).
+        let err = resolve_intra_4x4_pair(IntraNeighbour::Outside, IntraNeighbour::Outside, (0, 1))
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidIntraPrediction(0, 0, 1)));
+    }
+
+    #[test]
+    fn resolve_intra_4x4_predictor_covers_all_intra_pred_pairs_for_intra_neighbours() {
+        // Every entry in `INTRA_PRED_PAIRS` has both elements in
+        // `0..=4` per the wiki spec. With both neighbours encoded as
+        // 4×4 intra MBs the lookup must succeed for both elements of
+        // every one of the 25 pairs.
+        for &(a, b) in INTRA_PRED_PAIRS.iter() {
+            for top_mode in 0..=4u8 {
+                for left_mode in 0..=4u8 {
+                    let top = IntraNeighbour::Mode4x4(top_mode);
+                    let left = IntraNeighbour::Mode4x4(left_mode);
+                    // Both elements must yield modes in `0..=4` since
+                    // `pred_table[top + 1][left + 1]` for `top, left
+                    // ∈ 0..=4` (i.e. `[1..=5][1..=5]`) has no `-1`
+                    // entries per the wiki spec table.
+                    let resolved_a = resolve_intra_4x4_predictor(top, left, a).unwrap();
+                    let resolved_b = resolve_intra_4x4_predictor(top, left, b).unwrap();
+                    assert!(resolved_a < 5);
+                    assert!(resolved_b < 5);
+                }
+            }
+        }
     }
 }

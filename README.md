@@ -5,7 +5,29 @@ Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 
 ## Status
 
-**Round 6 — SVQ3 inter-MB motion-vector precision selector.** The
+**Round 7 — SVQ3 intra-4×4 predictor-from-neighbour resolution
+helper.** The wiki spec's §"Intra macroblock information decoding"
+describes the per-sub-block 4×4 intra-prediction mode as a lookup
+`pred_table[top + 1][left + 1][idx]` against the
+[`svq3_mb::INTRA_PRED_TABLE`] constant, with two substitution rules
+folded into the surrounding prose: "when predictors lie outside of
+slice, `-1` is used instead" and "for 16×16 intra and any inter
+blocks value of `2` is used as the predictor". Round 7 lands the
+substitution rules as a typed neighbour-classification enum
+(`svq3_mb::IntraNeighbour::{Outside, Intra16x16OrInter, Mode4x4(u8)}`)
+and a `resolve_intra_4x4_predictor(top, left, idx)` helper that
+performs the lookup, honours both substitution rules, and surfaces the
+spec's "if table value is -1 then input data was incorrect" condition
+as a new `Error::InvalidIntraPrediction(top, left, idx)` variant. A
+companion `resolve_intra_4x4_pair(top, left, (a, b))` walks both
+elements of an [`svq3_mb::INTRA_PRED_PAIRS`] entry against the same
+neighbour context and returns the resolved `(top_mode, left_mode)`
+tuple the per-sub-block intra-prediction stage will consume. Round 7
+remains structural — the per-sub-block intra-prediction VLC and the
+actual pixel-domain intra-prediction stage are still out of scope.
+
+Carried forward from round 6: **SVQ3 inter-MB motion-vector
+precision selector.** The
 three-branch decision documented in the wiki spec's §"Inter
 macroblock information decoding" lands in the `svq3_mb` module as a
 typed reader returning one of three sample-grid precisions
@@ -302,6 +324,20 @@ The standalone `svq3_mb` module surface (always available):
   `svq3_mb::INTRA_PRED_TABLE` (`[[[i8; 5]; 6]; 6]`) /
   `svq3_mb::INTRA_4X4_SCAN_ORDER` (`[u8; 16]`) — the three fixed
   tables from §"Intra macroblock information decoding".
+* `svq3_mb::IntraNeighbour { Outside, Intra16x16OrInter, Mode4x4(u8) }`
+  — typed classification of the neighbour macroblock / sub-block whose
+  previously-decoded intra-prediction mode feeds the per-sub-block
+  predictor lookup. Includes the `lookup_index() -> Result<u8>` helper
+  that performs the spec's `-1 → 0` (outside) / `2 → 3` (16×16-intra
+  or inter) substitution.
+* `svq3_mb::resolve_intra_4x4_predictor(top, left, idx) -> Result<u8>`
+  — performs the wiki spec's
+  `pred_table[top + 1][left + 1][idx]` lookup, surfacing the `-1`
+  sentinel as `Error::InvalidIntraPrediction(top_idx, left_idx, idx)`.
+* `svq3_mb::resolve_intra_4x4_pair(top, left, (a, b)) ->
+  Result<(u8, u8)>` — walks both elements of an `INTRA_PRED_PAIRS`
+  entry against the same neighbour context and returns the resolved
+  `(top_mode, left_mode)` tuple.
 * `svq3_mb::I_FRAME_MB_TYPE_MAX` / `P_FRAME_MB_TYPE_MAX` /
   `B_FRAME_MB_TYPE_MAX` / `P_FRAME_INTRA_OFFSET` /
   `B_FRAME_INTRA_OFFSET` constants.
@@ -330,6 +366,20 @@ The standalone `svq3_coeff` module surface (always available):
   `svq3_coeff::COEFFS_PER_ALT_SCAN_HALF` constants.
 
 ## Clean-room provenance
+
+Round 7 was implemented strictly from
+`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Intra macroblock
+information decoding" — specifically the paragraph beginning "Each
+element of the pair is then used as an index in the prediction table"
+which spells out the `pred_table[top + 1][left + 1][idx]` lookup
+shape, the two substitution rules ("when predictors lie outside of
+slice, -1 is used instead", "for 16x16 intra and any inter blocks
+value of 2 is used as the predictor"), and the error condition
+("if table value is -1 then input data was incorrect or intra modes
+were predicted incorrectly"). All three rules land as direct
+enumerated branches in the new `IntraNeighbour::lookup_index` /
+`resolve_intra_4x4_predictor` functions; no other source was
+consulted.
 
 Round 5 was implemented strictly from
 `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Coefficient decoding"
