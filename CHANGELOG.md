@@ -8,6 +8,28 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 6 — SVQ3 inter-MB motion-vector precision selector.** The
+  three-branch decision described in
+  `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Inter macroblock
+  information decoding" is now a typed reader in the `svq3_mb` module.
+  The selector consumes 0, 1, or 2 bits depending on the sequence
+  header's `has_thirdpel` / `has_halfpel` flags and returns one of
+  three precisions. B-frame inter macroblocks short-circuit to halfpel
+  per the spec's §"Macroblock transform and dequantization" remark
+  ("it is always halfpel precision in B-frames") and consume no bit.
+  - `svq3_mb::Svq3MvPrecision { Fullpel, Halfpel, Thirdpel }` — typed
+    sample-grid precision result.
+  - `svq3_mb::read_inter_mv_precision_p_frame(br, has_thirdpel,
+    has_halfpel) -> Result<Svq3MvPrecision>` — implements the
+    three-branch selector verbatim from the wiki spec for P-frame inter
+    macroblocks. Bit-consumption pattern: 0 bits when both flags off,
+    1 bit when exactly one flag is set, 1-2 bits when both flags are
+    set.
+  - `svq3_mb::read_inter_mv_precision(br, frame_type, has_thirdpel,
+    has_halfpel) -> Result<Svq3MvPrecision>` — frame-type dispatch that
+    short-circuits B-frames to halfpel without reading any bit and
+    defers P-frame inter to the standalone reader.
+
 - **Round 5 — SVQ3 residual coefficient walker.** The per-block
   Golomb-coded `(run, value)` residual coefficient stream described in
   `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Coefficient decoding"

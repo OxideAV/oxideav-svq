@@ -459,6 +459,128 @@ pub const INTRA_PRED_TABLE: [[[i8; 5]; 6]; 6] = [
     ],
 ];
 
+/// Per-macroblock motion-vector sample-grid precision used by an
+/// SVQ3 inter macroblock.
+///
+/// Per `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Inter macroblock
+/// information decoding" a P-frame inter macroblock can select between
+/// three sample-grid precisions for its motion vectors. The same
+/// section also notes (§"Macroblock transform and dequantization",
+/// paragraph beginning "Since P-frame macroblocks can have different
+/// motion vector precision") that B-frame inter macroblocks always
+/// use [`Halfpel`] precision and consume no bit to indicate it.
+///
+/// [`Halfpel`]: Svq3MvPrecision::Halfpel
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Svq3MvPrecision {
+    /// Whole-pixel grid. The motion-vector components are interpreted
+    /// directly as integer sample offsets with no sub-pixel
+    /// interpolation.
+    Fullpel,
+    /// Half-pixel grid. The motion-vector components are interpreted
+    /// at the 1/2-sample grid; a sub-pixel interpolation stage is
+    /// required when the reference is fetched.
+    Halfpel,
+    /// Third-pixel grid. The motion-vector components are interpreted
+    /// at the 1/3-sample grid; the wiki spec describes this as
+    /// "motion compensation may be performed with full-pixel, halfpel
+    /// or thirdpel precision" in §"Macroblock layer".
+    Thirdpel,
+}
+
+/// Read the inter-macroblock motion-vector precision selector for a
+/// P-frame inter macroblock.
+///
+/// Implements the three-branch decision documented in
+/// `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Inter macroblock
+/// information decoding":
+///
+/// ```text
+///   if has_thirdpel && get_bit() != has_halfpel {
+///       use thirdpel mode
+///   } else if has_halfpel && get_bit() != has_thirdpel {
+///       use halfpel mode
+///   } else {
+///       use fullpel mode
+///   }
+/// ```
+///
+/// `has_thirdpel` / `has_halfpel` come from the sequence header's
+/// `has_thirdpel` / `has_halfpel` flags (the two single-bit fields the
+/// SEQH parser captures into [`crate::svq3::Svq3SequenceHeader`]).
+///
+/// Returns the chosen [`Svq3MvPrecision`] on success; returns
+/// [`Error::Truncated`] if the bit-reader runs out of input mid-branch.
+///
+/// Bit consumption follows the spec's short-circuit evaluation
+/// exactly:
+///
+/// | `has_thirdpel` | `has_halfpel` | bits read |
+/// | -------------- | ------------- | --------- |
+/// | `false`        | `false`       | 0         |
+/// | `false`        | `true`        | 1         |
+/// | `true`         | `false`       | 1         |
+/// | `true`         | `true`        | 1 or 2    |
+///
+/// (When both flags are set the first branch reads one bit; if that
+/// branch is not taken the second branch reads one further bit, for a
+/// total of up to two bits.)
+pub fn read_inter_mv_precision_p_frame(
+    br: &mut BitReader<'_>,
+    has_thirdpel: bool,
+    has_halfpel: bool,
+) -> Result<Svq3MvPrecision> {
+    // First branch: `has_thirdpel && get_bit() != has_halfpel` →
+    // Thirdpel.
+    if has_thirdpel {
+        let bit = br.read_bit()? != 0;
+        if bit != has_halfpel {
+            return Ok(Svq3MvPrecision::Thirdpel);
+        }
+    }
+    // Second branch: `has_halfpel && get_bit() != has_thirdpel` →
+    // Halfpel.
+    if has_halfpel {
+        let bit = br.read_bit()? != 0;
+        if bit != has_thirdpel {
+            return Ok(Svq3MvPrecision::Halfpel);
+        }
+    }
+    // Else branch: fullpel.
+    Ok(Svq3MvPrecision::Fullpel)
+}
+
+/// Read the inter-macroblock motion-vector precision selector,
+/// dispatching by the enclosing slice's frame type.
+///
+/// Per `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock
+/// transform and dequantization" paragraph beginning "Since P-frame
+/// macroblocks can have different motion vector precision", B-frame
+/// inter macroblocks always use [`Svq3MvPrecision::Halfpel`] and
+/// consume **no** bit to indicate it. P-frame inter macroblocks defer
+/// to [`read_inter_mv_precision_p_frame`].
+///
+/// I-frame inter macroblocks do not exist — the wiki spec's I-frame
+/// macroblock type space (§"Macroblock layer") contains only intra
+/// codes (`0..=25`). Calling this with [`Svq3FrameType::Intra`]
+/// returns the sequence-header-implied fullpel default, but in
+/// practice the caller will never invoke this on an I-frame slice.
+///
+/// Returns [`Error::Truncated`] only on the P-frame branch where bits
+/// are consumed.
+pub fn read_inter_mv_precision(
+    br: &mut BitReader<'_>,
+    frame_type: Svq3FrameType,
+    has_thirdpel: bool,
+    has_halfpel: bool,
+) -> Result<Svq3MvPrecision> {
+    match frame_type {
+        Svq3FrameType::Predicted => read_inter_mv_precision_p_frame(br, has_thirdpel, has_halfpel),
+        Svq3FrameType::Bidirectional => Ok(Svq3MvPrecision::Halfpel),
+        Svq3FrameType::Intra => Ok(Svq3MvPrecision::Fullpel),
+    }
+}
+
 /// 16-entry scan order for the 4×4 luma intra-prediction sub-blocks.
 ///
 /// Per `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Intra macroblock
@@ -902,5 +1024,196 @@ mod tests {
         assert_eq!(B_FRAME_MB_TYPE_MAX, 29);
         assert_eq!(P_FRAME_INTRA_OFFSET, 8);
         assert_eq!(B_FRAME_INTRA_OFFSET, 4);
+    }
+
+    // ----- inter-MB motion-vector precision selector ---------------
+
+    /// Helper: pack `bits` as a left-aligned byte (MSB-first).
+    /// `nbits` is the number of valid bits (1..=8). The remaining
+    /// low-order bits are zero-padded so the BitReader's read_bit()
+    /// stream returns them as 0.
+    fn pack_bits_msb_first(nbits: u32, value: u32) -> Vec<u8> {
+        pack(&[(nbits, value)])
+    }
+
+    #[test]
+    fn precision_no_thirdpel_no_halfpel_is_fullpel_no_bits_read() {
+        // has_thirdpel = false, has_halfpel = false.
+        // Spec: both branches short-circuit on the && → fullpel,
+        // no bit consumed.
+        let bytes: [u8; 1] = [0xFF]; // sentinel — must not be read
+        let mut br = BitReader::new(&bytes);
+        let p = read_inter_mv_precision_p_frame(&mut br, false, false).unwrap();
+        assert_eq!(p, Svq3MvPrecision::Fullpel);
+        assert_eq!(br.bits_consumed(), 0);
+    }
+
+    #[test]
+    fn precision_only_halfpel_bit1_is_halfpel() {
+        // has_thirdpel=false, has_halfpel=true.
+        // First branch skipped (has_thirdpel=false). Second branch
+        // reads bit; condition `bit != has_thirdpel` → `bit != false`
+        // → bit == 1 → Halfpel.
+        let bytes = pack_bits_msb_first(1, 1);
+        let mut br = BitReader::new(&bytes);
+        let p = read_inter_mv_precision_p_frame(&mut br, false, true).unwrap();
+        assert_eq!(p, Svq3MvPrecision::Halfpel);
+        assert_eq!(br.bits_consumed(), 1);
+    }
+
+    #[test]
+    fn precision_only_halfpel_bit0_is_fullpel() {
+        // has_thirdpel=false, has_halfpel=true, bit=0.
+        // Second branch: `bit != has_thirdpel` → `0 != 0` → false
+        // → falls through to fullpel.
+        let bytes = pack_bits_msb_first(1, 0);
+        let mut br = BitReader::new(&bytes);
+        let p = read_inter_mv_precision_p_frame(&mut br, false, true).unwrap();
+        assert_eq!(p, Svq3MvPrecision::Fullpel);
+        assert_eq!(br.bits_consumed(), 1);
+    }
+
+    #[test]
+    fn precision_only_thirdpel_bit1_is_thirdpel() {
+        // has_thirdpel=true, has_halfpel=false, bit=1.
+        // First branch: `bit != has_halfpel` → `1 != 0` → true →
+        // Thirdpel.
+        let bytes = pack_bits_msb_first(1, 1);
+        let mut br = BitReader::new(&bytes);
+        let p = read_inter_mv_precision_p_frame(&mut br, true, false).unwrap();
+        assert_eq!(p, Svq3MvPrecision::Thirdpel);
+        assert_eq!(br.bits_consumed(), 1);
+    }
+
+    #[test]
+    fn precision_only_thirdpel_bit0_is_fullpel() {
+        // has_thirdpel=true, has_halfpel=false, bit=0.
+        // First branch: `0 != 0` → false → not taken.
+        // Second branch: `has_halfpel` is false → not taken.
+        // Falls through to fullpel.
+        let bytes = pack_bits_msb_first(1, 0);
+        let mut br = BitReader::new(&bytes);
+        let p = read_inter_mv_precision_p_frame(&mut br, true, false).unwrap();
+        assert_eq!(p, Svq3MvPrecision::Fullpel);
+        assert_eq!(br.bits_consumed(), 1);
+    }
+
+    #[test]
+    fn precision_both_first_bit0_is_thirdpel() {
+        // has_thirdpel=true, has_halfpel=true, first bit=0.
+        // First branch: `0 != 1` → true → Thirdpel. Second bit never
+        // consumed.
+        let bytes = pack_bits_msb_first(2, 0b01); // bit0=0, bit1=1 (unused)
+        let mut br = BitReader::new(&bytes);
+        let p = read_inter_mv_precision_p_frame(&mut br, true, true).unwrap();
+        assert_eq!(p, Svq3MvPrecision::Thirdpel);
+        assert_eq!(br.bits_consumed(), 1);
+    }
+
+    #[test]
+    fn precision_both_bits_10_is_halfpel() {
+        // has_thirdpel=true, has_halfpel=true.
+        // First bit = 1 → `1 != 1` → false → first branch not taken.
+        // Second bit = 0 → `0 != 1` → true → Halfpel.
+        let bytes = pack_bits_msb_first(2, 0b10);
+        let mut br = BitReader::new(&bytes);
+        let p = read_inter_mv_precision_p_frame(&mut br, true, true).unwrap();
+        assert_eq!(p, Svq3MvPrecision::Halfpel);
+        assert_eq!(br.bits_consumed(), 2);
+    }
+
+    #[test]
+    fn precision_both_bits_11_is_fullpel() {
+        // has_thirdpel=true, has_halfpel=true.
+        // First bit = 1 → `1 != 1` → false → first branch not taken.
+        // Second bit = 1 → `1 != 1` → false → second branch not
+        // taken. Falls through to fullpel.
+        let bytes = pack_bits_msb_first(2, 0b11);
+        let mut br = BitReader::new(&bytes);
+        let p = read_inter_mv_precision_p_frame(&mut br, true, true).unwrap();
+        assert_eq!(p, Svq3MvPrecision::Fullpel);
+        assert_eq!(br.bits_consumed(), 2);
+    }
+
+    #[test]
+    fn precision_p_frame_truncated_returns_error() {
+        // has_thirdpel=true but no bits available.
+        let mut br = BitReader::new(&[]);
+        let err = read_inter_mv_precision_p_frame(&mut br, true, false).unwrap_err();
+        assert!(matches!(err, Error::Truncated));
+    }
+
+    #[test]
+    fn precision_p_frame_both_flags_consumes_at_most_two_bits() {
+        // has_thirdpel=true, has_halfpel=true: regardless of which
+        // sub-branch is taken, the function consumes at most 2 bits.
+        // Sweep all four (bit0, bit1) combinations and verify the
+        // bit-consumption ceiling.
+        for first in 0..=1u32 {
+            for second in 0..=1u32 {
+                let bytes = pack_bits_msb_first(2, (first << 1) | second);
+                let mut br = BitReader::new(&bytes);
+                let _ = read_inter_mv_precision_p_frame(&mut br, true, true).unwrap();
+                assert!(br.bits_consumed() <= 2);
+                // When first=0 (Thirdpel branch taken) only 1 bit
+                // consumed.
+                if first == 0 {
+                    assert_eq!(br.bits_consumed(), 1);
+                } else {
+                    assert_eq!(br.bits_consumed(), 2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn precision_dispatch_b_frame_always_halfpel_no_bits_read() {
+        // B-frame inter macroblocks always halfpel; no bits consumed.
+        let bytes: [u8; 1] = [0xAA]; // sentinel — must not be read
+        let mut br = BitReader::new(&bytes);
+        let p = read_inter_mv_precision(&mut br, Svq3FrameType::Bidirectional, true, true).unwrap();
+        assert_eq!(p, Svq3MvPrecision::Halfpel);
+        assert_eq!(br.bits_consumed(), 0);
+    }
+
+    #[test]
+    fn precision_dispatch_p_frame_delegates() {
+        // P-frame branch matches the standalone function exactly.
+        let bytes = pack_bits_msb_first(1, 1);
+        let mut br = BitReader::new(&bytes);
+        let p = read_inter_mv_precision(&mut br, Svq3FrameType::Predicted, true, false).unwrap();
+        assert_eq!(p, Svq3MvPrecision::Thirdpel);
+        assert_eq!(br.bits_consumed(), 1);
+    }
+
+    #[test]
+    fn precision_dispatch_i_frame_is_fullpel_no_bits_read() {
+        // I-frame slices have no inter macroblocks; the dispatch
+        // returns fullpel without reading any bit (defensive
+        // behaviour; in practice the caller never reaches here).
+        let bytes: [u8; 1] = [0x55];
+        let mut br = BitReader::new(&bytes);
+        let p = read_inter_mv_precision(&mut br, Svq3FrameType::Intra, true, true).unwrap();
+        assert_eq!(p, Svq3MvPrecision::Fullpel);
+        assert_eq!(br.bits_consumed(), 0);
+    }
+
+    #[test]
+    fn precision_enum_variants_distinct() {
+        // Sanity — the three variants are distinct.
+        assert_ne!(Svq3MvPrecision::Fullpel, Svq3MvPrecision::Halfpel);
+        assert_ne!(Svq3MvPrecision::Halfpel, Svq3MvPrecision::Thirdpel);
+        assert_ne!(Svq3MvPrecision::Fullpel, Svq3MvPrecision::Thirdpel);
+    }
+
+    #[test]
+    fn precision_enum_is_copy_and_hashable_for_match_use() {
+        // Compile-time check via std::mem::size_of and a match. If
+        // the enum ever grows non-Copy fields these stop compiling.
+        fn require_copy<T: Copy>() {}
+        require_copy::<Svq3MvPrecision>();
+        let p = Svq3MvPrecision::Halfpel;
+        let q = p;
+        assert_eq!(p, q);
     }
 }

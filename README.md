@@ -5,9 +5,27 @@ Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 
 ## Status
 
-**Round 5 — SVQ3 residual coefficient walker.** The per-block
-Golomb-coded `(run, value)` residual coefficient stream from the
-wiki spec's §"Coefficient decoding" now lands in the new
+**Round 6 — SVQ3 inter-MB motion-vector precision selector.** The
+three-branch decision documented in the wiki spec's §"Inter
+macroblock information decoding" lands in the `svq3_mb` module as a
+typed reader returning one of three sample-grid precisions
+(`Svq3MvPrecision::{Fullpel, Halfpel, Thirdpel}`). The selector
+honours the spec's short-circuit evaluation exactly: when the
+sequence header's `has_thirdpel` / `has_halfpel` flags are both off
+no bit is consumed and the result is `Fullpel`; when exactly one
+flag is set the selector reads one bit; when both are set the
+function reads one or two bits depending on the first bit's value.
+The frame-type-dispatched `read_inter_mv_precision` also
+short-circuits B-frame inter macroblocks to halfpel without reading
+any bit, per the spec's §"Macroblock transform and dequantization"
+remark "it is always halfpel precision in B-frames". Round 6 remains
+structural — the actual motion-vector difference VLC is still gated
+on the spec's SVQ3 MV component VLC table, which is not enumerated
+bit-for-bit in the local mirror.
+
+Carried forward from round 5: **SVQ3 residual coefficient walker.**
+The per-block Golomb-coded `(run, value)` residual coefficient
+stream from the wiki spec's §"Coefficient decoding" lands in the
 `svq3_coeff` module: three coefficient-table variants (2×2 chroma
 DC, alternative-scan 4×4 luma-intra-with-low-quantiser, normal-
 zigzag everything else) plus the two run-correction arrays
