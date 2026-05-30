@@ -1,0 +1,22 @@
+source: reference/binaries/quicktimethirdparty.qtx
+source_sha256: ac3509bf22aa1458dfc6e1af980956c0153b4c287af452ae5b9cac6f923be169
+size_bytes: 598016
+image_base_hex: 0x67d70000
+vma_start_hex: 0x67dcd200
+vma_end_exclusive_hex: 0x67dcd224
+file_offset_start_hex: 0x0005d200
+file_offset_end_exclusive_hex: 0x0005d224
+byte_length: 36
+section: .rdata
+record_count: 9
+record_size_bytes: 4
+endianness: record (b0=level, b3=size/flag)
+sample_signedness: mixed (level bytes unsigned; block-shape LUT unsigned 1..4)
+interpretation: Level-descriptor table (records b0=level index 5..0) followed at +0x14 by the 16-entry block-shape LUT (values 1..4). Caps VQ-coded levels at 4 distinct block sizes -> gates L0..L3 codebooks only.
+tool: python3 struct + PE section table (file offset == RVA in .rdata)
+method: fixed-offset slice 0x5d200..0x5d224; boundary from descriptor record decode (b0 cycles 5..0) and block-shape LUT at 0x5d214
+notes: |
+  Two identical descriptor groups precede the LUT (0x5d1cc and 0x5d1f4);
+  each enumerates the full six-level block hierarchy 5..0, but only the
+  four smallest levels (L0..L3) have stored codebooks (see codebook-l0l3).
+  Block-shape LUT bytes: 04 04 03 02 04 03 03 02 03 03 02 02 03 02 02 01.

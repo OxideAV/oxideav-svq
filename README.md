@@ -5,31 +5,65 @@ Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 
 ## Status
 
-**Round 8 — SVQ1 block-tree subdivision walker (structural).** The
-recursive subdivide-vs-quantise decision tree the wiki spec defines
-in §"Decoding Intraframe Plane Data" lands as a new `svq1_blocktree`
-module. The walker covers all six levels (L=5 16×16 down to L=0
-4×2), reads one bit per non-leaf decision (with L=0 short-circuiting
-to "quantise"), and surfaces the wiki spec's `(stages > 0) && (level
->= 4)` invalid-vector branch through a new
+**Round 9 — SVQ1 L=0..L=3 codebook payload landed.** The 23004-byte
+mean-removed multistage VQ payload and its 36-byte
+descriptor/block-shape prefix are now compile-time constants in the
+new `svq1_codebook` module. The bytes come bit-exact from
+`tables/codebook-l0l3.csv` + `tables/codebook-descriptor.csv`,
+mirrors of `docs/video/svq1/tables/` populated by the docs-collab
+Extractor 02 pass (`docs/video/svq1/provenance/02-codebook-extraction.md`)
+from the reference binary `quicktimethirdparty.qtx`
+SHA-256 `ac3509bf22aa1458dfc6e1af980956c0153b4c287af452ae5b9cac6f923be169`,
+file offset `0x5d200..0x62c00` (VMA `0x67dcd200..0x67dd2c00`). A new
+build script parses the CSVs at build time and emits
+`SVQ1_CODEBOOK_L0L3_BYTES: [i8; 23004]`,
+`SVQ1_CODEBOOK_DESCRIPTOR: [u8; 36]`, and
+`SVQ1_BLOCK_SHAPE_LUT: [u8; 16]` under `$OUT_DIR/`; ergonomic
+accessors (`codebook_l0l3_payload`, `codebook_descriptor`,
+`block_shape_lut`) plus per-level size constants
+(`SVQ1_CODEBOOK_PAYLOAD_BYTES = 23004`,
+`SVQ1_CODEBOOK_DESCRIPTOR_BYTES = 36`,
+`SVQ1_STAGES_PER_LEVEL = 6`,
+`SVQ1_ENTRIES_PER_STAGE = 16`) round out the surface. A new
+`Svq1Level::codebook_bytes_per_half()` const method returns the
+per-level codebook size for one half (intra OR inter) — 768 / 1536
+/ 3072 / 6144 for L=0..L=3, `None` for L=4 / L=5 — matching the
+`docs/video/svq1/tables/codebook-l0l3.meta` size arithmetic
+`2 × (768 + 1536 + 3072 + 6144) = 23040 B = 36 B descriptor +
+23004 B payload`. Eleven new unit tests cover payload + descriptor
+lengths, the full-region size arithmetic, per-level byte counts, the
+L=4 / L=5 `None` rejection, the 16-entry block-shape LUT against the
+exact byte string recorded in `codebook-descriptor.meta` line 22
+(`04 04 03 02 04 03 03 02 03 03 02 02 03 02 02 01`), the LUT cap at
+`1..=4` (corroborating the §14.10 / §14.11 ABSENT findings), the
+first descriptor record's `(b0=0x03, b3=0x18, b4=0x02)` byte
+pattern, the first 16 i8 entries against `codebook-l0l3.hex` row 1
+(`02 01 00 ff 01 00 ff ff 01 00 ff fe 00 ff fe fd`), and accessor
+aliasing. Total tests: 192 (up from 181). Round 9 deliberately does
+NOT yet expose a `(level, stage, intra_or_inter, vector_idx) →
+&[i8]` lookup — the precise intra-vs-inter ordering and
+stage-vs-level interleave WITHIN the 23004-byte payload is a sibling
+docs spec task per `codebook-l0l3.meta` lines 30-32 ("the L0..L3
+spec's concern"). Full pixel reconstruction unblocks when the
+internal-layout spec lands.
+
+Carried forward from round 8: **SVQ1 block-tree subdivision walker
+(structural).** The recursive subdivide-vs-quantise decision tree
+the wiki spec defines in §"Decoding Intraframe Plane Data" lands as
+the `svq1_blocktree` module. The walker covers all six levels (L=5
+16×16 down to L=0 4×2), reads one bit per non-leaf decision (with
+L=0 short-circuiting to "quantise"), and surfaces the wiki spec's
+`(stages > 0) && (level >= 4)` invalid-vector branch through the
 `Error::InvalidLevelQuantise(Svq1Level)` variant. The L=4 / L=5
-rejection is corroborated by the newly-staged clean-room
-codebook-extraction docs `docs/video/svq1/spec/14.10-codebook-L4.md`
+rejection is corroborated by `docs/video/svq1/spec/14.10-codebook-L4.md`
 and `docs/video/svq1/spec/14.11-codebook-L5.md` (both resolve to
 "no codebook stored at this level in this build — always
-subdivided"). The new public surface is `Svq1Level { L0..L5 }`
+subdivided"). The round-8 public surface is `Svq1Level { L0..L5 }`
 (with `block_dims` / `vector_length` /
 `rejects_in_place_quantise` const accessors),
 `Svq1BlockDecision { Subdivide, Quantise }`,
 `read_block_decision(level, &mut BitReader)`, and a `const fn
-subdivide(level)` returning the two child levels. Thirteen new unit
-tests cover the level / vector-length tables, every
-subdivide / quantise / truncation path per level, the L=4 / L=5
-rejection, and a worked seven-bit breadth-first walk through three
-macroblocks. Round 8 stays structural — the per-leaf "stages count
-VLC + mean VLC + (stages × 4)-bit codebook selector" payload remains
-gated on the L=0..L=3 codebook layout / VLC table work tracked in
-`docs/video/svq1/CODEBOOK_GAP.md`.
+subdivide(level)` returning the two child levels.
 
 Carried forward from round 7: **SVQ3 intra-4×4
 predictor-from-neighbour resolution helper.** The wiki spec's

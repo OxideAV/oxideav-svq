@@ -1,0 +1,34 @@
+source: reference/binaries/quicktimethirdparty.qtx
+source_sha256: ac3509bf22aa1458dfc6e1af980956c0153b4c287af452ae5b9cac6f923be169
+size_bytes: 598016
+image_base_hex: 0x67d70000
+vma_start_hex: 0x67dcd224
+vma_end_exclusive_hex: 0x67dd2c00
+file_offset_start_hex: 0x0005d224
+file_offset_end_exclusive_hex: 0x00062c00
+byte_length: 23004
+section: .rdata
+record_count: 23004
+record_size_bytes: 1
+endianness: none (per-byte i8 deltas)
+sample_signedness: signed i8 (mean-removed VQ vector components)
+interpretation: SVQ1 mean-removed multistage VQ codebooks for the four smallest block levels: L0(4x2,8B) L1(4x4,16B) L2(8x4,32B) L3(8x8,64B), each 6 stages x 16 entries, for both the intra and inter halves. 23040 B == 2 * (768+1536+3072+6144).
+tool: python3 struct + PE section table; byte-distribution + size-arithmetic
+method: contiguous slice 0x5d224..0x62c00; start = first byte after the descriptor/LUT prefix; end = where the signed-byte VQ character breaks into a 32-bit-float / embedded-resource blob (BM header at 0x62c14)
+notes: |
+  vector payload = 23004 B (region 0x5d200..0x62c00 = 23040 B incl
+  the 36-byte descriptor/LUT prefix at 0x5d200..0x5d224).
+  signed_mean=-0.0031  abs_mean=3.44  min=-93  max=93
+  entropy ~4.1 bits/byte -> structured, NOT compressed.
+  canonical L0..L3 per-side (intra OR inter) = 11520 B; both sides = 23040 B.
+  region total 23040 B = 23040 B canonical (= 36 B over
+  the 23004 B vector payload; the 36 B is the descriptor/LUT prefix).
+    L0: vec_len=8B  stage=128B  6-stage codebook=768B
+    L1: vec_len=16B  stage=256B  6-stage codebook=1536B
+    L2: vec_len=32B  stage=512B  6-stage codebook=3072B
+    L3: vec_len=64B  stage=1024B  6-stage codebook=6144B
+  NOTE: the precise intra/inter ordering and stage-vs-level interleave
+  WITHIN this region is the L0..L3 spec's concern (sibling task); this
+  table is the verified contiguous byte payload. The decisive round-2
+  fact is that the region holds the L0..L3 codebooks (size matches
+  2*(L0+L1+L2+L3)) and has no room for L4/L5.

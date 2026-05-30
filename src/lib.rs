@@ -1,8 +1,35 @@
 //! Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec.
 //!
+//! **Round 9 — SVQ1 L=0..L=3 codebook payload landed.**
+//!
+//! Round 9 lands the 23004-byte mean-removed multistage VQ payload
+//! and its 36-byte descriptor prefix as compile-time constants
+//! ([`svq1_codebook`]), parsed at build time from the bit-exact
+//! `tables/codebook-l0l3.csv` + `tables/codebook-descriptor.csv`
+//! mirrors of `docs/video/svq1/tables/`. The docs were produced by
+//! Extractor 02 (`docs/video/svq1/provenance/02-codebook-extraction.md`)
+//! from the reference binary `quicktimethirdparty.qtx`
+//! SHA-256 `ac3509bf22aa1458dfc6e1af980956c0153b4c287af452ae5b9cac6f923be169`,
+//! file offset `0x5d200..0x62c00`. The new
+//! [`Svq1Level::codebook_bytes_per_half`] returns the
+//! per-level codebook size for one half (intra OR inter) — 768 / 1536
+//! / 3072 / 6144 for L=0..L=3, `None` for L=4 / L=5 — matching the
+//! `docs/video/svq1/tables/codebook-l0l3.meta` size arithmetic
+//! `2 × (768 + 1536 + 3072 + 6144) = 23040 B = 36 B descriptor +
+//! 23004 B payload`. The 16-entry block-shape LUT at descriptor
+//! offset `+0x14` is exposed via
+//! [`svq1_codebook::block_shape_lut`]; all entries are in `1..=4`,
+//! corroborating the §14.10 / §14.11 ABSENT findings for L=4 and L=5
+//! codebooks. The internal intra-vs-inter ordering and stage-vs-level
+//! interleave within the 23004-byte payload remains a sibling docs
+//! spec task per `codebook-l0l3.meta` — full pixel reconstruction
+//! waits on that layout doc.
+//!
+//! ## Earlier rounds (carried forward)
+//!
 //! **Round 8 — SVQ1 block-tree subdivision walker.**
 //!
-//! Round 8 lands the recursive subdivide-vs-quantise decision tree
+//! Round 8 landed the recursive subdivide-vs-quantise decision tree
 //! the SVQ1 wire format defines in
 //! `docs/video/svq1/wiki/Sorenson_Video_1.wiki` §"Decoding Intraframe
 //! Plane Data" as a typed module ([`svq1_blocktree`]). The walker
@@ -134,6 +161,7 @@ mod bitreader;
 mod error;
 mod header;
 pub mod svq1_blocktree;
+pub mod svq1_codebook;
 pub mod svq3;
 pub mod svq3_coeff;
 pub mod svq3_mb;

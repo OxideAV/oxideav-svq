@@ -8,6 +8,54 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 9 — SVQ1 L=0..L=3 codebook payload landed.** The 23004-byte
+  mean-removed multistage VQ payload + 36-byte descriptor/block-shape
+  prefix from `docs/video/svq1/tables/` (Extractor 02, file offset
+  `0x5d200..0x62c00` of the reference binary `quicktimethirdparty.qtx`
+  SHA-256 `ac3509bf22aa1458dfc6e1af980956c0153b4c287af452ae5b9cac6f923be169`)
+  are now compile-time constants in a new `svq1_codebook` module.
+  - New crate-local `tables/` directory mirrors
+    `docs/video/svq1/tables/{codebook-l0l3,codebook-descriptor}.{csv,hex,meta}`
+    + `MANIFEST-02.sha256` bit-exact so the in-repo CI checkout can
+    build without reaching out to the docs submodule.
+  - New `build.rs` parses the two CSVs (`value_signed` column) at
+    build time and emits `SVQ1_CODEBOOK_L0L3_BYTES: [i8; 23004]`,
+    `SVQ1_CODEBOOK_DESCRIPTOR: [u8; 36]`,
+    `SVQ1_BLOCK_SHAPE_LUT: [u8; 16]` under `$OUT_DIR/`.
+  - `svq1_codebook::Svq1Level::codebook_bytes_per_half()` const
+    method returns `Some(768)` / `Some(1536)` / `Some(3072)` /
+    `Some(6144)` for L=0..L=3 (one half — intra OR inter) and `None`
+    for L=4 / L=5. Per-half × 2 summed across L=0..L=3 is
+    `2 × (768 + 1536 + 3072 + 6144) = 23040 B`, matching the
+    `36 B descriptor + 23004 B payload` region total.
+  - Public accessors: `codebook_l0l3_payload() -> &'static [i8]`,
+    `codebook_descriptor() -> &'static [u8]`, `block_shape_lut() ->
+    &'static [u8]`.
+  - Public size constants: `SVQ1_CODEBOOK_PAYLOAD_BYTES = 23004`,
+    `SVQ1_CODEBOOK_DESCRIPTOR_BYTES = 36`,
+    `SVQ1_BLOCK_SHAPE_LUT_LEN = 16`, `SVQ1_STAGES_PER_LEVEL = 6`,
+    `SVQ1_ENTRIES_PER_STAGE = 16`.
+  - 11 unit tests cover payload + descriptor lengths, the
+    full-region size arithmetic, per-level byte counts, L=4 / L=5
+    `None` rejection, the 16-entry block-shape LUT against the exact
+    byte string `04 04 03 02 04 03 03 02 03 03 02 02 03 02 02 01`
+    recorded in `codebook-descriptor.meta` line 22, the LUT cap at
+    `1..=4` (corroborating the §14.10 / §14.11 ABSENT findings), the
+    first descriptor record's `(b0=0x03, b3=0x18, b4=0x02)` byte
+    pattern, the first 16 i8 entries against `codebook-l0l3.hex` row
+    1, and accessor aliasing. Total tests now 192 (was 181).
+  - **Deferred** — Round 9 deliberately does NOT yet expose a
+    `(level, stage, intra_or_inter, vector_idx) → &[i8]` lookup.
+    The precise intra-vs-inter ordering and stage-vs-level interleave
+    WITHIN the 23004-byte payload is a sibling docs spec task per
+    `docs/video/svq1/tables/codebook-l0l3.meta` lines 30-32 ("the
+    L0..L3 spec's concern"). Full pixel reconstruction unblocks when
+    the internal-layout spec lands. The L=4 / L=5 codebook bytes
+    themselves are confirmed ABSENT in this build per
+    `docs/video/svq1/spec/14.10-codebook-L4.md` and
+    `docs/video/svq1/spec/14.11-codebook-L5.md` — there is nothing
+    to add for those levels.
+
 - **Round 8 — SVQ1 block-tree subdivision walker (structural).** The
   recursive subdivide-vs-quantise decision tree described in
   `docs/video/svq1/wiki/Sorenson_Video_1.wiki` §"Decoding Intraframe
