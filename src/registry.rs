@@ -56,6 +56,10 @@ impl From<crate::Error> for Error {
                 "oxideav-svq: SVQ3 intra-4x4 prediction lookup landed on -1 sentinel \
                  at INTRA_PRED_TABLE[{top}][{left}][{idx}]"
             )),
+            crate::Error::InvalidLevelQuantise(level) => Error::InvalidData(format!(
+                "oxideav-svq: SVQ1 in-place quantise decision at {level:?} is illegal — \
+                 no codebook stored at this level (spec §14.10/§14.11)"
+            )),
             crate::Error::NotImplemented => Error::unsupported(
                 "oxideav-svq: SVQ1 pixel decode blocked on codebook docs-gap — see crates/oxideav-svq/README.md",
             ),

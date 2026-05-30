@@ -39,6 +39,19 @@ pub enum Error {
     /// tuple is `(top_index, left_index, idx)` after the spec's
     /// `top + 1` / `left + 1` adjustment.
     InvalidIntraPrediction(u8, u8, u8),
+    /// The SVQ1 block-tree subdivision walker read a `0` bit
+    /// (in-place quantise) at a level that has no codebook in this
+    /// build. Per `docs/video/svq1/wiki/Sorenson_Video_1.wiki`
+    /// §"Decoding Intraframe Plane Data" the inner loop fires
+    /// "invalid vector, error out of decode since levels 4 and 5
+    /// blocks do not use multistage VQ" when a quantised stage list
+    /// is seen at level ≥ 4. The clean-room codebook-extraction docs
+    /// `docs/video/svq1/spec/14.10-codebook-L4.md` and
+    /// `docs/video/svq1/spec/14.11-codebook-L5.md` confirm that no
+    /// L=4 / L=5 mean-removed vector codebook is stored in this
+    /// build's codebook region — the only codebooks present cover
+    /// L=0..L=3.
+    InvalidLevelQuantise(crate::svq1_blocktree::Svq1Level),
     /// Reserved scaffold variant. Surfaces from API endpoints (codec
     /// registration, frame decode) that the round-1 frame-header
     /// parser has not yet wired up.
@@ -74,6 +87,13 @@ impl core::fmt::Display for Error {
                     f,
                     "oxideav-svq: intra-4x4 prediction lookup landed on -1 sentinel \
                      at INTRA_PRED_TABLE[{top}][{left}][{idx}]"
+                )
+            }
+            Error::InvalidLevelQuantise(level) => {
+                write!(
+                    f,
+                    "oxideav-svq: SVQ1 in-place quantise decision at {level:?} is illegal — \
+                     no codebook stored at this level (spec §14.10/§14.11)"
                 )
             }
             Error::NotImplemented => f.write_str(

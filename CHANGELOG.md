@@ -8,6 +8,46 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 8 — SVQ1 block-tree subdivision walker (structural).** The
+  recursive subdivide-vs-quantise decision tree described in
+  `docs/video/svq1/wiki/Sorenson_Video_1.wiki` §"Decoding Intraframe
+  Plane Data" lands as a new `svq1_blocktree` module. The walker
+  reads ONE bit per level at L=1..=L=5 (1 ⇒ subdivide, 0 ⇒ quantise),
+  short-circuits the L=0 base case to "quantise" with no bit
+  consumed, and rejects the 0-bit (in-place quantise) branch at L=4
+  / L=5 with a new dedicated error variant. The L=4 / L=5 rejection
+  is corroborated by the newly-staged clean-room codebook-extraction
+  docs `docs/video/svq1/spec/14.10-codebook-L4.md` and
+  `docs/video/svq1/spec/14.11-codebook-L5.md`, both of which
+  resolve to "no codebook stored at this level in the Sorenson Video
+  TM for QT R2.0 build — the level is always subdivided".
+  - `svq1_blocktree::Svq1Level { L0, L1, L2, L3, L4, L5 }` —
+    typed level enum with `block_dims()` / `vector_length()` /
+    `rejects_in_place_quantise()` const methods matching the wiki
+    spec's level table (4×2 / 4×4 / 8×4 / 8×8 / 16×8 / 16×16; 8 /
+    16 / 32 / 64 / 128 / 256 samples; `true` only at L=4 / L=5).
+  - `svq1_blocktree::Svq1BlockDecision { Subdivide, Quantise }` —
+    typed result of one block-tree node.
+  - `svq1_blocktree::read_block_decision(level, &mut BitReader) ->
+    Result<Svq1BlockDecision>` — one-bit walker; L=0 short-circuits
+    to `Quantise` without reading a bit; L=4 / L=5 0-bit returns
+    `Error::InvalidLevelQuantise(level)`.
+  - `svq1_blocktree::subdivide(Svq1Level) -> Option<(Svq1Level,
+    Svq1Level)>` — `const fn` returning the two child levels for
+    any non-leaf level, `None` at L=0.
+  - `Error::InvalidLevelQuantise(Svq1Level)` — new error variant
+    surfacing the wiki spec's "invalid vector, error out of decode
+    since levels 4 and 5 blocks do not use multistage VQ"
+    condition. Mapped to `oxideav_core::Error::InvalidData` via the
+    existing `From<crate::Error> for oxideav_core::Error` impl.
+  - 13 unit tests covering the level table, vector-length table,
+    every per-level subdivide/quantise/truncation path, the
+    L=4 / L=5 rejection, and a worked 7-bit breadth-first walk.
+  - Round 8 stays structural — the per-leaf "stages count VLC +
+    mean VLC + (stages × 4)-bit codebook selector" payload
+    remains gated on the L=0..L=3 codebook layout / VLC table
+    work tracked in `docs/video/svq1/CODEBOOK_GAP.md`.
+
 - **Round 7 — SVQ3 intra-4×4 predictor-from-neighbour resolution
   helper.** The per-sub-block predictor lookup described in
   `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Intra macroblock

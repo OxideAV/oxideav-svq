@@ -1,6 +1,28 @@
 //! Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec.
 //!
-//! **Round 5 — SVQ3 residual coefficient walker.**
+//! **Round 8 — SVQ1 block-tree subdivision walker.**
+//!
+//! Round 8 lands the recursive subdivide-vs-quantise decision tree
+//! the SVQ1 wire format defines in
+//! `docs/video/svq1/wiki/Sorenson_Video_1.wiki` §"Decoding Intraframe
+//! Plane Data" as a typed module ([`svq1_blocktree`]). The walker
+//! covers the spec's six levels (L=5 16×16 down to L=0 4×2), reads
+//! one bit per non-leaf decision (with L=0 short-circuiting to
+//! "quantise"), and surfaces the wiki spec's
+//! `(stages > 0) && (level >= 4)` error path through a new
+//! [`Error::InvalidLevelQuantise`] variant. The L=4 / L=5 rejection
+//! is corroborated by the clean-room codebook-extraction docs
+//! `docs/video/svq1/spec/14.10-codebook-L4.md` and
+//! `docs/video/svq1/spec/14.11-codebook-L5.md` (RESOLVED 2026-05-30
+//! — no codebook stored at those levels in the Sorenson Video TM
+//! for QT R2.0 build; the codebook region only covers L=0..L=3).
+//! The per-leaf payload (stages-count VLC + mean VLC + codebook
+//! selector bits) is still gated on the L=0..L=3 codebook layout
+//! work tracked in `docs/video/svq1/CODEBOOK_GAP.md`.
+//!
+//! ## Earlier rounds (carried forward)
+//!
+//! Round 5 — SVQ3 residual coefficient walker.
 //!
 //! Round 4 landed the SVQ3 macroblock-type tree walk + the intra-
 //! prediction lookup tables. Round 5 adds the per-block residual
@@ -111,6 +133,7 @@
 mod bitreader;
 mod error;
 mod header;
+pub mod svq1_blocktree;
 pub mod svq3;
 pub mod svq3_coeff;
 pub mod svq3_mb;

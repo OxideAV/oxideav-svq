@@ -5,8 +5,35 @@ Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 
 ## Status
 
-**Round 7 — SVQ3 intra-4×4 predictor-from-neighbour resolution
-helper.** The wiki spec's §"Intra macroblock information decoding"
+**Round 8 — SVQ1 block-tree subdivision walker (structural).** The
+recursive subdivide-vs-quantise decision tree the wiki spec defines
+in §"Decoding Intraframe Plane Data" lands as a new `svq1_blocktree`
+module. The walker covers all six levels (L=5 16×16 down to L=0
+4×2), reads one bit per non-leaf decision (with L=0 short-circuiting
+to "quantise"), and surfaces the wiki spec's `(stages > 0) && (level
+>= 4)` invalid-vector branch through a new
+`Error::InvalidLevelQuantise(Svq1Level)` variant. The L=4 / L=5
+rejection is corroborated by the newly-staged clean-room
+codebook-extraction docs `docs/video/svq1/spec/14.10-codebook-L4.md`
+and `docs/video/svq1/spec/14.11-codebook-L5.md` (both resolve to
+"no codebook stored at this level in this build — always
+subdivided"). The new public surface is `Svq1Level { L0..L5 }`
+(with `block_dims` / `vector_length` /
+`rejects_in_place_quantise` const accessors),
+`Svq1BlockDecision { Subdivide, Quantise }`,
+`read_block_decision(level, &mut BitReader)`, and a `const fn
+subdivide(level)` returning the two child levels. Thirteen new unit
+tests cover the level / vector-length tables, every
+subdivide / quantise / truncation path per level, the L=4 / L=5
+rejection, and a worked seven-bit breadth-first walk through three
+macroblocks. Round 8 stays structural — the per-leaf "stages count
+VLC + mean VLC + (stages × 4)-bit codebook selector" payload remains
+gated on the L=0..L=3 codebook layout / VLC table work tracked in
+`docs/video/svq1/CODEBOOK_GAP.md`.
+
+Carried forward from round 7: **SVQ3 intra-4×4
+predictor-from-neighbour resolution helper.** The wiki spec's
+§"Intra macroblock information decoding"
 describes the per-sub-block 4×4 intra-prediction mode as a lookup
 `pred_table[top + 1][left + 1][idx]` against the
 [`svq3_mb::INTRA_PRED_TABLE`] constant, with two substitution rules
