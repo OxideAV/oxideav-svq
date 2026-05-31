@@ -39,6 +39,19 @@
 //! [`Svq1Level::codebook_bytes_per_half`] for the codebook size
 //! returned per level (`None` for L=4 / L=5).
 //!
+//! The two `tables/codebook-l{4,5}.meta` records produced by the docs
+//! collaborator's Extractor 02 pass (mirrored bit-exact under
+//! `crates/oxideav-svq/tables/`) are parsed at build time into the
+//! typed [`Svq1AbsentLevelRecord`] constants [`SVQ1_L4_ABSENCE`] and
+//! [`SVQ1_L5_ABSENCE`]. The build script verifies that each record's
+//! `status` field reads `ABSENT` and that the canonical
+//! vector-length / per-half byte-count fields match the values
+//! derivable from [`Svq1Level::vector_length`], so a future docs
+//! revision that flips a level back to "present" or silently changes
+//! the canonical sizes fails the build before any consumer relies on
+//! the `None` invariant. See [`Svq1Level::absence_record`] for the
+//! ergonomic `Svq1Level → Option<Svq1AbsentLevelRecord>` accessor.
+//!
 //! ## Open work (not blocked on this crate)
 //!
 //! The exact intra-vs-inter ordering and the stage-vs-level
@@ -75,6 +88,55 @@ pub const SVQ1_STAGES_PER_LEVEL: usize = 6;
 /// Number of vector entries per stage.
 pub const SVQ1_ENTRIES_PER_STAGE: usize = 16;
 
+/// Typed mirror of a `codebook-lN.meta` `status: ABSENT` record under
+/// `docs/video/svq1/tables/`.
+///
+/// Each instance corresponds to one architecturally-absent SVQ1
+/// codebook level (L=4 or L=5 in the Sorenson Video TM for QT R2.0
+/// build). The fields are exactly the meta file's scalar keys
+/// (`level`, `block_size`, `canonical_vector_len_bytes`,
+/// `canonical_6stage_intra_or_inter_bytes`) — the multi-line
+/// `resolution` and `evidence_rvas` YAML-block scalars are not
+/// mirrored here; consult `docs/video/svq1/tables/codebook-l{4,5}.meta`
+/// for the binary evidence that pinned each record as ABSENT.
+///
+/// The `canonical_*` fields document the size the codebook **would**
+/// have under the conventional six-level extension of the
+/// codebook hierarchy. `canonical_vector_len_bytes` equals
+/// `block_cols * block_rows` samples;
+/// `canonical_6stage_intra_or_inter_bytes` equals
+/// `canonical_vector_len_bytes` multiplied by `16` (entries per
+/// stage) and by `6` (stages per level). The values are deliberately
+/// kept in the constant so the build assertion can verify that the
+/// docs and the code agree on the would-be footprint that was ruled
+/// out.
+///
+/// See [`SVQ1_L4_ABSENCE`] and [`SVQ1_L5_ABSENCE`] for the two
+/// instances populated by `build.rs` from
+/// `tables/codebook-l{4,5}.meta`, and [`Svq1Level::absence_record`]
+/// for the ergonomic accessor that returns one of those constants
+/// (or `None` for the L=0..L=3 codebooks that ARE present).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Svq1AbsentLevelRecord {
+    /// Level number — `4` or `5`, mirroring the `level:` key.
+    pub level: u8,
+    /// Block size — `"16x8"` or `"16x16"`, mirroring the
+    /// `block_size:` key. `'static str` because the build script
+    /// substitutes the literal at compile time.
+    pub block_size: &'static str,
+    /// Canonical per-vector byte count — `128` (L=4) or `256` (L=5),
+    /// mirroring the `canonical_vector_len_bytes:` key. Equal to
+    /// `block_cols * block_rows` per the level's spec table.
+    pub canonical_vector_len_bytes: u32,
+    /// Canonical per-half codebook size in bytes — `12288` (L=4) or
+    /// `24576` (L=5), mirroring the
+    /// `canonical_6stage_intra_or_inter_bytes:` key. Equal to
+    /// `canonical_vector_len_bytes * 16 entries * 6 stages`. The full
+    /// would-be codebook (both halves) is twice this value; neither
+    /// fits in the reference binary's signed-byte VQ region.
+    pub canonical_6stage_intra_or_inter_bytes: u32,
+}
+
 impl Svq1Level {
     /// Byte count of the L=`self` codebook for **one** half
     /// (intra OR inter), or `None` for the always-subdivided levels
@@ -105,6 +167,31 @@ impl Svq1Level {
             Svq1Level::L2 => Some(32 * SVQ1_ENTRIES_PER_STAGE * SVQ1_STAGES_PER_LEVEL),
             Svq1Level::L3 => Some(64 * SVQ1_ENTRIES_PER_STAGE * SVQ1_STAGES_PER_LEVEL),
             Svq1Level::L4 | Svq1Level::L5 => None,
+        }
+    }
+
+    /// Return the [`Svq1AbsentLevelRecord`] for the always-subdivided
+    /// levels (L=4 / L=5), or `None` for the L=0..L=3 levels that DO
+    /// have a codebook stored in the reference binary.
+    ///
+    /// The returned record is one of the [`SVQ1_L4_ABSENCE`] /
+    /// [`SVQ1_L5_ABSENCE`] constants that `build.rs` populates from
+    /// `tables/codebook-l{4,5}.meta`. Use this when you want to
+    /// surface a structured "no codebook at this level" diagnostic
+    /// — e.g. when rejecting a malformed bitstream that asks for an
+    /// in-place quantisation at L=4 or L=5 (the
+    /// [`crate::Error::InvalidLevelQuantise`] case) — without
+    /// hard-coding the canonical-size numbers in the caller.
+    ///
+    /// Invariant guaranteed by the build script:
+    /// `self.absence_record().is_some() ==
+    ///  self.codebook_bytes_per_half().is_none()` for every
+    /// `Svq1Level`. Both predicates fire on exactly the L=4 / L=5 set.
+    pub const fn absence_record(self) -> Option<Svq1AbsentLevelRecord> {
+        match self {
+            Svq1Level::L4 => Some(SVQ1_L4_ABSENCE),
+            Svq1Level::L5 => Some(SVQ1_L5_ABSENCE),
+            Svq1Level::L0 | Svq1Level::L1 | Svq1Level::L2 | Svq1Level::L3 => None,
         }
     }
 }
@@ -254,5 +341,93 @@ mod tests {
         let d = codebook_descriptor();
         assert_eq!(d.len(), 36);
         assert_eq!(d.as_ptr(), SVQ1_CODEBOOK_DESCRIPTOR.as_ptr());
+    }
+
+    #[test]
+    fn svq1_l4_absence_matches_meta_constants() {
+        // tables/codebook-l4.meta: level=4, block_size=16x8,
+        // canonical_vector_len_bytes=128,
+        // canonical_6stage_intra_or_inter_bytes=12288, status=ABSENT.
+        // The build script asserts `status == ABSENT` at compile
+        // time — here we just sanity-check the scalar fields the
+        // generated constant carries forward.
+        assert_eq!(SVQ1_L4_ABSENCE.level, 4);
+        assert_eq!(SVQ1_L4_ABSENCE.block_size, "16x8");
+        assert_eq!(SVQ1_L4_ABSENCE.canonical_vector_len_bytes, 128);
+        assert_eq!(SVQ1_L4_ABSENCE.canonical_6stage_intra_or_inter_bytes, 12288);
+        // Per-half byte count must equal vector_len * 16 entries * 6 stages.
+        assert_eq!(
+            SVQ1_L4_ABSENCE.canonical_6stage_intra_or_inter_bytes,
+            SVQ1_L4_ABSENCE.canonical_vector_len_bytes
+                * SVQ1_ENTRIES_PER_STAGE as u32
+                * SVQ1_STAGES_PER_LEVEL as u32
+        );
+    }
+
+    #[test]
+    fn svq1_l5_absence_matches_meta_constants() {
+        // tables/codebook-l5.meta: level=5, block_size=16x16,
+        // canonical_vector_len_bytes=256,
+        // canonical_6stage_intra_or_inter_bytes=24576, status=ABSENT.
+        assert_eq!(SVQ1_L5_ABSENCE.level, 5);
+        assert_eq!(SVQ1_L5_ABSENCE.block_size, "16x16");
+        assert_eq!(SVQ1_L5_ABSENCE.canonical_vector_len_bytes, 256);
+        assert_eq!(SVQ1_L5_ABSENCE.canonical_6stage_intra_or_inter_bytes, 24576);
+        assert_eq!(
+            SVQ1_L5_ABSENCE.canonical_6stage_intra_or_inter_bytes,
+            SVQ1_L5_ABSENCE.canonical_vector_len_bytes
+                * SVQ1_ENTRIES_PER_STAGE as u32
+                * SVQ1_STAGES_PER_LEVEL as u32
+        );
+    }
+
+    #[test]
+    fn absence_record_canonical_sizes_match_vector_length() {
+        // The build-asserted `canonical_vector_len_bytes` field of
+        // each absence record must agree with the corresponding
+        // `Svq1Level::vector_length()` value. This is the property
+        // that lets `Svq1Level::absence_record` stand in for the
+        // raw meta-file content.
+        assert_eq!(
+            SVQ1_L4_ABSENCE.canonical_vector_len_bytes,
+            Svq1Level::L4.vector_length() as u32
+        );
+        assert_eq!(
+            SVQ1_L5_ABSENCE.canonical_vector_len_bytes,
+            Svq1Level::L5.vector_length() as u32
+        );
+    }
+
+    #[test]
+    fn absence_record_accessor_returns_l4_l5_records() {
+        // L=4 / L=5 → Some(record); L=0..L=3 → None.
+        assert_eq!(Svq1Level::L4.absence_record(), Some(SVQ1_L4_ABSENCE));
+        assert_eq!(Svq1Level::L5.absence_record(), Some(SVQ1_L5_ABSENCE));
+        assert_eq!(Svq1Level::L0.absence_record(), None);
+        assert_eq!(Svq1Level::L1.absence_record(), None);
+        assert_eq!(Svq1Level::L2.absence_record(), None);
+        assert_eq!(Svq1Level::L3.absence_record(), None);
+    }
+
+    #[test]
+    fn absence_and_codebook_predicates_are_complementary() {
+        // Documented invariant on Svq1Level::absence_record: an L=N
+        // for which `absence_record()` returns Some MUST be the same
+        // L=N for which `codebook_bytes_per_half()` returns None,
+        // and vice versa. This locks the two surfaces together.
+        for level in [
+            Svq1Level::L0,
+            Svq1Level::L1,
+            Svq1Level::L2,
+            Svq1Level::L3,
+            Svq1Level::L4,
+            Svq1Level::L5,
+        ] {
+            assert_eq!(
+                level.absence_record().is_some(),
+                level.codebook_bytes_per_half().is_none(),
+                "absence_record / codebook_bytes_per_half disagree at {level:?}"
+            );
+        }
     }
 }

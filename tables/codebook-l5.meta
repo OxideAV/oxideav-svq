@@ -1,0 +1,29 @@
+source: reference/binaries/quicktimethirdparty.qtx
+source_sha256: ac3509bf22aa1458dfc6e1af980956c0153b4c287af452ae5b9cac6f923be169
+size_bytes: 598016
+image_base_hex: 0x67d70000
+level: 5
+block_size: 16x16
+canonical_vector_len_bytes: 256
+canonical_6stage_intra_or_inter_bytes: 24576
+status: ABSENT
+resolution: |
+  No L=5 (16x16) mean-removed vector codebook exists in this build.
+  Not static-at-RVA: no contiguous signed-byte block of 24576 B
+  (one half) or 49152 B (both halves) exists anywhere; the one
+  signed-byte VQ region (vectors 0x67dcd224..0x67dd2c00, 23004 B; with
+  the 36 B descriptor prefix the full region 0x67dcd200..0x67dd2c00 is
+  23040 B = 2*(L0+L1+L2+L3)) is the L0..L3 intra+inter set and is
+  bounded above by a float/resource blob.
+  Not generated/derived at runtime: `analyze` (DllMain) writes 0 bytes
+  that are later executed; no self-modifying/unpack step.
+  Not compressed: the present codebook region is plain signed bytes
+  (entropy ~4.1, mean ~0), not a compressed stream.
+  Mechanism: 16x8 and 16x16 blocks are always subdivided to <=8x8
+  before vector quantisation, so this level needs no codebook. The
+  block-shape LUT (codebook-descriptor, values 1..4) and the absence
+  of any *128 / *256 index scaling in .text corroborate this.
+evidence_rvas: |
+  codebook region   : 0x67dcd224..0x67dd2c00 (file 0x5d224..0x62c00)
+  descriptor/LUT    : 0x67dcd200..0x67dcd224 (file 0x5d200..0x5d224)
+  float/res blob end: 0x67dd2c00 onward (BM header at 0x67dd2c14)

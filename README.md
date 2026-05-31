@@ -5,7 +5,37 @@ Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 
 ## Status
 
-**Round 9 — SVQ1 L=0..L=3 codebook payload landed.** The 23004-byte
+**Round 197 — SVQ1 L=4 / L=5 codebook ABSENCE wired end-to-end.**
+The docs collaborator's Extractor 02 pass (`docs/video/svq1/spec/
+14.10-codebook-L4.md`, `spec/14.11-codebook-L5.md`,
+`tables/codebook-l{4,5}.meta`, `provenance/02-codebook-extraction.md`)
+RESOLVED the long-standing L=4 / L=5 codebook gap as
+**architecturally absent**: no L=4 (16×8) or L=5 (16×16) codebook
+exists in the Sorenson Video TM for QT R2.0 build; both block sizes
+are always subdivided to ≤8×8 before quantisation. Round 197
+mirrors the two new `codebook-l{4,5}.meta` records bit-exact under
+`crates/oxideav-svq/tables/`, extends `build.rs` to parse them at
+build time (asserting `status: ABSENT` + matching the canonical
+per-vector / per-half byte counts against the per-level invariants),
+and exposes the result as a typed [`Svq1AbsentLevelRecord`] +
+[`SVQ1_L4_ABSENCE`] / [`SVQ1_L5_ABSENCE`] constants alongside a
+new [`Svq1Level::absence_record`] `const fn` accessor that returns
+`Some(SVQ1_L4_ABSENCE)` / `Some(SVQ1_L5_ABSENCE)` for the L=4 / L=5
+absent levels and `None` for the L=0..L=3 present-codebook levels.
+A new `tests/svq1_codebook_l4_l5_absence.rs` integration suite
+walks every crate-public surface that depends on the absence
+contract — `Svq1Level::codebook_bytes_per_half`, the new
+`absence_record` accessor, the `SVQ1_L{4,5}_ABSENCE` constants
+themselves, the `read_block_decision` walker's
+`Error::InvalidLevelQuantise` rejection path, and the 16-entry
+block-shape LUT that caps quantised block sizes at L=3 — and asserts
+they all agree on which levels are absent (L=4, L=5) versus present
+(L=0..L=3). Total tests: 197 lib + 7 integration = 204 (up from 192).
+The internal intra-vs-inter ordering and stage-vs-level interleave
+within the 23004-byte L=0..L=3 payload remains a sibling docs spec
+task — full pixel reconstruction still waits on that layout doc.
+
+Carried forward from round 9: **SVQ1 L=0..L=3 codebook payload.** The 23004-byte
 mean-removed multistage VQ payload and its 36-byte
 descriptor/block-shape prefix are now compile-time constants in the
 new `svq1_codebook` module. The bytes come bit-exact from

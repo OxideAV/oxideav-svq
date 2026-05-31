@@ -8,6 +8,62 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 197 — SVQ1 L=4 / L=5 codebook ABSENCE wired end-to-end.**
+  The docs collaborator's Extractor 02 pass
+  (`docs/video/svq1/spec/14.10-codebook-L4.md`,
+  `spec/14.11-codebook-L5.md`,
+  `tables/codebook-l{4,5}.meta`,
+  `provenance/02-codebook-extraction.md`) RESOLVED the L=4 / L=5
+  codebook gap as **architecturally absent**: no codebook exists at
+  16×8 or 16×16 in the reference build; both block sizes are always
+  subdivided to ≤8×8 before quantisation.
+  - New crate-local `tables/codebook-l4.meta` + `codebook-l5.meta`
+    bit-exact mirrors of `docs/video/svq1/tables/`.
+  - `build.rs` now parses the two new meta files at build time;
+    a new `parse_absent_meta` helper asserts `status: ABSENT` +
+    `level` / `block_size` / `canonical_vector_len_bytes` /
+    `canonical_6stage_intra_or_inter_bytes` against the per-level
+    invariants (L=4 → `4 / 16x8 / 128 / 12288`; L=5 →
+    `5 / 16x16 / 256 / 24576`). A future docs revision that flips
+    `status` to "present" or quietly changes the canonical sizes
+    fails the build before any consumer relies on the `None`
+    branch.
+  - New `Svq1AbsentLevelRecord` typed struct
+    (`{ level, block_size, canonical_vector_len_bytes,
+       canonical_6stage_intra_or_inter_bytes }`).
+  - New `pub const SVQ1_L4_ABSENCE: Svq1AbsentLevelRecord` and
+    `pub const SVQ1_L5_ABSENCE: Svq1AbsentLevelRecord` populated by
+    `build.rs` from the meta files.
+  - New `Svq1Level::absence_record() -> Option<Svq1AbsentLevelRecord>`
+    `const fn`. Returns `Some(SVQ1_L{4,5}_ABSENCE)` for the
+    always-subdivided levels and `None` for L=0..L=3. Documented
+    invariant: `absence_record().is_some() ==
+    codebook_bytes_per_half().is_none()` for every level.
+  - 5 new unit tests in `svq1_codebook::tests` covering the
+    `SVQ1_L4_ABSENCE` / `SVQ1_L5_ABSENCE` constants
+    (level / block_size / vec_len / per-half), the per-half byte
+    count vs vector_length identity, the `absence_record` accessor
+    (L=4 / L=5 → Some, L=0..L=3 → None), and the
+    `absence_record.is_some() ⇔ codebook_bytes_per_half.is_none()`
+    invariant.
+  - 7 new integration tests in
+    `tests/svq1_codebook_l4_l5_absence.rs` exercising the full
+    end-to-end absence contract — `Svq1Level::L4` /
+    `Svq1Level::L5` reporting absent through every public surface,
+    `Svq1Level::L0..L3` reporting present, the
+    `read_block_decision` walker rejecting in-place quantisation
+    at L=4 / L=5 with the typed
+    `Error::InvalidLevelQuantise(level)` variant (with the level
+    field roundtripping through `absence_record()`), the
+    block-shape LUT capping at 4 corroborating the absence, and
+    the four absence-surface predicates agreeing on every level.
+  - Total tests: 197 lib + 7 integration = 204 (was 192 → +12).
+  - **Deferred** — the internal intra-vs-inter ordering and
+    stage-vs-level interleave WITHIN the 23004-byte L=0..L=3
+    payload remains a sibling docs spec task per
+    `docs/video/svq1/CODEBOOK_GAP.md` "remaining open work" note.
+    Full pixel reconstruction still waits on that layout doc.
+
 - **Round 9 — SVQ1 L=0..L=3 codebook payload landed.** The 23004-byte
   mean-removed multistage VQ payload + 36-byte descriptor/block-shape
   prefix from `docs/video/svq1/tables/` (Extractor 02, file offset
