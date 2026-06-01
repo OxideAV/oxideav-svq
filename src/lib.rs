@@ -1,5 +1,36 @@
 //! Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec.
 //!
+//! **Round 203 — SVQ1 saturating-clip + bit-mask helper LUTs.**
+//!
+//! Round 203 lands two small helper LUTs the docs collaborator's
+//! Extractor 02 pass identified in the SVQ1 `.rdata` region:
+//!
+//! * The 768-byte saturating-clip LUT at file offset
+//!   `0x5a100..0x5a400` (`docs/video/svq1/tables/clip_lut.{csv,meta}`)
+//!   — used by the codec on interpolation / overflow-saturation
+//!   paths; the meta is explicit that this is NOT a VQ codebook.
+//! * The 16-byte bit-position / bit-mask helper LUT at file offset
+//!   `0x5c1c4..0x5c1d4`
+//!   (`docs/video/svq1/tables/svc_bitmask_lut.{csv,meta}`) — first 8
+//!   entries are the descending single-bit masks `0x80..0x01`; last 8
+//!   are their one's complements `0x7f..0xfe`.
+//!
+//! Both CSVs are mirrored bit-exact under `crates/oxideav-svq/tables/`
+//! with SHA-256s matching `docs/video/svq1/tables/MANIFEST-02.sha256`.
+//! The new [`svq1_helper_luts`] module exposes the constants
+//! ([`svq1_helper_luts::SVQ1_CLIP_LUT`],
+//! [`svq1_helper_luts::SVQ1_BITMASK_LUT`]), borrowed accessors
+//! ([`svq1_helper_luts::clip_lut`],
+//! [`svq1_helper_luts::bitmask_lut`]), and the source-region offsets
+//! ([`svq1_helper_luts::SVQ1_CLIP_LUT_FILE_OFFSET`],
+//! [`svq1_helper_luts::SVQ1_CLIP_LUT_VMA`],
+//! [`svq1_helper_luts::SVQ1_BITMASK_LUT_FILE_OFFSET`],
+//! [`svq1_helper_luts::SVQ1_BITMASK_LUT_VMA`]) for provenance.
+//! Seven new lib tests cover the length / structural invariants
+//! (descending bit-mask half, one's-complement half, exact 16-byte
+//! string, clip-LUT ramp head at byte `0x10..0x20`, derivable image
+//! base of `0x67d70000` for both regions).
+//!
 //! **Round 9 — SVQ1 L=0..L=3 codebook payload landed.**
 //!
 //! Round 9 lands the 23004-byte mean-removed multistage VQ payload
@@ -162,6 +193,7 @@ mod error;
 mod header;
 pub mod svq1_blocktree;
 pub mod svq1_codebook;
+pub mod svq1_helper_luts;
 pub mod svq3;
 pub mod svq3_coeff;
 pub mod svq3_mb;

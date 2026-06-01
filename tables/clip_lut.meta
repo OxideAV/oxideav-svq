@@ -1,0 +1,21 @@
+source: reference/binaries/quicktimethirdparty.qtx
+source_sha256: ac3509bf22aa1458dfc6e1af980956c0153b4c287af452ae5b9cac6f923be169
+size_bytes: 598016
+image_base_hex: 0x67d70000
+vma_start_hex: 0x67dca100
+vma_end_exclusive_hex: 0x67dca400
+file_offset_start_hex: 0x0005a100
+file_offset_end_exclusive_hex: 0x0005a400
+byte_length: 768
+section: .rdata
+record_count: 768
+record_size_bytes: 1
+endianness: none
+sample_signedness: unsigned
+interpretation: 768-byte saturating-clip LUT. Structure: first ~256 B is a prelude of small ints + the bytes 0x80..0xff,0x00..0x7f (the wrap-around remap); the central 512 B is a near-identity ramp clipped at the ends. Typical pixel-clamp LUT.
+tool: python3 struct + PE section table
+method: byte slice; identified by characteristic identity-ramp pattern
+  starting at 0x5a118 (`80 81 82 83 ... ff 00 01 ... 7f`)
+notes: |
+  Used by the codec's interpolation / overflow-saturation paths.
+  NOT a VQ codebook.

@@ -1,0 +1,20 @@
+source: reference/binaries/quicktimethirdparty.qtx
+source_sha256: ac3509bf22aa1458dfc6e1af980956c0153b4c287af452ae5b9cac6f923be169
+size_bytes: 598016
+image_base_hex: 0x67d70000
+vma_start_hex: 0x67dcc1c4
+vma_end_exclusive_hex: 0x67dcc1d4
+file_offset_start_hex: 0x0005c1c4
+file_offset_end_exclusive_hex: 0x0005c1d4
+byte_length: 16
+section: .rdata
+record_count: 16
+record_size_bytes: 1
+endianness: none
+sample_signedness: unsigned
+interpretation: 16-byte LUT — bit masks (0x80,0x40,..,0x01) followed by
+  one's-complements (0x7f,0xbf,..,0xfe)
+tool: python3 struct + PE section table
+method: byte slice; address from SVQ1 .text reloc-xref classification
+notes: |
+  Standard bit-position / bit-mask helper LUT.

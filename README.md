@@ -5,6 +5,53 @@ Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 
 ## Status
 
+**Round 203 — SVQ1 saturating-clip + bit-mask helper LUTs.** Round
+203 lands two small helper LUTs the docs collaborator's Extractor 02
+pass identified in the SVQ1 `.rdata` region. Both CSV+meta pairs ship
+under `crates/oxideav-svq/tables/` as bit-exact mirrors of
+`docs/video/svq1/tables/`, their SHA-256s appended to the local
+`MANIFEST-02.sha256` and matching the docs-side manifest:
+
+* **Saturating-clip LUT** — 768 bytes at reference-binary file offset
+  `0x5a100..0x5a400` (VMA `0x67dca100..0x67dca400`, section `.rdata`,
+  `clip_lut.{csv,meta}`). Per the meta: prelude + central wrap-around
+  ramp `0x80..0xff, 0x00..0x7f`; used by the codec on interpolation /
+  overflow-saturation paths. The meta is explicit that this is NOT a
+  VQ codebook.
+* **Bit-position / bit-mask LUT** — 16 bytes at file offset
+  `0x5c1c4..0x5c1d4` (VMA `0x67dcc1c4..0x67dcc1d4`,
+  `svc_bitmask_lut.{csv,meta}`). First 8 entries are the descending
+  single-bit masks `0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01`;
+  last 8 are their one's complements
+  `0x7f, 0xbf, 0xdf, 0xef, 0xf7, 0xfb, 0xfd, 0xfe`.
+
+`build.rs` is extended with an unsigned-CSV parser (`parse_unsigned_csv`)
+that asserts `byte_index` is gapless `0..N`, parses the
+`value_unsigned` column as `u8`, and emits `SVQ1_CLIP_LUT: [u8; 768]`
++ `SVQ1_BITMASK_LUT: [u8; 16]` under `$OUT_DIR/svq1_codebook_data.rs`.
+The new [`svq1_helper_luts`] module exposes the two constants,
+borrowed accessors (`clip_lut`, `bitmask_lut`), per-LUT byte-count
+constants (`SVQ1_CLIP_LUT_BYTES = 768`, `SVQ1_BITMASK_LUT_BYTES = 16`),
+and source-region provenance constants (file offset + VMA pair for
+each region: `SVQ1_CLIP_LUT_FILE_OFFSET = 0x0005_a100`,
+`SVQ1_CLIP_LUT_VMA = 0x67dc_a100`,
+`SVQ1_BITMASK_LUT_FILE_OFFSET = 0x0005_c1c4`,
+`SVQ1_BITMASK_LUT_VMA = 0x67dc_c1c4`). Eight new lib tests cover the
+length / structural invariants: documented byte-length per meta;
+descending bit-mask half (`SVQ1_BITMASK_LUT[i] == 1 << (7 - i)`);
+one's-complement half (`SVQ1_BITMASK_LUT[i+8] == !SVQ1_BITMASK_LUT[i]`);
+the exact 16-byte bitmask string as quoted in the meta; the clip-LUT
+ramp head `0x80..0x8f` at byte offset `0x10..0x20` corroborating the
+meta's "characteristic identity-ramp pattern starting at 0x5a118"
+remark; and the derivable `image_base = 0x67d70000` consistency for
+both regions (VMA − file_offset). Neither LUT is wired into a pixel
+decode path yet — the reconstruction path that would consume them
+remains gated on the L=0..L=3 intra-vs-inter / stage-vs-level layout
+doc still pending for the codebook payload; round 203 makes the
+bit-exact constants available so the future pixel work can lift them
+in unchanged. Total tests: 205 lib + 7 integration = 212 (up from
+204).
+
 **Round 197 — SVQ1 L=4 / L=5 codebook ABSENCE wired end-to-end.**
 The docs collaborator's Extractor 02 pass (`docs/video/svq1/spec/
 14.10-codebook-L4.md`, `spec/14.11-codebook-L5.md`,

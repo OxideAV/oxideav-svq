@@ -1,10 +1,11 @@
-//! Build script — parses the clean-room SVQ1 codebook tables mirrored
-//! under `tables/` (copied bit-exact from
+//! Build script — parses the clean-room SVQ1 codebook + helper-LUT
+//! tables mirrored under `tables/` (copied bit-exact from
 //! `docs/video/svq1/tables/codebook-l0l3.csv` +
-//! `tables/codebook-descriptor.csv`) and emits compile-time Rust
-//! constants in `$OUT_DIR/svq1_codebook_data.rs`. **The Implementer
-//! must NOT retype these numbers manually**; they come straight from
-//! the CSVs produced by the docs collaborator (Extractor 02,
+//! `tables/codebook-descriptor.csv` + `tables/clip_lut.csv` +
+//! `tables/svc_bitmask_lut.csv`) and emits compile-time Rust constants
+//! in `$OUT_DIR/svq1_codebook_data.rs`. **The Implementer must NOT
+//! retype these numbers manually**; they come straight from the CSVs
+//! produced by the docs collaborator (Extractor 02,
 //! `docs/video/svq1/provenance/02-codebook-extraction.md`) from
 //! `reference/binaries/quicktimethirdparty.qtx` SHA-256
 //! `ac3509bf22aa1458dfc6e1af980956c0153b4c287af452ae5b9cac6f923be169`.
@@ -45,6 +46,16 @@
 //! `level`, `block_size`, `canonical_vector_len_bytes`,
 //! `canonical_6stage_intra_or_inter_bytes`, and `status` keys are
 //! consumed).
+//!
+//! The two helper-LUT CSVs (`clip_lut.csv`,
+//! `svc_bitmask_lut.csv`) ship the `value_unsigned` column instead of
+//! the signed-byte column the codebook CSVs use; the
+//! `parse_unsigned_csv` helper consumes column 3 as a `u8` and
+//! verifies the `byte_index` column runs `0..expected_len`. Their
+//! `.meta` companions document the source region (file offset,
+//! length, byte structure) and are NOT consumed at build time —
+//! their content is documented in the dedicated module docs in
+//! `src/svq1_helper_luts.rs`.
 
 use std::env;
 use std::fs;
@@ -56,6 +67,14 @@ const CODEBOOK_DESCRIPTOR_BYTES: usize = 36;
 const BLOCK_SHAPE_LUT_LEN: usize = 16;
 const BLOCK_SHAPE_LUT_OFFSET: usize = 0x14; // 20
 
+/// Length of the saturating-clip helper LUT — 768 bytes, per
+/// `tables/clip_lut.meta` (`byte_length: 768`).
+const CLIP_LUT_BYTES: usize = 768;
+
+/// Length of the bit-position / bit-mask helper LUT — 16 bytes, per
+/// `tables/svc_bitmask_lut.meta` (`byte_length: 16`).
+const BITMASK_LUT_BYTES: usize = 16;
+
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo");
     let tables_dir = Path::new(&manifest_dir).join("tables");
@@ -64,16 +83,22 @@ fn main() {
     let descriptor_csv = tables_dir.join("codebook-descriptor.csv");
     let l4_meta = tables_dir.join("codebook-l4.meta");
     let l5_meta = tables_dir.join("codebook-l5.meta");
+    let clip_csv = tables_dir.join("clip_lut.csv");
+    let bitmask_csv = tables_dir.join("svc_bitmask_lut.csv");
 
     println!("cargo:rerun-if-changed={}", codebook_csv.display());
     println!("cargo:rerun-if-changed={}", descriptor_csv.display());
     println!("cargo:rerun-if-changed={}", l4_meta.display());
     println!("cargo:rerun-if-changed={}", l5_meta.display());
+    println!("cargo:rerun-if-changed={}", clip_csv.display());
+    println!("cargo:rerun-if-changed={}", bitmask_csv.display());
 
     let l0l3 = parse_signed_csv(&codebook_csv, CODEBOOK_L0L3_BYTES);
     let descriptor = parse_signed_csv(&descriptor_csv, CODEBOOK_DESCRIPTOR_BYTES);
     let absent_l4 = parse_absent_meta(&l4_meta, 4, "16x8", 128, 12288);
     let absent_l5 = parse_absent_meta(&l5_meta, 5, "16x16", 256, 24576);
+    let clip = parse_unsigned_csv(&clip_csv, CLIP_LUT_BYTES);
+    let bitmask = parse_unsigned_csv(&bitmask_csv, BITMASK_LUT_BYTES);
 
     let out_dir: PathBuf = env::var_os("OUT_DIR")
         .map(PathBuf::from)
@@ -95,6 +120,144 @@ fn main() {
     emit_descriptor(&mut f, &descriptor);
     emit_absent_record(&mut f, "SVQ1_L4_ABSENCE", &absent_l4);
     emit_absent_record(&mut f, "SVQ1_L5_ABSENCE", &absent_l5);
+    emit_clip_lut(&mut f, &clip);
+    emit_bitmask_lut(&mut f, &bitmask);
+}
+
+/// Emit `SVQ1_CLIP_LUT: [u8; 768]` — the saturating-clip helper LUT
+/// from `tables/clip_lut.csv`. Source region per `tables/clip_lut.meta`:
+/// file offset `0x5a100..0x5a400`, VMA `0x67dca100..0x67dca400`,
+/// section `.rdata`. Used by the codec's interpolation /
+/// overflow-saturation paths; NOT a VQ codebook.
+fn emit_clip_lut(f: &mut fs::File, data: &[u8]) {
+    assert_eq!(data.len(), CLIP_LUT_BYTES);
+    writeln!(
+        f,
+        "\n/// SVQ1_CLIP_LUT — 768-byte saturating-clip helper LUT\n\
+         /// from tables/clip_lut.csv. Source region per\n\
+         /// tables/clip_lut.meta: file offset 0x5a100..0x5a400, VMA\n\
+         /// 0x67dca100..0x67dca400, section .rdata. NOT a VQ codebook.\n\
+         pub static SVQ1_CLIP_LUT: [u8; {len}] = [",
+        len = data.len()
+    )
+    .unwrap();
+    let mut buf = String::new();
+    for (i, b) in data.iter().enumerate() {
+        buf.push_str(&format!("0x{:02x}, ", b));
+        if (i + 1) % 12 == 0 {
+            writeln!(f, "    {}", buf.trim_end()).unwrap();
+            buf.clear();
+        }
+    }
+    if !buf.is_empty() {
+        writeln!(f, "    {}", buf.trim_end()).unwrap();
+    }
+    writeln!(f, "];").unwrap();
+}
+
+/// Emit `SVQ1_BITMASK_LUT: [u8; 16]` — bit-position / bit-mask helper
+/// LUT from `tables/svc_bitmask_lut.csv`. Source region per
+/// `tables/svc_bitmask_lut.meta`: file offset `0x5c1c4..0x5c1d4`, VMA
+/// `0x67dcc1c4..0x67dcc1d4`, section `.rdata`. First 8 entries are
+/// bit masks (`0x80, 0x40, ..., 0x01`); last 8 are their one's
+/// complements (`0x7f, 0xbf, ..., 0xfe`).
+fn emit_bitmask_lut(f: &mut fs::File, data: &[u8]) {
+    assert_eq!(data.len(), BITMASK_LUT_BYTES);
+    writeln!(
+        f,
+        "\n/// SVQ1_BITMASK_LUT — 16-byte bit-position / bit-mask helper\n\
+         /// LUT from tables/svc_bitmask_lut.csv. Source region per\n\
+         /// tables/svc_bitmask_lut.meta: file offset 0x5c1c4..0x5c1d4,\n\
+         /// VMA 0x67dcc1c4..0x67dcc1d4, section .rdata. First 8 entries\n\
+         /// are bit masks (0x80, 0x40, ..., 0x01); last 8 are their\n\
+         /// one's complements (0x7f, 0xbf, ..., 0xfe).\n\
+         pub static SVQ1_BITMASK_LUT: [u8; {len}] = [",
+        len = data.len()
+    )
+    .unwrap();
+    let mut buf = String::new();
+    for (i, b) in data.iter().enumerate() {
+        buf.push_str(&format!("0x{:02x}, ", b));
+        if (i + 1) % 8 == 0 {
+            writeln!(f, "    {}", buf.trim_end()).unwrap();
+            buf.clear();
+        }
+    }
+    if !buf.is_empty() {
+        writeln!(f, "    {}", buf.trim_end()).unwrap();
+    }
+    writeln!(f, "];").unwrap();
+}
+
+/// Parse a `byte_index,file_offset_hex,vma_hex,value_unsigned,value_hex`
+/// CSV and return the `value_unsigned` column as a `Vec<u8>` of exactly
+/// `expected_len` entries. The `byte_index` column must run
+/// `0..expected_len` with no gaps. Sister of `parse_signed_csv` for the
+/// helper-LUT CSVs.
+fn parse_unsigned_csv(path: &Path, expected_len: usize) -> Vec<u8> {
+    let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let mut out: Vec<u8> = Vec::with_capacity(expected_len);
+    for (lineno, line) in text.lines().enumerate() {
+        if lineno == 0 {
+            // header row: byte_index,file_offset_hex,vma_hex,value_unsigned,value_hex
+            continue;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').collect();
+        assert!(
+            cols.len() == 5,
+            "{}:{} expected 5 columns, got {} ({:?})",
+            path.display(),
+            lineno + 1,
+            cols.len(),
+            line
+        );
+        let byte_index: usize = cols[0].parse().unwrap_or_else(|e| {
+            panic!(
+                "{}:{} parse byte_index {:?}: {e}",
+                path.display(),
+                lineno + 1,
+                cols[0]
+            )
+        });
+        assert_eq!(
+            byte_index,
+            out.len(),
+            "{}:{} byte_index gap (expected {}, got {})",
+            path.display(),
+            lineno + 1,
+            out.len(),
+            byte_index
+        );
+        let value_unsigned: u16 = cols[3].parse().unwrap_or_else(|e| {
+            panic!(
+                "{}:{} parse value_unsigned {:?}: {e}",
+                path.display(),
+                lineno + 1,
+                cols[3]
+            )
+        });
+        assert!(
+            value_unsigned <= 0xff,
+            "{}:{} value_unsigned {} out of u8 range",
+            path.display(),
+            lineno + 1,
+            value_unsigned
+        );
+        out.push(value_unsigned as u8);
+    }
+    assert_eq!(
+        out.len(),
+        expected_len,
+        "{} produced {} bytes; expected {} per the docs/video/svq1/tables/*.meta size arithmetic",
+        path.display(),
+        out.len(),
+        expected_len
+    );
+    out
 }
 
 /// Parsed view of a `codebook-lN.meta` ABSENT record. Only the scalar

@@ -8,6 +8,50 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 203 — SVQ1 saturating-clip + bit-mask helper LUTs.**
+  Two small helper LUTs identified by the docs collaborator's
+  Extractor 02 pass in the SVQ1 `.rdata` region are now mirrored
+  bit-exact under `crates/oxideav-svq/tables/` and exposed as
+  compile-time constants via a new `svq1_helper_luts` module:
+  - **Saturating-clip LUT** — 768 bytes at reference-binary file
+    offset `0x5a100..0x5a400` (VMA `0x67dca100..0x67dca400`,
+    section `.rdata`). New `tables/clip_lut.{csv,meta}`. Per the
+    meta this is the codec's interpolation / overflow-saturation
+    helper — explicitly NOT a VQ codebook.
+  - **Bit-position / bit-mask LUT** — 16 bytes at file offset
+    `0x5c1c4..0x5c1d4` (VMA `0x67dcc1c4..0x67dcc1d4`). New
+    `tables/svc_bitmask_lut.{csv,meta}`. First 8 entries are the
+    descending single-bit masks
+    `0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01`; last 8 are
+    their one's complements
+    `0x7f, 0xbf, 0xdf, 0xef, 0xf7, 0xfb, 0xfd, 0xfe`.
+  - `build.rs` gains a `parse_unsigned_csv` helper (sister of the
+    existing signed-byte CSV parser) that asserts `byte_index` is
+    gapless `0..N`, parses the `value_unsigned` column as `u8`,
+    and emits `SVQ1_CLIP_LUT: [u8; 768]` + `SVQ1_BITMASK_LUT:
+    [u8; 16]` alongside the existing `SVQ1_CODEBOOK_L0L3_BYTES`
+    / `SVQ1_CODEBOOK_DESCRIPTOR` / `SVQ1_BLOCK_SHAPE_LUT` /
+    `SVQ1_L{4,5}_ABSENCE` constants.
+  - New `svq1_helper_luts` module exposes:
+    - `SVQ1_CLIP_LUT: [u8; 768]` static
+    - `SVQ1_BITMASK_LUT: [u8; 16]` static
+    - `clip_lut() -> &'static [u8]` accessor
+    - `bitmask_lut() -> &'static [u8]` accessor
+    - `SVQ1_CLIP_LUT_BYTES = 768`, `SVQ1_BITMASK_LUT_BYTES = 16`
+    - `SVQ1_CLIP_LUT_FILE_OFFSET = 0x0005_a100`,
+      `SVQ1_CLIP_LUT_VMA = 0x67dc_a100`,
+      `SVQ1_BITMASK_LUT_FILE_OFFSET = 0x0005_c1c4`,
+      `SVQ1_BITMASK_LUT_VMA = 0x67dc_c1c4`
+  - Eight new lib tests cover length-vs-meta, the descending-mask
+    half, the one's-complement half, the documented 16-byte
+    bitmask string, the clip-LUT identity-ramp head at offset
+    `0x10..0x20` (`0x80..0x8f`), and the derivable image base
+    `0x67d70000` (VMA − file-offset) for both LUT regions.
+  - `tables/MANIFEST-02.sha256` extended with the four new file
+    SHA-256s, matching `docs/video/svq1/tables/MANIFEST-02.sha256`.
+  - Total lib tests rise to 205 (was 197); integration tests
+    unchanged at 7.
+
 - **Round 197 — SVQ1 L=4 / L=5 codebook ABSENCE wired end-to-end.**
   The docs collaborator's Extractor 02 pass
   (`docs/video/svq1/spec/14.10-codebook-L4.md`,
