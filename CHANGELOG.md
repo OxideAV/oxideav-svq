@@ -8,6 +8,42 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 217 — SVQ1 u16-LE parameter table (512 records) mirrored.**
+  The 1024-byte `u16` parameter table identified by the docs
+  collaborator's Extractor 02 pass at file offset `0x59d00..0x5a100`
+  (VMA `0x67dc9d00..0x67dca100`, section `.rdata`) is now mirrored
+  bit-exact under `crates/oxideav-svq/tables/u16_param_table.{csv,
+  meta}` and exposed via the existing `svq1_helper_luts` module:
+  - `build.rs` gains a `parse_u16_csv` helper (sister of the
+    existing `parse_unsigned_csv`) that asserts the `word_index`
+    column is gapless `0..512`, parses the `value_u16` column, and
+    emits a `SVQ1_U16_PARAM_TABLE: [u16; 512]` static.
+  - New `svq1_helper_luts` surface:
+    - `SVQ1_U16_PARAM_TABLE: [u16; 512]` static (1024 bytes total).
+    - `u16_param_table() -> &'static [u16]` accessor.
+    - `SVQ1_U16_PARAM_TABLE_WORDS = 512` /
+      `SVQ1_U16_PARAM_TABLE_BYTES = 1024` length constants.
+    - `SVQ1_U16_PARAM_TABLE_FILE_OFFSET = 0x0005_9d00` /
+      `SVQ1_U16_PARAM_TABLE_VMA = 0x67dc_9d00` provenance constants.
+    - `SVQ1_U16_PARAM_TABLE_ALLOWED_VALUES: [u16; 16]` — the closed
+      ascending allowed-value set the meta enumerates
+      (`{0x0000, 0x0001, 0x0002, 0x0010, 0x0014, 0x0020, 0x0028,
+      0x0048, 0x0068, 0x0081, 0x0082, 0x0084, 0x0101, 0x0102,
+      0x0181, 0x0182}`).
+  - Seven new lib tests cover length-vs-meta, the source-region
+    offsets / image-base derivation, the flush-against-clip-LUT
+    geometry (`u16_end_vma == SVQ1_CLIP_LUT_VMA`), the
+    every-value-is-in-allowed-set closed-set invariant, the
+    four-word zero prelude at `word_index 0..4`, the first
+    non-zero `0x0020 × 9` group head at `word_index 4..13`, and a
+    strictly-ascending-uniqueness guard over
+    `SVQ1_U16_PARAM_TABLE_ALLOWED_VALUES`.
+  - `tables/MANIFEST-02.sha256` extended with the two new file
+    SHA-256s; both match `docs/video/svq1/tables/MANIFEST-02.sha256`
+    bit-for-bit.
+  - The table is NOT yet wired into a decode path — exposed for
+    the future pixel-reconstruction stage to lift in unchanged.
+  - Total tests: 212 lib + 7 integration = 219 (up from 212).
 - **Round 203 — SVQ1 saturating-clip + bit-mask helper LUTs.**
   Two small helper LUTs identified by the docs collaborator's
   Extractor 02 pass in the SVQ1 `.rdata` region are now mirrored

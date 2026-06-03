@@ -26,6 +26,16 @@
 //!   block-shape lookup (values 1..=4) that lives at the tail of the
 //!   descriptor (file offset `0x5d214..0x5d224`); see
 //!   `docs/video/svq1/tables/codebook-descriptor.meta` line 22.
+//! * `pub static SVQ1_U16_PARAM_TABLE: [u16; 512]` — the 1024-byte
+//!   u16-LE parameter table at file offset `0x59d00..0x5a100` (VMA
+//!   `0x67dc9d00..0x67dca100`, section `.rdata`), mirrored bit-exact
+//!   from `tables/u16_param_table.csv` (itself a bit-exact mirror of
+//!   `docs/video/svq1/tables/u16_param_table.csv`). Per its
+//!   companion `.meta`, the table holds u16 values drawn from the
+//!   set `{0x0000, 0x0001, 0x0002, 0x0010, 0x0014, 0x0020, 0x0028,
+//!   0x0048, 0x0068, 0x0081, 0x0082, 0x0084, 0x0101, 0x0102, 0x0181,
+//!   0x0182}` arranged in grouped runs adjacent to the clip LUT;
+//!   no SVQ1 pixel-decode path consumes it yet.
 //! * `pub const SVQ1_L4_ABSENCE: Svq1AbsentLevelRecord` and
 //!   `pub const SVQ1_L5_ABSENCE: Svq1AbsentLevelRecord` — typed records
 //!   mirrored bit-for-bit from `tables/codebook-l4.meta` and
@@ -47,7 +57,7 @@
 //! `canonical_6stage_intra_or_inter_bytes`, and `status` keys are
 //! consumed).
 //!
-//! The two helper-LUT CSVs (`clip_lut.csv`,
+//! The two byte-wide helper-LUT CSVs (`clip_lut.csv`,
 //! `svc_bitmask_lut.csv`) ship the `value_unsigned` column instead of
 //! the signed-byte column the codebook CSVs use; the
 //! `parse_unsigned_csv` helper consumes column 3 as a `u8` and
@@ -56,6 +66,16 @@
 //! length, byte structure) and are NOT consumed at build time —
 //! their content is documented in the dedicated module docs in
 //! `src/svq1_helper_luts.rs`.
+//!
+//! The 16-bit-wide `u16_param_table.csv` ships a
+//! `word_index,file_offset_hex,vma_hex,value_u16,value_hex` row
+//! layout (note the `word_index` column instead of `byte_index`); the
+//! `parse_u16_csv` helper consumes column 3 as a `u16` and verifies
+//! the `word_index` column runs `0..expected_len`. Its `.meta`
+//! companion is NOT consumed at build time; the surface invariants
+//! it documents (length 512, allowed value set, group structure)
+//! are encoded directly in the dedicated module docs in
+//! `src/svq1_helper_luts.rs` + lib tests.
 
 use std::env;
 use std::fs;
@@ -75,6 +95,11 @@ const CLIP_LUT_BYTES: usize = 768;
 /// `tables/svc_bitmask_lut.meta` (`byte_length: 16`).
 const BITMASK_LUT_BYTES: usize = 16;
 
+/// Length of the u16-LE parameter table — 512 records of 2 bytes
+/// each = 1024 bytes total, per `tables/u16_param_table.meta`
+/// (`byte_length: 1024`, `record_count: 512`, `record_size_bytes: 2`).
+const U16_PARAM_TABLE_WORDS: usize = 512;
+
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo");
     let tables_dir = Path::new(&manifest_dir).join("tables");
@@ -85,6 +110,7 @@ fn main() {
     let l5_meta = tables_dir.join("codebook-l5.meta");
     let clip_csv = tables_dir.join("clip_lut.csv");
     let bitmask_csv = tables_dir.join("svc_bitmask_lut.csv");
+    let u16_param_csv = tables_dir.join("u16_param_table.csv");
 
     println!("cargo:rerun-if-changed={}", codebook_csv.display());
     println!("cargo:rerun-if-changed={}", descriptor_csv.display());
@@ -92,6 +118,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", l5_meta.display());
     println!("cargo:rerun-if-changed={}", clip_csv.display());
     println!("cargo:rerun-if-changed={}", bitmask_csv.display());
+    println!("cargo:rerun-if-changed={}", u16_param_csv.display());
 
     let l0l3 = parse_signed_csv(&codebook_csv, CODEBOOK_L0L3_BYTES);
     let descriptor = parse_signed_csv(&descriptor_csv, CODEBOOK_DESCRIPTOR_BYTES);
@@ -99,6 +126,7 @@ fn main() {
     let absent_l5 = parse_absent_meta(&l5_meta, 5, "16x16", 256, 24576);
     let clip = parse_unsigned_csv(&clip_csv, CLIP_LUT_BYTES);
     let bitmask = parse_unsigned_csv(&bitmask_csv, BITMASK_LUT_BYTES);
+    let u16_param = parse_u16_csv(&u16_param_csv, U16_PARAM_TABLE_WORDS);
 
     let out_dir: PathBuf = env::var_os("OUT_DIR")
         .map(PathBuf::from)
@@ -122,6 +150,7 @@ fn main() {
     emit_absent_record(&mut f, "SVQ1_L5_ABSENCE", &absent_l5);
     emit_clip_lut(&mut f, &clip);
     emit_bitmask_lut(&mut f, &bitmask);
+    emit_u16_param_table(&mut f, &u16_param);
 }
 
 /// Emit `SVQ1_CLIP_LUT: [u8; 768]` — the saturating-clip helper LUT
@@ -187,6 +216,110 @@ fn emit_bitmask_lut(f: &mut fs::File, data: &[u8]) {
         writeln!(f, "    {}", buf.trim_end()).unwrap();
     }
     writeln!(f, "];").unwrap();
+}
+
+/// Emit `SVQ1_U16_PARAM_TABLE: [u16; 512]` — the 1024-byte u16-LE
+/// parameter table from `tables/u16_param_table.csv`. Source region
+/// per `tables/u16_param_table.meta`: file offset `0x59d00..0x5a100`,
+/// VMA `0x67dc9d00..0x67dca100`, section `.rdata`. Sits immediately
+/// below the saturating-clip LUT (clip starts at `0x5a100`).
+fn emit_u16_param_table(f: &mut fs::File, data: &[u16]) {
+    assert_eq!(data.len(), U16_PARAM_TABLE_WORDS);
+    writeln!(
+        f,
+        "\n/// SVQ1_U16_PARAM_TABLE — 1024-byte u16-LE parameter table\n\
+         /// from tables/u16_param_table.csv. Source region per\n\
+         /// tables/u16_param_table.meta: file offset 0x59d00..0x5a100,\n\
+         /// VMA 0x67dc9d00..0x67dca100, section .rdata. 512 records,\n\
+         /// 2 bytes each, u16 LE. Adjacent to (immediately below) the\n\
+         /// saturating-clip LUT at 0x5a100. NOT a VQ codebook.\n\
+         pub static SVQ1_U16_PARAM_TABLE: [u16; {len}] = [",
+        len = data.len()
+    )
+    .unwrap();
+    let mut buf = String::new();
+    for (i, w) in data.iter().enumerate() {
+        buf.push_str(&format!("0x{:04x}, ", w));
+        if (i + 1) % 8 == 0 {
+            writeln!(f, "    {}", buf.trim_end()).unwrap();
+            buf.clear();
+        }
+    }
+    if !buf.is_empty() {
+        writeln!(f, "    {}", buf.trim_end()).unwrap();
+    }
+    writeln!(f, "];").unwrap();
+}
+
+/// Parse a `word_index,file_offset_hex,vma_hex,value_u16,value_hex`
+/// CSV and return the `value_u16` column as a `Vec<u16>` of exactly
+/// `expected_len` entries. The `word_index` column must run
+/// `0..expected_len` with no gaps. Sister of `parse_unsigned_csv`
+/// for the 16-bit-wide u16-LE parameter table.
+fn parse_u16_csv(path: &Path, expected_len: usize) -> Vec<u16> {
+    let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let mut out: Vec<u16> = Vec::with_capacity(expected_len);
+    for (lineno, line) in text.lines().enumerate() {
+        if lineno == 0 {
+            // header row: word_index,file_offset_hex,vma_hex,value_u16,value_hex
+            continue;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').collect();
+        assert!(
+            cols.len() == 5,
+            "{}:{} expected 5 columns, got {} ({:?})",
+            path.display(),
+            lineno + 1,
+            cols.len(),
+            line
+        );
+        let word_index: usize = cols[0].parse().unwrap_or_else(|e| {
+            panic!(
+                "{}:{} parse word_index {:?}: {e}",
+                path.display(),
+                lineno + 1,
+                cols[0]
+            )
+        });
+        assert_eq!(
+            word_index,
+            out.len(),
+            "{}:{} word_index gap (expected {}, got {})",
+            path.display(),
+            lineno + 1,
+            out.len(),
+            word_index
+        );
+        let value_u16: u32 = cols[3].parse().unwrap_or_else(|e| {
+            panic!(
+                "{}:{} parse value_u16 {:?}: {e}",
+                path.display(),
+                lineno + 1,
+                cols[3]
+            )
+        });
+        assert!(
+            value_u16 <= 0xffff,
+            "{}:{} value_u16 {} out of u16 range",
+            path.display(),
+            lineno + 1,
+            value_u16
+        );
+        out.push(value_u16 as u16);
+    }
+    assert_eq!(
+        out.len(),
+        expected_len,
+        "{} produced {} words; expected {} per the docs/video/svq1/tables/u16_param_table.meta size arithmetic",
+        path.display(),
+        out.len(),
+        expected_len
+    );
+    out
 }
 
 /// Parse a `byte_index,file_offset_hex,vma_hex,value_unsigned,value_hex`

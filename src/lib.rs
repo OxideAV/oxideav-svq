@@ -1,5 +1,25 @@
 //! Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec.
 //!
+//! **Round 217 — SVQ1 u16-LE parameter table (512 records) mirrored.**
+//!
+//! Round 217 picks up the third Extractor-02-staged helper region
+//! from `docs/video/svq1/tables/`: the 1024-byte `u16` parameter
+//! table at file offset `0x59d00..0x5a100` (VMA
+//! `0x67dc9d00..0x67dca100`, section `.rdata`). The
+//! [`svq1_helper_luts::SVQ1_U16_PARAM_TABLE`] static now holds the
+//! bit-exact `u16`-LE bytes; the
+//! [`svq1_helper_luts::SVQ1_U16_PARAM_TABLE_ALLOWED_VALUES`]
+//! ascending list encodes the closed allowed-value set the meta
+//! enumerates; and seven new lib tests cover length-vs-meta, source-
+//! region provenance, the flush-against-clip-LUT geometry
+//! (`u16_end_vma == SVQ1_CLIP_LUT_VMA`), the every-value-in-allowed-
+//! set closed-set invariant, the four-word zero prelude at
+//! `word_index 0..4`, the first non-zero `0x0020 × 9` group head at
+//! `word_index 4..13`, and a strictly-ascending-uniqueness guard over
+//! `SVQ1_U16_PARAM_TABLE_ALLOWED_VALUES` itself. The table is NOT yet
+//! wired into a decode path — the future pixel-reconstruction stage
+//! will lift it in unchanged.
+//!
 //! **Round 203 — SVQ1 saturating-clip + bit-mask helper LUTs.**
 //!
 //! Round 203 lands two small helper LUTs the docs collaborator's

@@ -1,0 +1,20 @@
+source: reference/binaries/quicktimethirdparty.qtx
+source_sha256: ac3509bf22aa1458dfc6e1af980956c0153b4c287af452ae5b9cac6f923be169
+size_bytes: 598016
+image_base_hex: 0x67d70000
+vma_start_hex: 0x67dc9d00
+vma_end_exclusive_hex: 0x67dca100
+file_offset_start_hex: 0x00059d00
+file_offset_end_exclusive_hex: 0x0005a100
+byte_length: 1024
+section: .rdata
+record_count: 512
+record_size_bytes: 2
+endianness: little (u16 LE)
+sample_signedness: unsigned u16
+interpretation: u16 parameter table — values from {0x0010, 0x0020, 0x0028, 0x0048, 0x0084, 0x0081, 0x0001, 0x0002, ...} arranged in groups suggestive of per-level stride / block-size parameters. Adjacent to the clip_lut.
+tool: python3 struct + PE section table
+method: byte slice; bounded by zero-run before 0x59d00 and the clip_lut at 0x5a100
+notes: |
+  Likely the codec's block-size / vector-width parameter table (values like 0x10, 0x20, 0x48, 0x84 match canonical block sizes
+  8, 16, 32, 64, 128 in pixel-element counts).

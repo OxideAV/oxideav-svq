@@ -5,6 +5,52 @@ Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 
 ## Status
 
+**Round 217 — SVQ1 u16-LE parameter table (512 records) mirrored.**
+Round 217 picks up the third Extractor-02-staged helper region from
+`docs/video/svq1/tables/`: the 1024-byte `u16` parameter table at
+file offset `0x59d00..0x5a100` (VMA `0x67dc9d00..0x67dca100`, section
+`.rdata`). The CSV+meta pair (`tables/u16_param_table.{csv,meta}`)
+ships bit-exact against `docs/video/svq1/tables/u16_param_table.*`;
+both SHA-256s are appended to the local `MANIFEST-02.sha256` and
+match the docs-side manifest. The meta classifies the values
+("values from `{0x0000, 0x0001, 0x0002, 0x0010, 0x0014, 0x0020,
+0x0028, 0x0048, 0x0068, 0x0081, 0x0082, 0x0084, 0x0101, 0x0102,
+0x0181, 0x0182}` arranged in groups") and notes the table sits
+immediately below the saturating-clip LUT (which begins at
+`0x5a100`); both observations are encoded as compile-time and lib
+tests below.
+
+`build.rs` gains a `parse_u16_csv` helper (sister of the existing
+`parse_unsigned_csv`) that asserts the `word_index` column is
+gapless `0..512`, parses the `value_u16` column, and emits
+`SVQ1_U16_PARAM_TABLE: [u16; 512]` under
+`$OUT_DIR/svq1_codebook_data.rs`. The existing `svq1_helper_luts`
+module gains the new constant, a borrowed accessor
+(`u16_param_table`), per-table length constants
+(`SVQ1_U16_PARAM_TABLE_WORDS = 512`,
+`SVQ1_U16_PARAM_TABLE_BYTES = 1024`), source-region provenance
+constants (`SVQ1_U16_PARAM_TABLE_FILE_OFFSET = 0x0005_9d00`,
+`SVQ1_U16_PARAM_TABLE_VMA = 0x67dc_9d00`), and a typed
+`SVQ1_U16_PARAM_TABLE_ALLOWED_VALUES: [u16; 16]` ascending list
+that the meta's brace-enumerated set is encoded as. Seven new lib
+tests cover the length / structural invariants: documented record
+count and byte length per meta; the source-region offsets and
+derivable image base `0x67d70000` (VMA − file offset); the flush
+geometry that ties the table's exclusive end VMA `0x67dca100` to
+`SVQ1_CLIP_LUT_VMA`; the closed-set invariant (every entry belongs
+to the documented allowed-value set); the four-word `0x0000`
+prelude at `word_index 0..4` (file offsets `0x59d00..0x59d08`); the
+first non-zero `0x0020 × 9` run at `word_index 4..13` (file offsets
+`0x59d08..0x59d1a`); and a strictly-ascending-uniqueness guard over
+the allowed-value set itself. Neither the bytes nor the new
+accessor is wired into a pixel decode path yet — the
+reconstruction stage that would consume the LUTs remains gated on
+the L=0..L=3 intra-vs-inter / stage-vs-level layout doc still
+pending for the codebook payload; round 217 makes the bit-exact
+constants available so the future pixel work can lift them in
+unchanged. Total tests: 212 lib + 7 integration = 219 (up from
+212).
+
 **Round 203 — SVQ1 saturating-clip + bit-mask helper LUTs.** Round
 203 lands two small helper LUTs the docs collaborator's Extractor 02
 pass identified in the SVQ1 `.rdata` region. Both CSV+meta pairs ship
