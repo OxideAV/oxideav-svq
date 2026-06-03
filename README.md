@@ -5,6 +5,36 @@ Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 
 ## Status
 
+**Round 224 — SVQ3 sub-pixel thirdpel interpolation arithmetic.** Round
+224 implements the per-sample interpolation arithmetic the wiki spec
+defines for SVQ3 motion compensation in
+`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Motion Compensation" as
+a new `svq3_mc` module. The `thirdpel_interpolate_1d(a, b) -> i32`
+`const fn` implements the spec's one-direction formula
+`((2 * A + B + 1) * 0x2AB) >> 11` (with `0x2AB` / `>> 11` / `+1`
+surfaced as `THIRDPEL_1D_MULTIPLIER` / `THIRDPEL_1D_SHIFT` /
+`THIRDPEL_1D_BIAS`); the `thirdpel_interpolate_2d(a, b, c, d) -> i32`
+`const fn` implements the spec's two-dimensional formula
+`((4 * A + 3 * B + 3 * C + 2 * D + 6) * 0xAAB) >> 15` against the
+spec-quoted weight matrix `THIRDPEL_2D_WEIGHTS = [[4, 3], [3, 2]]`
+(with `0xAAB` / `>> 15` / `+6` surfaced as `THIRDPEL_2D_MULTIPLIER` /
+`THIRDPEL_2D_SHIFT` / `THIRDPEL_2D_BIAS`). Both helpers consume the
+spec's exact integer arithmetic — no division and no floating point.
+Round 224 also surfaces the wiki spec's "stored and predicted as
+fraction of six and then rounded to the desired base" motion-vector
+storage remark as a per-precision base lookup
+(`stored_sixths_base(Svq3MvPrecision::Fullpel) == 6`, `Halfpel == 3`,
+`Thirdpel == 2`) plus an `is_aligned_to_precision_base(stored_sixths,
+precision) -> bool` predicate. The actual rounding step is NOT yet
+implemented — the wiki spec leaves the rounding direction (toward
+zero / away from zero / round-half-up / round-half-even) unspecified,
+so round 224 exposes only the alignment check, deferring the rounding
+helper to the round that pins the direction in `docs/`. Round 224
+is structural arithmetic only —
+`Svq3DecoderHandle::receive_frame` continues to return
+`oxideav_core::Error::Unsupported`. Total tests: 243 lib + 7
+integration = 250 (up from 219).
+
 **Round 217 — SVQ1 u16-LE parameter table (512 records) mirrored.**
 Round 217 picks up the third Extractor-02-staged helper region from
 `docs/video/svq1/tables/`: the 1024-byte `u16` parameter table at
@@ -549,7 +579,46 @@ The standalone `svq3_coeff` module surface (always available):
   `svq3_coeff::COEFFS_PER_CHROMA_DC_BLOCK` /
   `svq3_coeff::COEFFS_PER_ALT_SCAN_HALF` constants.
 
+The standalone `svq3_mc` module surface (always available):
+
+* `svq3_mc::thirdpel_interpolate_1d(a: i32, b: i32) -> i32` `const fn` —
+  the one-direction interpolation formula
+  `((2 * A + B + 1) * 0x2AB) >> 11`.
+* `svq3_mc::thirdpel_interpolate_2d(a: i32, b: i32, c: i32, d: i32) ->
+  i32` `const fn` — the two-dimensional interpolation formula
+  `((4 * A + 3 * B + 3 * C + 2 * D + 6) * 0xAAB) >> 15`.
+* `svq3_mc::THIRDPEL_1D_MULTIPLIER = 0x2AB` (683) /
+  `svq3_mc::THIRDPEL_1D_SHIFT = 11` / `svq3_mc::THIRDPEL_1D_BIAS = 1` /
+  `svq3_mc::THIRDPEL_1D_WEIGHT_SUM = 3` provenance constants.
+* `svq3_mc::THIRDPEL_2D_MULTIPLIER = 0xAAB` (2731) /
+  `svq3_mc::THIRDPEL_2D_SHIFT = 15` / `svq3_mc::THIRDPEL_2D_BIAS = 6` /
+  `svq3_mc::THIRDPEL_2D_WEIGHT_SUM = 12` provenance constants.
+* `svq3_mc::THIRDPEL_2D_WEIGHTS: [[u8; 2]; 2] = [[4, 3], [3, 2]]` — the
+  verbatim 2×2 weight matrix the wiki spec quotes.
+* `svq3_mc::stored_sixths_base(Svq3MvPrecision) -> u32` `const fn` —
+  returns 6 / 3 / 2 for Fullpel / Halfpel / Thirdpel per the wiki spec's
+  "stored and predicted as fraction of six and then rounded to the
+  desired base" remark.
+* `svq3_mc::is_aligned_to_precision_base(stored_sixths: i32,
+  Svq3MvPrecision) -> bool` `const fn` — checks whether an
+  already-rounded sixths-grid value is on the precision's base.
+
 ## Clean-room provenance
+
+Round 224 was implemented strictly from
+`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Motion Compensation" —
+the four-line paragraph beginning "Thirdpel interpolation in one
+direction uses formula" and the preceding sentence on motion-vector
+storage ("as fraction of six and then rounded to the desired base").
+The interpolation multipliers (`0x2AB`, `0xAAB`), shifts (`11`, `15`),
+biases (`+1`, `+6`), and the 2×2 weight matrix `[4 3 / 3 2]` are
+transcribed verbatim from that paragraph. The motion-vector-storage
+base lookup (Fullpel → 6 / Halfpel → 3 / Thirdpel → 2) follows
+directly from the spec's "fraction of six" phrasing combined with the
+three precisions enumerated in `Svq3MvPrecision`. No other source was
+consulted; in particular the §"Macroblock transform and
+dequantization" section (which the round 224 brief flagged as pending
+a docs scrub) was not read.
 
 Round 7 was implemented strictly from
 `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Intra macroblock

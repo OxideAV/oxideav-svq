@@ -1,5 +1,41 @@
 //! Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec.
 //!
+//! **Round 224 — SVQ3 sub-pixel thirdpel interpolation arithmetic.**
+//!
+//! Round 224 lands the per-sample interpolation arithmetic the wiki
+//! spec defines for SVQ3 motion compensation in
+//! `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Motion Compensation"
+//! as a new [`svq3_mc`] module. The
+//! [`svq3_mc::thirdpel_interpolate_1d`] helper implements the spec's
+//! one-direction formula `((2 * A + B + 1) * 0x2AB) >> 11` (with the
+//! `0x2AB` / `>> 11` / `+ 1` constants surfaced as
+//! [`svq3_mc::THIRDPEL_1D_MULTIPLIER`] / [`svq3_mc::THIRDPEL_1D_SHIFT`]
+//! / [`svq3_mc::THIRDPEL_1D_BIAS`]); the
+//! [`svq3_mc::thirdpel_interpolate_2d`] helper implements the spec's
+//! two-dimensional formula `((4 * A + 3 * B + 3 * C + 2 * D + 6) *
+//! 0xAAB) >> 15` against the spec-quoted weight matrix
+//! [`svq3_mc::THIRDPEL_2D_WEIGHTS`] = `[[4, 3], [3, 2]]` (with the
+//! `0xAAB` / `>> 15` / `+ 6` constants surfaced as
+//! [`svq3_mc::THIRDPEL_2D_MULTIPLIER`] / [`svq3_mc::THIRDPEL_2D_SHIFT`]
+//! / [`svq3_mc::THIRDPEL_2D_BIAS`]). Both helpers are `const fn` and
+//! consume the spec's exact integer arithmetic — no division and no
+//! floating point.
+//!
+//! Round 224 also surfaces the wiki spec's "stored and predicted as
+//! fraction of six and then rounded to the desired base" motion-vector
+//! storage remark as a per-precision base lookup
+//! ([`svq3_mc::stored_sixths_base`] returning 6 / 3 / 2 for Fullpel /
+//! Halfpel / Thirdpel) plus an [`svq3_mc::is_aligned_to_precision_base`]
+//! predicate. The actual rounding step is NOT implemented — the wiki
+//! spec text leaves the rounding direction unspecified, so round 224
+//! exposes only the alignment check, deferring the rounding helper to
+//! the round that pins the direction in `docs/`.
+//!
+//! Round 224 is structural arithmetic only —
+//! `Svq3DecoderHandle::receive_frame` continues to return
+//! `oxideav_core::Error::Unsupported` until the reference-frame-fetch
+//! + filter-application stage lands.
+//!
 //! **Round 217 — SVQ1 u16-LE parameter table (512 records) mirrored.**
 //!
 //! Round 217 picks up the third Extractor-02-staged helper region
@@ -217,6 +253,7 @@ pub mod svq1_helper_luts;
 pub mod svq3;
 pub mod svq3_coeff;
 pub mod svq3_mb;
+pub mod svq3_mc;
 
 #[cfg(feature = "registry")]
 mod registry;

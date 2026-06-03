@@ -8,6 +8,45 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 224 — SVQ3 sub-pixel thirdpel interpolation arithmetic.** The
+  per-sample interpolation arithmetic the wiki spec defines for SVQ3
+  motion compensation in
+  `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Motion Compensation"
+  lands as a new `svq3_mc` module. Round 224 is structural arithmetic
+  only — `Svq3DecoderHandle::receive_frame` continues to return
+  `oxideav_core::Error::Unsupported`.
+  - New `svq3_mc` module surface:
+    - `thirdpel_interpolate_1d(a, b) -> i32` `const fn` —
+      `((2 * A + B + 1) * 0x2AB) >> 11`.
+    - `thirdpel_interpolate_2d(a, b, c, d) -> i32` `const fn` —
+      `((4 * A + 3 * B + 3 * C + 2 * D + 6) * 0xAAB) >> 15`.
+    - `THIRDPEL_1D_MULTIPLIER = 0x2AB` (683) / `THIRDPEL_1D_SHIFT = 11`
+      / `THIRDPEL_1D_BIAS = 1` / `THIRDPEL_1D_WEIGHT_SUM = 3`
+      provenance constants.
+    - `THIRDPEL_2D_MULTIPLIER = 0xAAB` (2731) / `THIRDPEL_2D_SHIFT = 15`
+      / `THIRDPEL_2D_BIAS = 6` / `THIRDPEL_2D_WEIGHT_SUM = 12`
+      provenance constants.
+    - `THIRDPEL_2D_WEIGHTS: [[u8; 2]; 2] = [[4, 3], [3, 2]]` — the
+      verbatim weight matrix the wiki spec quotes.
+    - `stored_sixths_base(precision) -> u32` — returns 6 / 3 / 2 for
+      Fullpel / Halfpel / Thirdpel, per the wiki spec's "stored and
+      predicted as fraction of six and then rounded to the desired
+      base" remark.
+    - `is_aligned_to_precision_base(stored_sixths, precision) -> bool`
+      — checks whether an already-rounded sixths-grid value is on the
+      precision's base. The actual rounding step is NOT implemented
+      because the wiki spec text leaves the rounding direction
+      unspecified.
+  - +31 tests covering the multiplier / shift / bias constants, the
+    weight matrix and its sum, the fixed-point reciprocal ratios
+    (`683 * 3 = 2049 > 2048`, `2731 * 12 = 32772 > 32768`), formula
+    expansion matches for zero / equal / asymmetric inputs, exhaustive
+    `0..=255 × 0..=255` byte-range coverage for the 1D form,
+    representative-spread byte-range coverage for the 2D form, the
+    per-precision storage base lookup, and the alignment predicate
+    against negative and positive sixths-grid values (212 → 243
+    lib-test total; 219 → 250 lib + integration).
+
 - **Round 217 — SVQ1 u16-LE parameter table (512 records) mirrored.**
   The 1024-byte `u16` parameter table identified by the docs
   collaborator's Extractor 02 pass at file offset `0x59d00..0x5a100`
