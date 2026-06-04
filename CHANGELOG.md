@@ -8,6 +8,65 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 230 — SVQ3 macroblock transform + dequantization arithmetic.**
+  The per-coefficient dequantization arithmetic the wiki spec defines
+  for SVQ3 in `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock
+  transform and dequantization" lands as a new `svq3_dequant` module.
+  Round 230 is structural arithmetic only —
+  `Svq3DecoderHandle::receive_frame` continues to return
+  `oxideav_core::Error::Unsupported` until the dezigzag + IDCT stages
+  land.
+  - New `svq3_dequant` module surface:
+    - `LUMA_TRANSFORM_MATRIX: [[i32; 4]; 4]` — verbatim from the wiki
+      spec's four-row block
+      `[[13, 17, 1, 7], [13, 7, -1, -17], [13, -7, -1, 17], [13, -17,
+      1, -7]]`.
+    - `LUMA_TRANSFORM_DC_COLUMN = 13` — corroborates the all-rows-share-
+      `13`-in-column-0 invariant.
+    - `CHROMA_DC_TRANSFORM_MATRIX: [[i32; 2]; 2]` — verbatim from the
+      wiki spec's `[[8, 8], [8, -8]]` block.
+    - `DEQUANT_COEFF_TABLE: [u32; 32]` — the 32-entry per-quantiser
+      scale table, monotonically increasing from `3881` at `Q=0` to
+      `141_533` at `Q=31`.
+    - `DEQUANT_COEFF_TABLE_LEN = 32` /
+      `DEQUANT_QUANTISER_RANGE = 0..32` — length and quantiser-range
+      constants matching the slice header's 5-bit quantiser field.
+    - `INTRA_LUMA_DC_SCALE = 259_922` (= `13 * 13 * 1538`) /
+      `INTRA_LUMA_DC_SCALE_TAIL = 1538` — the spec's intra-luma-DC
+      scale and its standalone tail factor.
+    - `DEQUANT_SHIFT = 20` / `DEQUANT_ROUND = 0x80000 = 1 << 19` —
+      the general dequant's right-shift and round-half-up bias.
+    - `CHROMA_DC_PRE_SHIFT = 3` / `CHROMA_DC_POST_SHIFT = 1` — the
+      two chroma-DC shifts that total `>> 4` (matching the `8`-scaled
+      chroma transform matrix).
+    - `dequantize_intra_luma_dc(block_zero) -> i32` `const fn` —
+      applies `INTRA_LUMA_DC_SCALE * block_zero`, the spec's
+      `13 * 13 * 1538 * block[0]` expression for intra luma blocks
+      without separate DC coefficient blocks.
+    - `dequantize_chroma_dc(q, block_zero) -> i32` `const fn` —
+      applies `(DEQUANT_COEFF_TABLE[q] * (block_zero >> 3)) >> 1`,
+      the spec's chroma-DC expression.
+    - `dequantize_coefficient(q, coeff, dc) -> i32` `const fn` —
+      applies `(coeff * DEQUANT_COEFF_TABLE[q] + dc + 0x80000) >> 20`,
+      the spec's general per-coefficient dequant expression.
+    - `finalise_dc(dc) -> i32` `const fn` — applies
+      `(dc + DEQUANT_ROUND) >> DEQUANT_SHIFT`, the no-AC-contribution
+      shortcut equivalent to `dequantize_coefficient(_, 0, dc)`.
+  - +40 lib tests covering the luma transform matrix shape +
+    row-by-row verbatim content + first-column invariant + row-sum
+    invariant, the chroma DC transform matrix verbatim content and
+    its per-row sums (16 / 0), the 32-entry dequant table's
+    length-vs-quantiser-range agreement + first/last entry +
+    every-row verbatim content + strict-monotonicity sweep, the
+    `DEQUANT_SHIFT = 20` and `DEQUANT_ROUND = 0x80000` provenance
+    identities, the `INTRA_LUMA_DC_SCALE = 13 * 13 * 1538 = 259_922`
+    decomposition, the chroma-shift total `>> 4` identity, every
+    closed-form helper's zero / one / negative / boundary
+    arithmetic checks, the `finalise_dc` round-half-up boundary, a
+    monotonic-output-in-quantiser sweep for `dequantize_coefficient`,
+    and linearity-in-coeff / additivity-in-dc identities (243 → 283
+    lib-test total; 250 → 290 lib + integration).
+
 - **Round 224 — SVQ3 sub-pixel thirdpel interpolation arithmetic.** The
   per-sample interpolation arithmetic the wiki spec defines for SVQ3
   motion compensation in

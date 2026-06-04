@@ -1,5 +1,26 @@
 //! Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec.
 //!
+//! **Round 230 — SVQ3 macroblock transform + dequantization arithmetic.**
+//!
+//! Round 230 lands the per-coefficient dequantization arithmetic the
+//! wiki spec defines for SVQ3 in
+//! `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock transform
+//! and dequantization" as a new [`svq3_dequant`] module. The 4×4 luma
+//! transform coefficient matrix
+//! ([`svq3_dequant::LUMA_TRANSFORM_MATRIX`]), the 2×2 chroma DC
+//! transform matrix ([`svq3_dequant::CHROMA_DC_TRANSFORM_MATRIX`]),
+//! and the 32-entry per-quantiser scale table
+//! ([`svq3_dequant::DEQUANT_COEFF_TABLE`]) land verbatim; the three
+//! closed-form expressions the spec quotes — intra-luma DC,
+//! chroma DC, and the general per-coefficient dequant — land as
+//! the [`svq3_dequant::dequantize_intra_luma_dc`],
+//! [`svq3_dequant::dequantize_chroma_dc`],
+//! [`svq3_dequant::dequantize_coefficient`], and
+//! [`svq3_dequant::finalise_dc`] `const fn` helpers. Round 230 is
+//! structural arithmetic only — `Svq3DecoderHandle::receive_frame`
+//! continues to return `oxideav_core::Error::Unsupported` until the
+//! dezigzag + IDCT stages land.
+//!
 //! **Round 224 — SVQ3 sub-pixel thirdpel interpolation arithmetic.**
 //!
 //! Round 224 lands the per-sample interpolation arithmetic the wiki
@@ -252,6 +273,7 @@ pub mod svq1_codebook;
 pub mod svq1_helper_luts;
 pub mod svq3;
 pub mod svq3_coeff;
+pub mod svq3_dequant;
 pub mod svq3_mb;
 pub mod svq3_mc;
 

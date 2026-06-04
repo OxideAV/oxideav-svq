@@ -5,6 +5,32 @@ Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 
 ## Status
 
+**Round 230 — SVQ3 macroblock transform + dequantization arithmetic.**
+Round 230 implements the per-coefficient dequantization arithmetic the
+wiki spec defines for SVQ3 in
+`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock transform and
+dequantization" as a new `svq3_dequant` module. The 4×4 luma transform
+coefficient matrix (`LUMA_TRANSFORM_MATRIX` = `[[13, 17, 1, 7], [13, 7,
+-1, -17], [13, -7, -1, 17], [13, -17, 1, -7]]`), the 2×2 chroma DC
+transform matrix (`CHROMA_DC_TRANSFORM_MATRIX` = `[[8, 8], [8, -8]]`),
+and the 32-entry per-quantiser scale table (`DEQUANT_COEFF_TABLE`,
+indexed by the slice quantiser `Q ∈ 0..32`, monotonically increasing
+from `3881` at `Q=0` to `141533` at `Q=31`) land verbatim as `pub
+const` arrays. The three closed-form dequantization expressions the
+wiki spec quotes — intra-luma DC (`13 * 13 * 1538 * block[0]` =
+`INTRA_LUMA_DC_SCALE * block[0]` with `INTRA_LUMA_DC_SCALE = 259_922`),
+chroma DC (`(DEQUANT_COEFF_TABLE[Q] * (block[0] >> 3)) >> 1`), and
+general per-coefficient dequant (`(coeff * DEQUANT_COEFF_TABLE[Q] + dc
++ 0x80000) >> 20`) — land as the `dequantize_intra_luma_dc(block_zero)
+-> i32`, `dequantize_chroma_dc(q, block_zero) -> i32`,
+`dequantize_coefficient(q, coeff, dc) -> i32`, and `finalise_dc(dc) ->
+i32` `const fn` helpers. The dequant shift (`DEQUANT_SHIFT = 20`) and
+the round-half-up bias (`DEQUANT_ROUND = 0x80000 = 1 << 19`) are
+surfaced as provenance constants. Round 230 is structural arithmetic
+only — `Svq3DecoderHandle::receive_frame` continues to return
+`oxideav_core::Error::Unsupported` until the dezigzag + IDCT stages
+land. Total tests: 283 lib + 7 integration = 290 (up from 250).
+
 **Round 224 — SVQ3 sub-pixel thirdpel interpolation arithmetic.** Round
 224 implements the per-sample interpolation arithmetic the wiki spec
 defines for SVQ3 motion compensation in
@@ -579,6 +605,39 @@ The standalone `svq3_coeff` module surface (always available):
   `svq3_coeff::COEFFS_PER_CHROMA_DC_BLOCK` /
   `svq3_coeff::COEFFS_PER_ALT_SCAN_HALF` constants.
 
+The standalone `svq3_dequant` module surface (always available):
+
+* `svq3_dequant::LUMA_TRANSFORM_MATRIX: [[i32; 4]; 4]` — the 4×4
+  luma transform coefficient matrix
+  `[[13, 17, 1, 7], [13, 7, -1, -17], [13, -7, -1, 17], [13, -17, 1, -7]]`.
+* `svq3_dequant::LUMA_TRANSFORM_DC_COLUMN = 13` — corroborates the
+  invariant that all four rows share `13` in column 0.
+* `svq3_dequant::CHROMA_DC_TRANSFORM_MATRIX: [[i32; 2]; 2]` — the 2×2
+  chroma DC transform matrix `[[8, 8], [8, -8]]`.
+* `svq3_dequant::DEQUANT_COEFF_TABLE: [u32; 32]` — the 32-entry
+  per-quantiser scale table, verbatim from the wiki spec.
+* `svq3_dequant::DEQUANT_COEFF_TABLE_LEN = 32` /
+  `DEQUANT_QUANTISER_RANGE = 0..32` — length and quantiser-range
+  constants.
+* `svq3_dequant::INTRA_LUMA_DC_SCALE = 259_922` — the `13 * 13 *
+  1538` intra-luma-DC scale; also `INTRA_LUMA_DC_SCALE_TAIL = 1538`
+  for the standalone scale factor.
+* `svq3_dequant::DEQUANT_SHIFT = 20` / `DEQUANT_ROUND = 0x80000`
+  — the general dequant's right-shift and round-half-up bias.
+* `svq3_dequant::CHROMA_DC_PRE_SHIFT = 3` /
+  `CHROMA_DC_POST_SHIFT = 1` — the chroma DC pre / post shifts that
+  total `>> 4`.
+* `svq3_dequant::dequantize_intra_luma_dc(block_zero) -> i32`
+  `const fn` — applies `INTRA_LUMA_DC_SCALE * block_zero`.
+* `svq3_dequant::dequantize_chroma_dc(q, block_zero) -> i32`
+  `const fn` — applies `(DEQUANT_COEFF_TABLE[q] * (block_zero >>
+  3)) >> 1`.
+* `svq3_dequant::dequantize_coefficient(q, coeff, dc) -> i32`
+  `const fn` — applies `(coeff * DEQUANT_COEFF_TABLE[q] + dc +
+  0x80000) >> 20`.
+* `svq3_dequant::finalise_dc(dc) -> i32` `const fn` — applies
+  `(dc + 0x80000) >> 20` for the no-AC-contribution case.
+
 The standalone `svq3_mc` module surface (always available):
 
 * `svq3_mc::thirdpel_interpolate_1d(a: i32, b: i32) -> i32` `const fn` —
@@ -604,6 +663,20 @@ The standalone `svq3_mc` module surface (always available):
   already-rounded sixths-grid value is on the precision's base.
 
 ## Clean-room provenance
+
+Round 230 was implemented strictly from
+`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock transform and
+dequantization" — the four-line block enumerating the 4×4 luma
+transform matrix, the two-line block enumerating the 2×2 chroma DC
+transform matrix, the 32-entry quantizer table block (lines beginning
+`3881, 4351, ...` through `...126635, 141533`), and the three
+closed-form expressions for intra-luma DC, chroma DC, and the general
+per-coefficient dequant. The constants (`INTRA_LUMA_DC_SCALE` = `13 *
+13 * 1538` = `259_922`, `DEQUANT_SHIFT` = `20`, `DEQUANT_ROUND` =
+`0x80000`, `CHROMA_DC_PRE_SHIFT` = `3`, `CHROMA_DC_POST_SHIFT` = `1`)
+are transcribed verbatim from the same paragraph. No other source was
+consulted; the spec paragraph's parenthetical attribution to an
+external project file was specifically NOT consulted nor reproduced.
 
 Round 224 was implemented strictly from
 `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Motion Compensation" —
