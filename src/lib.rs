@@ -1,5 +1,31 @@
 //! Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec.
 //!
+//! **Round 233 — SVQ3 per-block coefficient placement (scan-order
+//! infrastructure).**
+//!
+//! Round 233 lands the per-block placement step that connects the
+//! Golomb-decoded `(run, value)` coefficient stream from
+//! [`svq3_coeff`] to the 2D block matrix consumed by the
+//! dequantization arithmetic in [`svq3_dequant`]. The wiki spec's
+//! §"Coefficient decoding" describes coefficients being stored in
+//! 4×4 (sub)blocks "except for chroma DCs which are stored in 2×2
+//! blocks"; round 233 surfaces the **unambiguous 2×2 chroma DC
+//! row-major scan** ([`svq3_scan::CHROMA_DC_2X2_SCAN`]) and a generic
+//! [`svq3_scan::place_coefficients_in_scan_order`] helper that walks
+//! a `(run, value)` stream into a fixed-size flat array per a
+//! scan-order table. The convenience wrapper
+//! [`svq3_scan::place_chroma_dc_2x2`] pins the chroma DC 2×2 case for
+//! direct consumption by the
+//! [`svq3_dequant::CHROMA_DC_TRANSFORM_MATRIX`] application. The 4×4
+//! scan-order arrays (alt-scan picture + normal-zigzag) are
+//! deliberately NOT transcribed — the wiki's §"Macroblock layer"
+//! ASCII art for the dezigzag pattern is ambiguous in two ways (see
+//! the module's "Open work" section) so round 233 defers the 4×4
+//! scan arrays to a future docs round. Round 233 is structural
+//! arithmetic only — `Svq3DecoderHandle::receive_frame` continues to
+//! return `oxideav_core::Error::Unsupported` until the 4×4 dezigzag +
+//! IDCT stages land.
+//!
 //! **Round 230 — SVQ3 macroblock transform + dequantization arithmetic.**
 //!
 //! Round 230 lands the per-coefficient dequantization arithmetic the
@@ -276,6 +302,7 @@ pub mod svq3_coeff;
 pub mod svq3_dequant;
 pub mod svq3_mb;
 pub mod svq3_mc;
+pub mod svq3_scan;
 
 #[cfg(feature = "registry")]
 mod registry;

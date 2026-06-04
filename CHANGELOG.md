@@ -8,6 +8,81 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 233 — SVQ3 per-block coefficient placement (scan-order
+  infrastructure).** The per-block placement step that connects the
+  Golomb-decoded `(run, value)` coefficient stream from `svq3_coeff`
+  to the 2D block matrix consumed by the dequantization arithmetic in
+  `svq3_dequant` lands as a new `svq3_scan` module. Round 233 is
+  structural arithmetic only —
+  `Svq3DecoderHandle::receive_frame` continues to return
+  `oxideav_core::Error::Unsupported` until the 4×4 dezigzag + IDCT
+  stages land.
+  - New `svq3_scan` module surface:
+    - `CHROMA_DC_2X2_SCAN: [usize; 4] = [0, 1, 2, 3]` — the
+      unambiguous row-major 2×2 chroma DC scan order. The wiki spec's
+      §"Coefficient decoding" notes that "chroma DCs are stored in
+      2×2 blocks" without drawing a dezigzag picture for the 2×2
+      case; for a 2×2 block stored row-major the row-major /
+      column-major / diagonal scan orders all collapse to the same
+      four-position list.
+    - `CHROMA_DC_2X2_LEN = 4` and `FULL_4X4_LEN = 16` — placement-side
+      block-capacity constants mirroring the
+      `crate::svq3_coeff::COEFFS_PER_*` lengths.
+    - `chroma_dc_2x2_flat_index(row, col) -> Option<usize>` `const fn`
+      and its inverse `chroma_dc_2x2_matrix_position(flat) ->
+      Option<(usize, usize)>` `const fn` — round-trip helpers
+      converting between 2×2 matrix `(row, col)` positions and the
+      4-entry row-major flat-index store.
+    - `ScanError` enum (`OutOfRange` / `InvalidScanOrderEntry` /
+      `ScanOrderLengthMismatch`) — typed errors the placement helpers
+      raise when the input coefficient stream's cursor would overrun
+      the destination, when the scan-order table contains an
+      out-of-range entry, or when the scan-order table's length does
+      not match the destination's capacity. Implements `Display` +
+      `std::error::Error`.
+    - `place_coefficients_in_scan_order::<DEST_LEN>(coeffs,
+      scan_order) -> Result<[i32; DEST_LEN], ScanError>` — generic
+      `(run, value)` stream → fixed-size flat-array placement helper.
+      Initialises the destination to all zeros, advances a placement
+      cursor by `coeff.run + 1` per non-zero coefficient per the wiki
+      spec's §"Coefficient decoding" semantics, and writes the
+      coefficient's signed `value` at the scan-order position
+      `cursor + run` mapped through the supplied scan-order table.
+    - `place_chroma_dc_2x2(coeffs) -> Result<[i32; 4], ScanError>` —
+      convenience wrapper pinned to `CHROMA_DC_2X2_SCAN` /
+      `CHROMA_DC_2X2_LEN`. Returns the 4-entry block in row-major
+      order so its output feeds directly into the
+      `svq3_dequant::CHROMA_DC_TRANSFORM_MATRIX = [[8, 8], [8, -8]]`
+      application.
+  - +24 lib tests covering: the 2×2 row-major scan-order identity-mapping
+    invariant; the 2×2 scan length-vs-capacity agreement; the
+    scan-position covers-every-position-exactly-once invariant; the
+    scan-position → matrix `(row, col)` decoding for all four entries;
+    the `chroma_dc_2x2_flat_index` round-trip + out-of-range-row +
+    out-of-range-col rejection guards; the
+    `chroma_dc_2x2_matrix_position` out-of-range-flat-index rejection;
+    placement of an empty stream → all-zero block; single-coefficient
+    placement at each `run` value `(0, 1, 3)`; multi-coefficient
+    placement with zero-run + non-zero-run sequences; full-block fill
+    via four consecutive run=0 coefficients; negative-value sign
+    preservation through placement; cursor-overrun rejection at
+    in-stream `run`, cumulative-run, and saturated-`u32::MAX` boundaries;
+    scan-order length-mismatch and out-of-range scan-entry rejection
+    paths; generic-scan-order placement against a permuted 4-entry table;
+    generic-scan-order empty-stream identity for any scan order; and
+    `ScanError` `Display` impl sanity (`oxideav-svq:` module prefix
+    and offending-value mention). Lib-test total: 283 → 307 (290 →
+    314 with the 7 standalone-mode integration test).
+  - The wiki's §"Macroblock layer" "Dezigzag pattern (from H.264)"
+    ASCII art for the 4×4 scan order is NOT transcribed in round 233:
+    the picture has two unresolved characteristics — (a) row-0
+    horizontal arrows connect `(0,0)→(0,1)→(0,2)`, matching neither
+    the H.264 frame-zigzag opening triple `(0,0)→(0,1)→(1,0)` nor the
+    H.264 alt-scan opening triple `(0,0)→(1,0)→(0,1)`; (b) the wiki
+    text uses "normal zigzag" as the not-this-picture case without
+    depicting it. Both 4×4 scan-order arrays are deferred to a future
+    docs round that pins their canonical interpretation.
+
 - **Round 230 — SVQ3 macroblock transform + dequantization arithmetic.**
   The per-coefficient dequantization arithmetic the wiki spec defines
   for SVQ3 in `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock
