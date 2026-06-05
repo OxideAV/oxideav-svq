@@ -8,6 +8,55 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 239 — SVQ1 mean-step saturating arithmetic.** The per-sample
+  mean-step apply arithmetic documented in
+  `docs/video/svq1/spec/05-mean-removal.md` §5.4 lands as a new
+  `svq1_mean` module. The two halves of the SVQ1 mean family — intra
+  (`u8 ∈ [0, 255]` per §5.1.1) and inter (`s9 ∈ [-256, +255]` per
+  §5.1.2 / §5.1.3) — are exposed as `const fn` helpers, with the
+  underlying clamp matching the wiki spec's "saturate to an unsigned
+  byte range, 0..255" mandate (§5.4.3). Round 239 is pure arithmetic —
+  no bitstream reads — the future mean-VLC wire-up round will read the
+  intra (alphabet 256) and inter (alphabet 512, `min_value = -256`)
+  mean-VLC tables per spec/05 §5.7 and feed the decoded mean into
+  these helpers.
+  - New `svq1_mean` module surface:
+    - `INTRA_MEAN_MIN: u8 = 0` and `INTRA_MEAN_MAX: u8 = 255` — the
+      intra mean range per spec/05 §5.1.1.
+    - `INTER_MEAN_MIN: i16 = -256` and `INTER_MEAN_MAX: i16 = 255` —
+      the inter mean range per spec/05 §5.1.2 / §5.1.3.
+    - `saturate_u8(value: i16) -> u8` `const fn` — the per-stage
+      clamp to the unsigned byte range `[0, 255]` per spec/05 §5.4.3.
+    - `apply_intra_mean_step(predictor: u8, mean: u8) -> u8` `const
+      fn` — the intra path's per-sample mean step. The canonical case
+      has `predictor = 0` per spec/05 §5.4.1.
+    - `apply_inter_mean_step(predictor: u8, mean: i16) -> Result<u8,
+      MeanError>` `const fn` — the inter path's per-sample mean step.
+      The predictor is the motion-compensated reference sample; the
+      `saturate_u8` clamp is load-bearing on this path per the
+      spec/05 §5.1.2 worked examples (`predictor = 0`, `mean = -256`
+      → 0; `predictor = 255`, `mean = +255` → 255).
+    - `samples_per_leaf(level: Svq1Level) -> Option<usize>` `const
+      fn` — the `V_L` replication count per spec/03 §3.3 (`8 / 16 /
+      32 / 64` for L=0..L=3; `None` for L=4 / L=5 since those levels
+      do not host a mean-removed VQ leaf per spec/14.10 / §14.11).
+    - `MeanError::OutOfRange(i16)` — typed error for inter mean
+      values outside the closed `[-256, +255]` domain.
+  - Twelve new unit tests in `svq1_mean::tests` cover the boundary
+    behaviour: `saturate_u8` below-zero / above-255 / pass-through
+    sweep across `[0, 255]`; intra mean-only with `predictor = 0`
+    using the spec/05 §5.9 worked-example value `mean = 61` plus the
+    range boundaries; intra mean with a non-zero predictor exercising
+    the clamp; inter mean negative-residue / positive-residue
+    saturation per spec/05 §5.1.2's two worked examples; inter
+    `mean = 0` returns the predictor unchanged for every predictor
+    in `[0, 255]`; inter out-of-range rejection at `-257` / `+256`;
+    `samples_per_leaf` matches spec/03 §3.3's `V_L` numbers for
+    L=0..L=3 and returns `None` for L=4 / L=5; intra and inter
+    range-constant values match spec/05 §5.1.
+  - Total tests: 319 lib + 7 integration = 326 (up from 307 + 7 =
+    314).
+
 - **Round 233 — SVQ3 per-block coefficient placement (scan-order
   infrastructure).** The per-block placement step that connects the
   Golomb-decoded `(run, value)` coefficient stream from `svq3_coeff`

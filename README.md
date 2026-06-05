@@ -5,6 +5,28 @@ Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 
 ## Status
 
+**Round 239 — SVQ1 mean-step saturating arithmetic.** Round 239 lands
+the per-sample mean-step apply arithmetic documented in
+`docs/video/svq1/spec/05-mean-removal.md` §5.4 as a new `svq1_mean`
+module. The two halves of the SVQ1 mean family — intra (`u8 ∈ [0,
+255]` per §5.1.1) and inter (`s9 ∈ [-256, +255]` per §5.1.2 / §5.1.3)
+— are exposed as the `const fn` helpers `apply_intra_mean_step` and
+`apply_inter_mean_step`, with the underlying `saturate_u8` clamp
+matching the wiki spec's "saturate to an unsigned byte range, 0..255"
+mandate (§5.4.3). A companion `samples_per_leaf` helper returns the
+`V_L` replication count per spec/03 §3.3 (`8 / 16 / 32 / 64` for
+L=0..L=3; `None` for L=4 / L=5 since those levels do not host a
+mean-removed VQ leaf per spec/14.10 / §14.11). Range constants
+(`INTRA_MEAN_MIN` / `INTRA_MEAN_MAX` / `INTER_MEAN_MIN` /
+`INTER_MEAN_MAX`) pin the two-table value-range distinction at the
+type level; a `MeanError::OutOfRange` variant flags out-of-range
+inter mean values. Round 239 is pure arithmetic — no bitstream reads
+— the future mean-VLC wire-up round will read the intra (alphabet
+256, file `0x5cb0c..0x5cf14`) and inter (alphabet 512, `min_value =
+-256`, file `0x5c304..0x5cb0c`) mean-VLC tables per spec/05 §5.7 and
+feed the decoded mean into these helpers. Total tests: 319 lib + 7
+integration = 326 (up from 314).
+
 **Round 233 — SVQ3 per-block coefficient placement (scan-order
 infrastructure).** Round 233 lands the per-block placement step that
 connects the Golomb-decoded `(run, value)` coefficient stream from
