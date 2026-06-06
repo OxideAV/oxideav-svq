@@ -8,6 +8,65 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 242 — SVQ1 per-stage codebook-index field reader (§4.2).**
+  The `4 × N`-bit per-leaf codebook-index run described in
+  `docs/video/svq1/spec/04-multistage-vq-decoder.md` §4.2 lands as a
+  new `svq1_stage_indices` module. The reader consumes `N`
+  consecutive 4-bit fields (stage-1 first, stage-`N` last) from the
+  existing MSB-first `BitReader`, returns the values as an
+  allocation-free `IndexBuffer` of up to six unsigned `u8`s in
+  `0..=15`, and surfaces the spec's three invariants — bit-tight (no
+  inter-stage padding, §4.2.1), stage-ordered (no permutation field,
+  §4.2.1), raw (not VLC, §4.2.1) — through both the function
+  signature and a dedicated test set.
+  - New `svq1_stage_indices` module surface:
+    - `BITS_PER_INDEX: u32 = 4` — per-stage field width per
+      spec/04 §4.2 (table row "Width : 4 bits").
+    - `MAX_STAGES_PER_LEAF: usize = 6` — upper bound on `N` per
+      spec/04 §4.1 stage-count VLC alphabet `{-1, 0..=6}`. Mirrors
+      `svq1_codebook::SVQ1_STAGES_PER_LEVEL`.
+    - `MAX_VEC_IDX: u8 = 15` — upper bound on each `vec_idx` per
+      spec/14 §14.4 "16 vectors per stage" (entries `0..=15`).
+    - `bits_for_n_stages(n: usize) -> Option<usize>` `const fn` —
+      closed-form `4 × N` for `N ∈ 0..=6`, `None` otherwise.
+    - `IndexBuffer` struct with `EMPTY` constant, `len()` /
+      `is_empty()` / `indices()` / `get(stage_one_based)`
+      accessors. Storage is a `[u8; 6]` plus a `len: u8`; values
+      past `len` are not exposed to callers.
+    - `read_stage_indices(reader, n_stages) -> Result<IndexBuffer>`
+      — reads exactly `4 × n_stages` bits MSB-first; rejects
+      `n_stages > MAX_STAGES_PER_LEAF` with `Error::BadBitWidth`;
+      returns `IndexBuffer::EMPTY` for `n_stages == 0` without
+      consuming any bits (mean-only leaf path per spec/04 §4.5.4);
+      propagates `Error::Truncated` if the underlying byte slice
+      ends mid-run.
+  - Twenty-seven new lib tests cover the closed-form arithmetic
+    (`bits_for_n_stages` over the full `0..=7` range), the empty
+    buffer's accessor invariants, the degenerate cases (zero stages
+    consumes no bits; seven or more stages rejected with
+    `BadBitWidth(n)`), each edge of the single-stage value range
+    (`0`, `5`, `15`), the multi-stage byte-boundary-crossing cases
+    (two-stage byte read, three-stage 12-bit read straddling byte
+    0/1, six-stage 24-bit read consuming the spec's "3 bytes
+    worth"), the per-stage all-zeros / all-fifteens edges, the
+    no-inter-stage-padding invariant via `bits_consumed`
+    accounting, the continuation read (post-reader cursor lands at
+    the exact bit immediately after the last stage's last bit), the
+    three truncation paths (mid-stream, first-stage, mid-third-
+    stage), the `IndexBuffer::get` one-based indexing convention
+    (`get(0)` returns `None`), and the cross-module
+    `MAX_STAGES_PER_LEAF == SVQ1_STAGES_PER_LEVEL` consistency
+    invariant.
+  - Round 242 is the bitstream-side index reader alone. It does
+    NOT perform the §4.3 codebook lookup
+    (`(level, half, stage, vec_idx) → V_L signed bytes`) — that
+    step still depends on the L=0..L=3 payload's intra-vs-inter /
+    stage-vs-level interleave being pinned in `docs/video/svq1/`
+    (`crates/oxideav-svq/src/svq1_codebook.rs` "Open work" note).
+    Once that interleave lands, the per-leaf decoder will call
+    `svq1_stage_indices::read_stage_indices` and feed the returned
+    `IndexBuffer` into the codebook-offset arithmetic.
+
 - **Round 239 — SVQ1 mean-step saturating arithmetic.** The per-sample
   mean-step apply arithmetic documented in
   `docs/video/svq1/spec/05-mean-removal.md` §5.4 lands as a new

@@ -5,6 +5,36 @@ Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 
 ## Status
 
+**Round 242 — SVQ1 per-stage codebook-index field reader (§4.2).**
+Round 242 lands the per-stage codebook-index field reader the SVQ1
+spec defines in `docs/video/svq1/spec/04-multistage-vq-decoder.md`
+§4.2 as a new `svq1_stage_indices` module. The wiki source
+(`docs/video/svq1/wiki/Sorenson_Video_1.wiki` §"Decoding Intraframe
+Plane Data") pins the run as `4 × N` raw bits — `N` consecutive 4-bit
+fields in stage-ascending order with no inter-stage padding and no
+permutation field ("the first 4 bits specify the first codebook to
+use, the next 4 bits specify the second codebook, all the way up to a
+sixth codebooks for 6 possible stages"). The
+`svq1_stage_indices::read_stage_indices` function reads exactly that
+run from a `BitReader` and returns an allocation-free
+`svq1_stage_indices::IndexBuffer` of up to
+`svq1_stage_indices::MAX_STAGES_PER_LEAF = 6` entries. The per-stage
+width `svq1_stage_indices::BITS_PER_INDEX = 4`, the maximum index
+`svq1_stage_indices::MAX_VEC_IDX = 15`, and the closed-form bit-count
+helper `svq1_stage_indices::bits_for_n_stages` (returning `4 × N` for
+`N ∈ 0..=6` and `None` otherwise) surface the spec invariants for
+callers that want to range-check or budget bits up front. The reader
+honours the `N = 0` mean-only leaf path (spec/04 §4.5.4) by returning
+`IndexBuffer::EMPTY` without consuming any bits; `N > 6` is rejected
+with `Error::BadBitWidth` (the stage-count VLC alphabet excludes that
+case per spec/04 §4.1.1); mid-run end-of-stream surfaces as
+`Error::Truncated`. Round 242 is the bitstream-side index reader
+alone — the §4.3 codebook lookup
+(`(level, half, stage, vec_idx) → V_L bytes`) still depends on the
+L=0..L=3 payload's intra-vs-inter / stage-vs-level interleave pinned
+in `docs/video/svq1/`. Total tests: 346 lib + 7 integration = 353
+(up from 326).
+
 **Round 239 — SVQ1 mean-step saturating arithmetic.** Round 239 lands
 the per-sample mean-step apply arithmetic documented in
 `docs/video/svq1/spec/05-mean-removal.md` §5.4 as a new `svq1_mean`
