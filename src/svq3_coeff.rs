@@ -317,6 +317,103 @@ pub fn read_alt_scan_half(br: &mut BitReader<'_>) -> Result<Vec<Coefficient>> {
     read_block_inner(br, COEFFS_PER_ALT_SCAN_HALF, read_alt_scan_coefficient)
 }
 
+/// One alternative-scan 4×4 block, organised into its two half-scans as
+/// the wiki spec describes them.
+///
+/// Per `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Coefficient
+/// decoding" line "Please note that in this case block is coded in two
+/// parts of up two eight coefficients corresponding to each half-scan."
+/// Each half is an independent run of up to [`COEFFS_PER_ALT_SCAN_HALF`]
+/// = `8` coefficients, terminated by either an explicit end-of-block
+/// sentinel (`code == 0`) or by reaching the half's capacity.
+///
+/// The two halves are kept **separated**: the run-accumulator cursor
+/// resets at the half boundary so a coefficient placed at scan
+/// position `7` in the first half does not consume a slot in the second
+/// half. This mirrors the wiki spec's "two parts" wording — each part is
+/// its own independent run.
+///
+/// The block's flat order is `first_half ++ second_half` (first-half
+/// coefficients come before second-half coefficients in stream order).
+/// The cumulative count of `first_half.len() + second_half.len()` is
+/// bounded by `2 * COEFFS_PER_ALT_SCAN_HALF = 16` =
+/// [`COEFFS_PER_4X4_BLOCK`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AltScanBlock {
+    /// Coefficients read from the first half-scan (up to
+    /// [`COEFFS_PER_ALT_SCAN_HALF`] entries).
+    pub first_half: Vec<Coefficient>,
+    /// Coefficients read from the second half-scan (up to
+    /// [`COEFFS_PER_ALT_SCAN_HALF`] entries).
+    pub second_half: Vec<Coefficient>,
+}
+
+impl AltScanBlock {
+    /// Total non-zero coefficient count across both half-scans.
+    ///
+    /// Bounded by `2 * COEFFS_PER_ALT_SCAN_HALF = 16` =
+    /// [`COEFFS_PER_4X4_BLOCK`].
+    pub fn len(&self) -> usize {
+        self.first_half.len() + self.second_half.len()
+    }
+
+    /// True when both halves are empty (both terminated by an
+    /// immediate end-of-block sentinel).
+    pub fn is_empty(&self) -> bool {
+        self.first_half.is_empty() && self.second_half.is_empty()
+    }
+
+    /// Yield a flat `(half_index, coefficient)` iterator across the
+    /// block in stream order. `half_index` is `0` for the first-half
+    /// coefficients and `1` for the second-half coefficients.
+    pub fn iter_with_half(&self) -> impl Iterator<Item = (u8, Coefficient)> + '_ {
+        let first = self.first_half.iter().map(|c| (0u8, *c));
+        let second = self.second_half.iter().map(|c| (1u8, *c));
+        first.chain(second)
+    }
+
+    /// Flatten both halves into a single `Vec<Coefficient>` in stream
+    /// order (first half, then second half). The half-scan boundary
+    /// information is discarded; callers that need it should consume
+    /// the [`first_half`](Self::first_half) and
+    /// [`second_half`](Self::second_half) fields directly.
+    pub fn flatten(&self) -> Vec<Coefficient> {
+        let mut out = Vec::with_capacity(self.len());
+        out.extend_from_slice(&self.first_half);
+        out.extend_from_slice(&self.second_half);
+        out
+    }
+}
+
+/// Walk an alternative-scan 4×4 block as two consecutive half-scans.
+///
+/// Per `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Coefficient
+/// decoding" — the alt-scan path is "coded in two parts of up two eight
+/// coefficients corresponding to each half-scan". This helper calls
+/// [`read_alt_scan_half`] twice, in order, and packages the result into
+/// an [`AltScanBlock`] that preserves the half boundary.
+///
+/// The two halves are read **independently**: each half has its own
+/// run-accumulator cursor that resets to zero at the half boundary, and
+/// each half is independently terminated by either an explicit
+/// end-of-block sentinel or by reaching `COEFFS_PER_ALT_SCAN_HALF` = `8`
+/// coefficients.
+///
+/// Errors propagate from the underlying half walker:
+///
+/// * [`Error::Truncated`] — bit-reader ran out of bits mid-coefficient
+///   in either half.
+/// * [`Error::BadBitWidth`] — a `(run + 1)` advance would push the
+///   per-half cursor past `COEFFS_PER_ALT_SCAN_HALF`.
+pub fn read_alt_scan_block(br: &mut BitReader<'_>) -> Result<AltScanBlock> {
+    let first_half = read_alt_scan_half(br)?;
+    let second_half = read_alt_scan_half(br)?;
+    Ok(AltScanBlock {
+        first_half,
+        second_half,
+    })
+}
+
 /// Walk a 4×4 normal-scan ("all other block types") block (16
 /// coefficients).
 ///
@@ -846,5 +943,193 @@ mod tests {
         let mut br = BitReader::new(&bytes);
         let coeffs = read_normal_scan_block(&mut br).unwrap();
         assert!(coeffs.is_empty());
+    }
+
+    // ---- Alt-scan two-half block walker --------------------------------
+
+    #[test]
+    fn alt_scan_block_both_halves_empty() {
+        // Two consecutive end-of-block sentinels → both halves empty.
+        let bytes = pack(&[ue(0), ue(0)]);
+        let mut br = BitReader::new(&bytes);
+        let block = read_alt_scan_block(&mut br).unwrap();
+        assert!(block.first_half.is_empty());
+        assert!(block.second_half.is_empty());
+        assert!(block.is_empty());
+        assert_eq!(block.len(), 0);
+    }
+
+    #[test]
+    fn alt_scan_block_first_half_only_populated() {
+        // First half: code 1 → (run=0, value=1), sign 0; code 0 end.
+        // Second half: code 0 end immediately.
+        let bytes = pack(&[ue(1), (1, 0), ue(0), ue(0)]);
+        let mut br = BitReader::new(&bytes);
+        let block = read_alt_scan_block(&mut br).unwrap();
+        assert_eq!(block.first_half, vec![Coefficient { run: 0, value: 1 }]);
+        assert!(block.second_half.is_empty());
+        assert_eq!(block.len(), 1);
+        assert!(!block.is_empty());
+    }
+
+    #[test]
+    fn alt_scan_block_second_half_only_populated() {
+        // First half: code 0 end immediately.
+        // Second half: code 2 → (run=1, value=1), sign 1; code 0 end.
+        let bytes = pack(&[ue(0), ue(2), (1, 1), ue(0)]);
+        let mut br = BitReader::new(&bytes);
+        let block = read_alt_scan_block(&mut br).unwrap();
+        assert!(block.first_half.is_empty());
+        assert_eq!(block.second_half, vec![Coefficient { run: 1, value: -1 }]);
+        assert_eq!(block.len(), 1);
+    }
+
+    #[test]
+    fn alt_scan_block_both_halves_capped_at_eight_each() {
+        // 8 coeffs per half × 2 halves = 16 coefficients total without
+        // any explicit end-of-block sentinel between or after. Each
+        // coefficient is code=1 sign=0 → (run=0, value=1) which advances
+        // each cursor by exactly 1 per coefficient.
+        let mut packs: Vec<(u32, u32)> = Vec::new();
+        for _ in 0..16 {
+            packs.push(ue(1));
+            packs.push((1, 0));
+        }
+        let bytes = pack(&packs);
+        let mut br = BitReader::new(&bytes);
+        let block = read_alt_scan_block(&mut br).unwrap();
+        assert_eq!(block.first_half.len(), COEFFS_PER_ALT_SCAN_HALF);
+        assert_eq!(block.second_half.len(), COEFFS_PER_ALT_SCAN_HALF);
+        assert_eq!(block.len(), COEFFS_PER_4X4_BLOCK);
+        for c in block.first_half.iter().chain(block.second_half.iter()) {
+            assert_eq!(c.run, 0);
+            assert_eq!(c.value, 1);
+        }
+    }
+
+    #[test]
+    fn alt_scan_block_halves_use_independent_cursors() {
+        // First half: a single code=7 → (run=0, value=5) sign 0; cursor
+        // advances to 1. Then code 0 → end of first half. Second half:
+        // start fresh at cursor 0 — a code 8 → (run=3, value=1) sign 0
+        // places at scan position 3, cursor advances to 4. Then code 0
+        // ends. If the cursor had carried over, the second half would
+        // observe cursor 1 + 4 = 5 instead of 4 — the AltScanBlock
+        // shape captures the per-half independence.
+        let bytes = pack(&[ue(7), (1, 0), ue(0), ue(8), (1, 0), ue(0)]);
+        let mut br = BitReader::new(&bytes);
+        let block = read_alt_scan_block(&mut br).unwrap();
+        assert_eq!(block.first_half, vec![Coefficient { run: 0, value: 5 }]);
+        assert_eq!(block.second_half, vec![Coefficient { run: 3, value: 1 }]);
+    }
+
+    #[test]
+    fn alt_scan_block_first_half_at_capacity_does_not_consume_second_half_bits() {
+        // Fill the first half to capacity (8 code=1 sign=0 entries) so
+        // it returns without consuming an end-of-block sentinel. Then
+        // the second half consumes the very next code: code 4 →
+        // (run=2, value=1) sign 1; code 0 end. This pins that the
+        // capacity-cap exit from the first half does NOT eat the first
+        // bit of the second half.
+        let mut packs: Vec<(u32, u32)> = Vec::new();
+        for _ in 0..8 {
+            packs.push(ue(1));
+            packs.push((1, 0));
+        }
+        packs.push(ue(4));
+        packs.push((1, 1));
+        packs.push(ue(0));
+        let bytes = pack(&packs);
+        let mut br = BitReader::new(&bytes);
+        let block = read_alt_scan_block(&mut br).unwrap();
+        assert_eq!(block.first_half.len(), COEFFS_PER_ALT_SCAN_HALF);
+        assert_eq!(block.second_half, vec![Coefficient { run: 2, value: -1 }]);
+    }
+
+    #[test]
+    fn alt_scan_block_run_overflow_in_first_half_propagates() {
+        // code 8 → (run=3, value=1), cursor 0+4=4. code 9 → (run=4,
+        // value=1), cursor 4+5=9 > 8 → BadBitWidth before the second
+        // half is touched.
+        let bytes = pack(&[ue(8), (1, 0), ue(9), (1, 0)]);
+        let mut br = BitReader::new(&bytes);
+        let err = read_alt_scan_block(&mut br).unwrap_err();
+        assert!(matches!(err, Error::BadBitWidth(_)));
+    }
+
+    #[test]
+    fn alt_scan_block_run_overflow_in_second_half_propagates() {
+        // First half: a single code 1 sign 0 then end. Second half:
+        // code 8 → (run=3, value=1), cursor 0+4=4. code 9 → (run=4,
+        // value=1), cursor 4+5=9 > 8 → BadBitWidth.
+        let bytes = pack(&[ue(1), (1, 0), ue(0), ue(8), (1, 0), ue(9), (1, 0)]);
+        let mut br = BitReader::new(&bytes);
+        let err = read_alt_scan_block(&mut br).unwrap_err();
+        assert!(matches!(err, Error::BadBitWidth(_)));
+    }
+
+    #[test]
+    fn alt_scan_block_truncated_in_first_half_propagates() {
+        // Empty bit stream → first Golomb decode hits Truncated.
+        let mut br = BitReader::new(&[]);
+        assert!(matches!(
+            read_alt_scan_block(&mut br),
+            Err(Error::Truncated)
+        ));
+    }
+
+    #[test]
+    fn alt_scan_block_truncated_in_second_half_propagates() {
+        // First half terminates cleanly (just ue(0)). Second half hits
+        // end-of-stream on its first Golomb decode → Truncated.
+        let bytes = pack(&[ue(0)]);
+        let mut br = BitReader::new(&bytes);
+        assert!(matches!(
+            read_alt_scan_block(&mut br),
+            Err(Error::Truncated)
+        ));
+    }
+
+    #[test]
+    fn alt_scan_block_flatten_preserves_stream_order() {
+        // First half: code 1 sign 0; second half: code 2 sign 1; ends.
+        let bytes = pack(&[ue(1), (1, 0), ue(0), ue(2), (1, 1), ue(0)]);
+        let mut br = BitReader::new(&bytes);
+        let block = read_alt_scan_block(&mut br).unwrap();
+        assert_eq!(
+            block.flatten(),
+            vec![
+                Coefficient { run: 0, value: 1 },
+                Coefficient { run: 1, value: -1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn alt_scan_block_iter_with_half_yields_indexed_pairs() {
+        // First half: code 1 sign 0; second half: code 1 sign 0; ends.
+        let bytes = pack(&[ue(1), (1, 0), ue(0), ue(1), (1, 0), ue(0)]);
+        let mut br = BitReader::new(&bytes);
+        let block = read_alt_scan_block(&mut br).unwrap();
+        let collected: Vec<(u8, Coefficient)> = block.iter_with_half().collect();
+        assert_eq!(
+            collected,
+            vec![
+                (0, Coefficient { run: 0, value: 1 }),
+                (1, Coefficient { run: 0, value: 1 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn alt_scan_block_total_length_bounded_by_full_4x4_capacity() {
+        // The block's total non-zero coefficient count is bounded by
+        // 2 × COEFFS_PER_ALT_SCAN_HALF = COEFFS_PER_4X4_BLOCK. Pin this
+        // bound as a structural invariant.
+        assert_eq!(
+            2 * COEFFS_PER_ALT_SCAN_HALF,
+            COEFFS_PER_4X4_BLOCK,
+            "alt-scan two-half capacity must equal the 4×4 block capacity"
+        );
     }
 }

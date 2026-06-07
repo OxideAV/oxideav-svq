@@ -5,6 +5,31 @@ Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 
 ## Status
 
+**Round 245 — SVQ3 alt-scan two-half block walker.** Round 245 lands
+the typed two-half walker for SVQ3's alternative-scan coefficient block
+as a new `svq3_coeff::AltScanBlock` carrier plus a
+`svq3_coeff::read_alt_scan_block` entry point. The wiki spec
+(`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Coefficient decoding")
+pins the alt-scan path as "coded in two parts of up two eight
+coefficients corresponding to each half-scan": each half is an
+independent run of up to `COEFFS_PER_ALT_SCAN_HALF = 8` coefficients,
+terminated by either an explicit end-of-block sentinel (`code == 0`) or
+by reaching the half's capacity, and the two halves keep their
+run-accumulator cursors strictly independent. The `AltScanBlock` carrier
+exposes the two halves as separate `Vec<Coefficient>` fields
+(`first_half` / `second_half`) for the future placement step that pins
+the 4×4 scan-order arrays, plus three convenience accessors: `len()`
+returning the cumulative coefficient count bounded by
+`COEFFS_PER_4X4_BLOCK = 16`, `iter_with_half()` yielding
+`(half_index, Coefficient)` pairs in stream order, and `flatten()`
+producing a single `Vec<Coefficient>` for callers that have already
+absorbed the half-scan boundary. The walker itself sequences two
+`read_alt_scan_half(br)` calls back-to-back, preserving the half
+walker's per-half termination + per-half capacity guarantees verbatim.
+The per-half 8-position scan-order array the wiki spec depicts in
+§"Macroblock layer" remains deferred per round 233's ambiguity note.
+Total tests: 359 lib + 7 integration = 366 (up from 346 + 7 = 353).
+
 **Round 242 — SVQ1 per-stage codebook-index field reader (§4.2).**
 Round 242 lands the per-stage codebook-index field reader the SVQ1
 spec defines in `docs/video/svq1/spec/04-multistage-vq-decoder.md`

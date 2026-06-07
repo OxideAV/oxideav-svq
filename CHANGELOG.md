@@ -8,6 +8,50 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 245 — SVQ3 alt-scan two-half block walker.** The typed
+  two-half walker for SVQ3's alternative-scan coefficient block lands as
+  a new `svq3_coeff::AltScanBlock` carrier plus a
+  `svq3_coeff::read_alt_scan_block` entry point. The wiki spec
+  (`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Coefficient decoding")
+  pins the alt-scan path as "coded in two parts of up two eight
+  coefficients corresponding to each half-scan": each half is an
+  independent run of up to `COEFFS_PER_ALT_SCAN_HALF` = 8 coefficients,
+  terminated by either an explicit end-of-block sentinel (`code == 0`)
+  or by reaching the half's capacity, and the two halves keep their
+  run-accumulator cursors strictly independent.
+  - New surface in `svq3_coeff`:
+    - `AltScanBlock { first_half: Vec<Coefficient>, second_half:
+      Vec<Coefficient> }` — typed two-half carrier with
+      `len()` / `is_empty()` / `iter_with_half()` (yielding
+      `(half_index: u8, Coefficient)` pairs in stream order) /
+      `flatten()` (returning a single `Vec<Coefficient>` for callers
+      that have already absorbed the half boundary).
+    - `read_alt_scan_block(br) -> Result<AltScanBlock>` — sequences
+      two `read_alt_scan_half(br)` calls back-to-back, preserving the
+      half walker's per-half termination + per-half capacity
+      guarantees verbatim.
+  - 12 new lib tests pin the contract:
+    - both halves empty (two consecutive end-of-block sentinels),
+    - first-half-only / second-half-only populated patterns,
+    - both halves capped at 8 coefficients each → `len() == 16`,
+    - per-half cursor independence (a `(run=0, value=5)` coefficient
+      in half 1 does not bleed into half 2's cursor),
+    - first-half capacity-cap exit does NOT consume the second
+      half's first bit,
+    - `BadBitWidth` overflow propagation from either half,
+    - `Truncated` propagation from either half,
+    - `flatten()` preserves stream order,
+    - `iter_with_half()` yields the correct `(half_index,
+      Coefficient)` pairs,
+    - structural invariant `2 * COEFFS_PER_ALT_SCAN_HALF ==
+      COEFFS_PER_4X4_BLOCK`.
+  - The per-half 8-position scan-order array the wiki spec depicts in
+    §"Macroblock layer" remains deferred per round 233's ambiguity
+    note; the two-half block walker landed here exposes the
+    coefficient stream in the order it was emitted, leaving the
+    scan-position-to-flat-index reshape to the round that pins the
+    canonical interpretation in `docs/video/svq3/`.
+
 - **Round 242 — SVQ1 per-stage codebook-index field reader (§4.2).**
   The `4 × N`-bit per-leaf codebook-index run described in
   `docs/video/svq1/spec/04-multistage-vq-decoder.md` §4.2 lands as a
