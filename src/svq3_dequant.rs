@@ -277,6 +277,117 @@ pub const fn finalise_dc(dc: i32) -> i32 {
     (dc + DEQUANT_ROUND) >> DEQUANT_SHIFT
 }
 
+/// Apply one 1-D row of the 2×2 chroma DC transform matrix to a 2-point
+/// column of samples.
+///
+/// The wiki spec's §"Macroblock transform and dequantization" pins the
+/// 2×2 chroma DC transform matrix as
+///
+/// ```text
+///   8  8
+///   8 -8
+/// ```
+///
+/// (also exposed verbatim as [`CHROMA_DC_TRANSFORM_MATRIX`]). The spec
+/// states "chroma DCs need to be transformed first using the following
+/// matrix" before the [`dequantize_chroma_dc`] expression is applied.
+///
+/// This helper carries out **one row's** dot product against a 2-point
+/// column `[a, b]`, using `matrix_row` as the row of weights. For the
+/// first matrix row `[8, 8]` the result is `8 * (a + b)`; for the second
+/// matrix row `[8, -8]` the result is `8 * (a - b)`. The two matrix rows
+/// are accessible as `CHROMA_DC_TRANSFORM_MATRIX[0]` and
+/// `CHROMA_DC_TRANSFORM_MATRIX[1]`.
+///
+/// Returns the unrounded i32 dot product; subsequent dequantisation /
+/// finalisation is the caller's responsibility (see
+/// [`dequantize_chroma_dc`] / [`finalise_dc`]).
+///
+/// # Examples
+///
+/// Apply both rows of the matrix to the same input pair:
+///
+/// ```
+/// use oxideav_svq::svq3_dequant::{
+///     apply_chroma_dc_transform_row, CHROMA_DC_TRANSFORM_MATRIX,
+/// };
+/// let pair = (3, 1);
+/// // Row 0 = sum-of-pair × 8.
+/// assert_eq!(
+///     apply_chroma_dc_transform_row(CHROMA_DC_TRANSFORM_MATRIX[0], pair.0, pair.1),
+///     32,
+/// );
+/// // Row 1 = difference-of-pair × 8.
+/// assert_eq!(
+///     apply_chroma_dc_transform_row(CHROMA_DC_TRANSFORM_MATRIX[1], pair.0, pair.1),
+///     16,
+/// );
+/// ```
+#[inline]
+#[must_use]
+pub const fn apply_chroma_dc_transform_row(matrix_row: [i32; 2], a: i32, b: i32) -> i32 {
+    matrix_row[0] * a + matrix_row[1] * b
+}
+
+/// Apply the 2×2 chroma DC transform matrix to a row-major 2×2 input
+/// block by multiplying the matrix into the block's columns (`M · X`).
+///
+/// The wiki spec's §"Macroblock transform and dequantization" pins the
+/// transform matrix [`CHROMA_DC_TRANSFORM_MATRIX`] = `[[8, 8], [8, -8]]`
+/// but does not enumerate the full `M · X · M^T` two-sided transform
+/// expression; only `M` itself is quoted alongside the remark "chroma
+/// DCs need to be transformed first using the following matrix". This
+/// helper applies `M` against the input's columns and returns the result
+/// in row-major order — the single-sided transform pass that is
+/// unambiguously what `M` alone produces against a column vector.
+///
+/// The input `block` is laid out row-major: `block[0]` = `(0, 0)`,
+/// `block[1]` = `(0, 1)`, `block[2]` = `(1, 0)`, `block[3]` = `(1, 1)`.
+/// This matches [`crate::svq3_scan::place_chroma_dc_2x2`]'s output. The
+/// returned `[i32; 4]` is laid out the same way.
+///
+/// Per-position output (where `(r, c)` = row, column):
+///
+/// * `out[0, 0] = M[0, :] · X[:, 0] = 8 * (block[0, 0] + block[1, 0])`
+/// * `out[0, 1] = M[0, :] · X[:, 1] = 8 * (block[0, 1] + block[1, 1])`
+/// * `out[1, 0] = M[1, :] · X[:, 0] = 8 * (block[0, 0] - block[1, 0])`
+/// * `out[1, 1] = M[1, :] · X[:, 1] = 8 * (block[0, 1] - block[1, 1])`
+///
+/// The unrounded i32 outputs feed directly into [`dequantize_chroma_dc`]
+/// for the per-sample dequant step; this helper does NOT apply any
+/// shift, bias, or quantiser scaling.
+///
+/// The full two-sided `M · X · M^T` transform (which the wiki spec does
+/// NOT spell out explicitly) is deliberately NOT folded in here — that
+/// derivation belongs in a future round once the docs pin it.
+///
+/// # Examples
+///
+/// Apply the transform to an identity-like input:
+///
+/// ```
+/// use oxideav_svq::svq3_dequant::apply_chroma_dc_2x2_columns;
+/// let block = [1, 0, 0, 1];
+/// // out[0,0] = 8 * (1 + 0) = 8;  out[0,1] = 8 * (0 + 1) = 8.
+/// // out[1,0] = 8 * (1 - 0) = 8;  out[1,1] = 8 * (0 - 1) = -8.
+/// assert_eq!(apply_chroma_dc_2x2_columns(block), [8, 8, 8, -8]);
+/// ```
+#[inline]
+#[must_use]
+pub const fn apply_chroma_dc_2x2_columns(block: [i32; 4]) -> [i32; 4] {
+    // block layout: row-major 2×2.
+    //   block[0] = (0, 0)   block[1] = (0, 1)
+    //   block[2] = (1, 0)   block[3] = (1, 1)
+    let row0 = CHROMA_DC_TRANSFORM_MATRIX[0];
+    let row1 = CHROMA_DC_TRANSFORM_MATRIX[1];
+    // Output rows, column by column.
+    let out_00 = apply_chroma_dc_transform_row(row0, block[0], block[2]);
+    let out_01 = apply_chroma_dc_transform_row(row0, block[1], block[3]);
+    let out_10 = apply_chroma_dc_transform_row(row1, block[0], block[2]);
+    let out_11 = apply_chroma_dc_transform_row(row1, block[1], block[3]);
+    [out_00, out_01, out_10, out_11]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,5 +751,200 @@ mod tests {
                 assert_eq!(dequantize_coefficient(q, 0, dc), finalise_dc(dc));
             }
         }
+    }
+
+    // ---- 2×2 chroma DC transform application ---------------------------
+
+    #[test]
+    fn chroma_dc_transform_row_zero_is_sum_times_eight() {
+        // Row 0 of the matrix is `[8, 8]`; the dot product against any
+        // 2-point column `[a, b]` is `8 * (a + b)`.
+        let row0 = CHROMA_DC_TRANSFORM_MATRIX[0];
+        for &(a, b) in &[(0i32, 0i32), (1, 0), (0, 1), (3, 5), (-2, 7), (-4, -1)] {
+            assert_eq!(
+                apply_chroma_dc_transform_row(row0, a, b),
+                8 * (a + b),
+                "row 0 mismatch for ({a}, {b})"
+            );
+        }
+    }
+
+    #[test]
+    fn chroma_dc_transform_row_one_is_difference_times_eight() {
+        // Row 1 of the matrix is `[8, -8]`; the dot product against any
+        // 2-point column `[a, b]` is `8 * (a - b)`.
+        let row1 = CHROMA_DC_TRANSFORM_MATRIX[1];
+        for &(a, b) in &[(0i32, 0i32), (1, 0), (0, 1), (3, 5), (-2, 7), (-4, -1)] {
+            assert_eq!(
+                apply_chroma_dc_transform_row(row1, a, b),
+                8 * (a - b),
+                "row 1 mismatch for ({a}, {b})"
+            );
+        }
+    }
+
+    #[test]
+    fn chroma_dc_transform_row_zero_at_known_pair() {
+        // Worked example: row 0 dot (3, 1) = 8 * 3 + 8 * 1 = 32.
+        assert_eq!(
+            apply_chroma_dc_transform_row(CHROMA_DC_TRANSFORM_MATRIX[0], 3, 1),
+            32
+        );
+    }
+
+    #[test]
+    fn chroma_dc_transform_row_one_at_known_pair() {
+        // Worked example: row 1 dot (3, 1) = 8 * 3 + (-8) * 1 = 16.
+        assert_eq!(
+            apply_chroma_dc_transform_row(CHROMA_DC_TRANSFORM_MATRIX[1], 3, 1),
+            16
+        );
+    }
+
+    #[test]
+    fn chroma_dc_2x2_columns_all_zero_block_yields_all_zero_output() {
+        // Identity for the additive zero input.
+        assert_eq!(apply_chroma_dc_2x2_columns([0, 0, 0, 0]), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn chroma_dc_2x2_columns_top_row_one_zero_block() {
+        // Input:
+        //   1 0
+        //   0 0
+        // out[0,0] = 8 * (1 + 0) = 8.   out[0,1] = 8 * (0 + 0) = 0.
+        // out[1,0] = 8 * (1 - 0) = 8.   out[1,1] = 8 * (0 - 0) = 0.
+        assert_eq!(apply_chroma_dc_2x2_columns([1, 0, 0, 0]), [8, 0, 8, 0]);
+    }
+
+    #[test]
+    fn chroma_dc_2x2_columns_bottom_row_one_zero_block() {
+        // Input:
+        //   0 0
+        //   1 0
+        // out[0,0] = 8 * (0 + 1) = 8.   out[0,1] = 8 * (0 + 0) = 0.
+        // out[1,0] = 8 * (0 - 1) = -8.  out[1,1] = 8 * (0 - 0) = 0.
+        assert_eq!(apply_chroma_dc_2x2_columns([0, 0, 1, 0]), [8, 0, -8, 0]);
+    }
+
+    #[test]
+    fn chroma_dc_2x2_columns_diagonal_one_zero_block() {
+        // Input:
+        //   1 0
+        //   0 1
+        // out[0,0] = 8 * (1 + 0) = 8.   out[0,1] = 8 * (0 + 1) = 8.
+        // out[1,0] = 8 * (1 - 0) = 8.   out[1,1] = 8 * (0 - 1) = -8.
+        assert_eq!(apply_chroma_dc_2x2_columns([1, 0, 0, 1]), [8, 8, 8, -8]);
+    }
+
+    #[test]
+    fn chroma_dc_2x2_columns_anti_diagonal_one_zero_block() {
+        // Input:
+        //   0 1
+        //   1 0
+        // out[0,0] = 8 * (0 + 1) = 8.   out[0,1] = 8 * (1 + 0) = 8.
+        // out[1,0] = 8 * (0 - 1) = -8.  out[1,1] = 8 * (1 - 0) = 8.
+        assert_eq!(apply_chroma_dc_2x2_columns([0, 1, 1, 0]), [8, 8, -8, 8]);
+    }
+
+    #[test]
+    fn chroma_dc_2x2_columns_all_ones_block_doubles_dc_and_cancels_diff() {
+        // Input:
+        //   1 1
+        //   1 1
+        // out[0,0] = 8 * (1 + 1) = 16.  out[0,1] = 8 * (1 + 1) = 16.
+        // out[1,0] = 8 * (1 - 1) = 0.   out[1,1] = 8 * (1 - 1) = 0.
+        assert_eq!(apply_chroma_dc_2x2_columns([1, 1, 1, 1]), [16, 16, 0, 0]);
+    }
+
+    #[test]
+    fn chroma_dc_2x2_columns_is_linear_in_input() {
+        // Doubling every input position doubles every output position.
+        let block = [3, -2, 5, 1];
+        let doubled = [6, -4, 10, 2];
+        let out = apply_chroma_dc_2x2_columns(block);
+        let out_doubled = apply_chroma_dc_2x2_columns(doubled);
+        for (o, od) in out.iter().zip(out_doubled.iter()) {
+            assert_eq!(2 * o, *od);
+        }
+    }
+
+    #[test]
+    fn chroma_dc_2x2_columns_negation_negates_output() {
+        // f(-X) = -f(X) — the transform is linear.
+        let block = [3, -2, 5, 1];
+        let negated = [-3, 2, -5, -1];
+        let out = apply_chroma_dc_2x2_columns(block);
+        let out_negated = apply_chroma_dc_2x2_columns(negated);
+        for (o, on) in out.iter().zip(out_negated.iter()) {
+            assert_eq!(-*o, *on);
+        }
+    }
+
+    #[test]
+    fn chroma_dc_2x2_columns_top_row_only_carries_to_both_output_rows() {
+        // Only top-row input → both output rows are non-zero with the
+        // same magnitudes (sum and difference of the top-row pair both
+        // collapse to the top-row pair when bottom is zero).
+        let block = [2, 5, 0, 0];
+        // out[0,0] = 8 * (2 + 0) = 16. out[0,1] = 8 * (5 + 0) = 40.
+        // out[1,0] = 8 * (2 - 0) = 16. out[1,1] = 8 * (5 - 0) = 40.
+        assert_eq!(apply_chroma_dc_2x2_columns(block), [16, 40, 16, 40]);
+    }
+
+    #[test]
+    fn chroma_dc_2x2_columns_bottom_row_only_signs_second_output_row() {
+        // Only bottom-row input → first output row carries the bottom
+        // values verbatim (sum) and second output row carries their
+        // negations (difference 0 - x = -x).
+        let block = [0, 0, 3, -1];
+        // out[0,0] = 8 * (0 + 3) = 24.  out[0,1] = 8 * (0 - 1) = -8.
+        // out[1,0] = 8 * (0 - 3) = -24. out[1,1] = 8 * (0 - -1) = 8.
+        assert_eq!(apply_chroma_dc_2x2_columns(block), [24, -8, -24, 8]);
+    }
+
+    #[test]
+    fn chroma_dc_2x2_columns_output_row_zero_is_column_wise_sum_times_eight() {
+        // Output row 0 column c = 8 * (block top-row c + block bottom-row c).
+        let block = [7, -3, 2, 4];
+        let out = apply_chroma_dc_2x2_columns(block);
+        assert_eq!(out[0], 8 * (block[0] + block[2]));
+        assert_eq!(out[1], 8 * (block[1] + block[3]));
+    }
+
+    #[test]
+    fn chroma_dc_2x2_columns_output_row_one_is_column_wise_difference_times_eight() {
+        // Output row 1 column c = 8 * (block top-row c - block bottom-row c).
+        let block = [7, -3, 2, 4];
+        let out = apply_chroma_dc_2x2_columns(block);
+        assert_eq!(out[2], 8 * (block[0] - block[2]));
+        assert_eq!(out[3], 8 * (block[1] - block[3]));
+    }
+
+    #[test]
+    fn chroma_dc_2x2_columns_const_evaluable_in_static_context() {
+        // The `const fn` annotation lets the helper be used at const
+        // evaluation time.
+        const OUT: [i32; 4] = apply_chroma_dc_2x2_columns([1, 2, 3, 4]);
+        // out[0,0] = 8*(1+3)=32. out[0,1] = 8*(2+4)=48.
+        // out[1,0] = 8*(1-3)=-16. out[1,1] = 8*(2-4)=-16.
+        assert_eq!(OUT, [32, 48, -16, -16]);
+    }
+
+    #[test]
+    fn chroma_dc_2x2_columns_chains_with_place_chroma_dc_2x2() {
+        // Cross-module sanity: feed a placement output through the
+        // transform to confirm the row-major flat layout is compatible.
+        // A single coefficient at scan position 0 with value 1 places at
+        // flat index 0 of the 4-entry block — the (0, 0) position. The
+        // transformed output's column 0 sums (top + bottom) and
+        // differences (top - bottom) collapse to (1, 1) and (1, -1)
+        // times 8 = (8, 8). Column 1 is all zeros.
+        use crate::svq3_coeff::Coefficient;
+        use crate::svq3_scan::place_chroma_dc_2x2;
+        let block = place_chroma_dc_2x2(&[Coefficient { run: 0, value: 1 }]).unwrap();
+        assert_eq!(block, [1, 0, 0, 0]);
+        let transformed = apply_chroma_dc_2x2_columns(block);
+        assert_eq!(transformed, [8, 0, 8, 0]);
     }
 }

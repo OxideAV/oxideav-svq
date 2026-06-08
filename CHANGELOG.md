@@ -8,6 +8,59 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 262 — SVQ3 2×2 chroma DC transform application helper.** The
+  per-block application of the 2×2 chroma DC transform matrix the wiki
+  spec pins in `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock
+  transform and dequantization" as `[[8, 8], [8, -8]]` (also exposed
+  verbatim as [`svq3_dequant::CHROMA_DC_TRANSFORM_MATRIX`]) lands as two
+  new `const fn` helpers in the existing `svq3_dequant` module. The wiki
+  spec states "chroma DCs need to be transformed first using the
+  following matrix" before the [`svq3_dequant::dequantize_chroma_dc`]
+  expression is applied; round 262 implements the matrix application
+  step as the single-sided `M · X` pass (the unambiguous form `M` alone
+  produces against a column vector). Round 262 is structural arithmetic
+  only — no new bitstream reads — and `Svq3DecoderHandle::receive_frame`
+  continues to return `oxideav_core::Error::Unsupported`.
+  - New `svq3_dequant` module surface:
+    - `apply_chroma_dc_transform_row(matrix_row: [i32; 2], a: i32, b:
+      i32) -> i32` `const fn` — one matrix-row dot product against a
+      2-point column. For the first matrix row `[8, 8]` the result is
+      `8 * (a + b)`; for the second matrix row `[8, -8]` the result is
+      `8 * (a - b)`. Caller passes `CHROMA_DC_TRANSFORM_MATRIX[0]` /
+      `CHROMA_DC_TRANSFORM_MATRIX[1]` for the spec's two rows.
+    - `apply_chroma_dc_2x2_columns(block: [i32; 4]) -> [i32; 4]`
+      `const fn` — applies `CHROMA_DC_TRANSFORM_MATRIX` against the
+      columns of a row-major 2×2 input block (the `M · X` single-sided
+      pass). The input layout matches
+      [`svq3_scan::place_chroma_dc_2x2`]'s row-major output (`block[0]`
+      = `(0,0)`, `block[1]` = `(0,1)`, `block[2]` = `(1,0)`, `block[3]`
+      = `(1,1)`); the return value is laid out the same way. The
+      per-position output is:
+      `out[0,0] = 8 * (block[0,0] + block[1,0])`,
+      `out[0,1] = 8 * (block[0,1] + block[1,1])`,
+      `out[1,0] = 8 * (block[0,0] - block[1,0])`,
+      `out[1,1] = 8 * (block[0,1] - block[1,1])`. Suitable for direct
+      consumption by the per-sample dequant step that follows.
+  - 18 new lib tests cover: row-0 sum-of-pair semantics swept across
+    six representative `(a, b)` pairs; row-1 difference-of-pair
+    semantics over the same sweep; explicit worked `row · (3, 1)`
+    examples (`32` for row 0; `16` for row 1); the all-zero-block
+    identity; four single-position-active-bit inputs (top-row,
+    bottom-row, diagonal, anti-diagonal); the all-ones block's
+    sum-cancelling-difference behaviour; linearity under doubling and
+    under negation; the top-row-only / bottom-row-only branch
+    asymmetries; per-row column-wise sum / difference identities; the
+    `const fn` annotation usable at compile time (a `const OUT: [i32;
+    4]` site); and a cross-module sanity case feeding a
+    [`svq3_scan::place_chroma_dc_2x2`] output through
+    `apply_chroma_dc_2x2_columns`.
+  - 2 doctest examples (one per helper) on the public surface.
+  - Total tests: 377 lib + 7 integration + 2 doc = 386 (up from 359 + 7
+    = 366).
+  - The full two-sided `M · X · M^T` transform — which the wiki spec
+    does NOT spell out explicitly — is deliberately NOT folded in here.
+    That derivation belongs in a future round once docs pin it.
+
 - **Round 245 — SVQ3 alt-scan two-half block walker.** The typed
   two-half walker for SVQ3's alternative-scan coefficient block lands as
   a new `svq3_coeff::AltScanBlock` carrier plus a

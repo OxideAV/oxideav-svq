@@ -1,5 +1,29 @@
 //! Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec.
 //!
+//! **Round 262 — SVQ3 2×2 chroma DC transform application helper.**
+//!
+//! Round 262 lands the per-block application of the 2×2 chroma DC
+//! transform matrix the wiki spec pins in
+//! `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock transform
+//! and dequantization" as `[[8, 8], [8, -8]]` (also exposed verbatim as
+//! [`svq3_dequant::CHROMA_DC_TRANSFORM_MATRIX`]). Two new `const fn`
+//! helpers surface the transform's two natural application forms:
+//! [`svq3_dequant::apply_chroma_dc_transform_row`] carries out one
+//! matrix-row dot product against a 2-point column (row 0 produces
+//! `8 * (a + b)`, row 1 produces `8 * (a - b)`), and
+//! [`svq3_dequant::apply_chroma_dc_2x2_columns`] applies the full
+//! matrix against the columns of a row-major 2×2 input block (the
+//! `M · X` single-sided pass). The input layout matches
+//! [`svq3_scan::place_chroma_dc_2x2`]'s row-major output so the
+//! transformed result feeds directly into the subsequent
+//! [`svq3_dequant::dequantize_chroma_dc`] per-sample dequant step. The
+//! full two-sided `M · X · M^T` transform that the wiki spec does NOT
+//! spell out explicitly is deliberately NOT folded in here — that
+//! derivation belongs in a future round once docs pin it. Total tests:
+//! 377 lib + 7 integration + 2 doc = 386 (up from 359 + 7 = 366).
+//!
+//! ## Earlier rounds (carried forward)
+//!
 //! **Round 245 — SVQ3 alt-scan two-half block walker.**
 //!
 //! Round 245 lands the typed two-half walker for SVQ3's alternative-scan
