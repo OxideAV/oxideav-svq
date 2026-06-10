@@ -8,6 +8,47 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 272 — SVQ3 4×4 luma transform application helpers.** The 4×4
+  luma transform matrix the wiki spec
+  (`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock transform
+  and dequantization") pins under "Transform coefficients" as
+  `[[13,17,1,7],[13,7,-1,-17],[13,-7,-1,17],[13,-17,1,-7]]` (already
+  exposed verbatim as [`svq3_dequant::LUMA_TRANSFORM_MATRIX`]) now has a
+  per-block application surface mirroring round 262's chroma DC helpers.
+  Round 272 is structural arithmetic only — no new bitstream reads — and
+  `Svq3DecoderHandle::receive_frame` continues to return
+  `oxideav_core::Error::Unsupported`.
+  - New `svq3_dequant` module surface:
+    - `apply_luma_transform_row(matrix_row: [i32; 4], a: i32, b: i32, c:
+      i32, d: i32) -> i32` `const fn` — one matrix-row dot product
+      against a 4-point column `[a, b, c, d]`:
+      `matrix_row[0]*a + matrix_row[1]*b + matrix_row[2]*c +
+      matrix_row[3]*d`. Because every row shares the column-0 value
+      [`svq3_dequant::LUMA_TRANSFORM_DC_COLUMN`] = `13`, a pure-DC column
+      `[a, 0, 0, 0]` yields `13 * a` for every row.
+    - `apply_luma_transform_columns(block: [i32; 16]) -> [i32; 16]`
+      `const fn` — applies `LUMA_TRANSFORM_MATRIX` against the columns of
+      a row-major 4×4 input block (the `M · X` single-sided pass).
+      Input/output are row-major (`block[r*4 + c]` = sample at `(r, c)`);
+      `out[r*4 + c] = M[r, :] · X[:, c]`. The unrounded i32 outputs feed
+      directly into [`svq3_dequant::dequantize_coefficient`].
+  - 9 new lib tests cover: all-ones-column weight summing; pure-DC
+    column reducing to `13 * a` swept over six `a` values across all
+    four rows; explicit per-row worked dot products against `[1,2,3,4]`
+    (`78`, `-44`, `64`, `-46`); row linearity under doubling/negation;
+    the all-zero block identity; pure-DC column repeating `13*a` down
+    every output row; a single-active-column block matching the per-row
+    dot; full-block linearity under doubling and negation; the
+    decomposition agreeing with the row helper position-by-position over
+    an arbitrary block; and the `const fn` annotation usable in a `const`
+    site.
+  - 2 doctest examples (one per helper) on the public surface.
+  - Total tests: 387 lib + 7 integration + 4 doc = 398 (up from 377 + 7
+    + 2 = 386).
+  - The full two-sided `M · X · M^T` luma transform — which the wiki
+    spec does NOT spell out explicitly — is deliberately NOT folded in
+    here; that derivation belongs in a future round once docs pin it.
+
 - **Round 262 — SVQ3 2×2 chroma DC transform application helper.** The
   per-block application of the 2×2 chroma DC transform matrix the wiki
   spec pins in `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock

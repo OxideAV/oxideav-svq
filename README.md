@@ -5,6 +5,25 @@ Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 
 ## Status
 
+**Round 272 — SVQ3 4×4 luma transform application helpers.** Round 272
+lands the per-block application of the 4×4 luma transform matrix the wiki
+spec pins in `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock
+transform and dequantization" under "Transform coefficients" (already
+exposed verbatim as [`svq3_dequant::LUMA_TRANSFORM_MATRIX`]), mirroring
+round 262's chroma DC helpers. Two new `const fn` helpers:
+`svq3_dequant::apply_luma_transform_row(matrix_row, a, b, c, d) -> i32`
+carries out one matrix-row dot product against a 4-point column (every
+row shares column-0 `13`, so a pure-DC column `[a,0,0,0]` yields
+`13 * a`), and `svq3_dequant::apply_luma_transform_columns(block: [i32;
+16]) -> [i32; 16]` applies the matrix against the columns of a row-major
+4×4 input block (the `M · X` single-sided pass; `out[r*4+c] = M[r,:] ·
+X[:,c]`). The unrounded outputs feed directly into
+`svq3_dequant::dequantize_coefficient`. The full two-sided `M · X · M^T`
+luma transform the wiki spec does NOT spell out is deliberately NOT
+folded in here — that derivation belongs in a future round once docs pin
+it. Total tests: 387 lib + 7 integration + 4 doc = 398 (up from 377 + 7
++ 2 = 386).
+
 **Round 262 — SVQ3 2×2 chroma DC transform application helper.** Round
 262 lands the per-block application of the 2×2 chroma DC transform
 matrix the wiki spec pins in `docs/video/svq3/wiki/Sorenson_Video_3.wiki`

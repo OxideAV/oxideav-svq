@@ -388,6 +388,122 @@ pub const fn apply_chroma_dc_2x2_columns(block: [i32; 4]) -> [i32; 4] {
     [out_00, out_01, out_10, out_11]
 }
 
+/// Apply one 1-D row of the 4×4 luma transform matrix to a 4-point
+/// column of samples.
+///
+/// The wiki spec's §"Macroblock transform and dequantization" pins the
+/// 4×4 luma transform matrix as
+///
+/// ```text
+///   13  17   1   7
+///   13   7  -1 -17
+///   13  -7  -1  17
+///   13 -17   1  -7
+/// ```
+///
+/// (also exposed verbatim as [`LUMA_TRANSFORM_MATRIX`]). The spec lists
+/// these coefficients under "Transform coefficients" preceding the
+/// dequantization expressions.
+///
+/// This helper carries out **one row's** dot product against a 4-point
+/// column `[a, b, c, d]`, using `matrix_row` as the row of weights:
+/// `matrix_row[0] * a + matrix_row[1] * b + matrix_row[2] * c +
+/// matrix_row[3] * d`. The four matrix rows are accessible as
+/// `LUMA_TRANSFORM_MATRIX[0]` through `LUMA_TRANSFORM_MATRIX[3]`. Because
+/// every row shares the column-0 value [`LUMA_TRANSFORM_DC_COLUMN`] = `13`,
+/// the `a` term always contributes `13 * a`.
+///
+/// Returns the unrounded i32 dot product; subsequent dequantisation /
+/// finalisation is the caller's responsibility (see
+/// [`dequantize_coefficient`] / [`finalise_dc`]).
+///
+/// # Examples
+///
+/// Apply the first matrix row to a column of samples:
+///
+/// ```
+/// use oxideav_svq::svq3_dequant::{
+///     apply_luma_transform_row, LUMA_TRANSFORM_MATRIX,
+/// };
+/// // Row 0 = [13, 17, 1, 7] applied to [1, 1, 1, 1] sums the weights.
+/// assert_eq!(
+///     apply_luma_transform_row(LUMA_TRANSFORM_MATRIX[0], 1, 1, 1, 1),
+///     13 + 17 + 1 + 7,
+/// );
+/// // A pure-DC column [a, 0, 0, 0] yields 13 * a for every row.
+/// assert_eq!(
+///     apply_luma_transform_row(LUMA_TRANSFORM_MATRIX[3], 5, 0, 0, 0),
+///     13 * 5,
+/// );
+/// ```
+#[inline]
+#[must_use]
+pub const fn apply_luma_transform_row(matrix_row: [i32; 4], a: i32, b: i32, c: i32, d: i32) -> i32 {
+    matrix_row[0] * a + matrix_row[1] * b + matrix_row[2] * c + matrix_row[3] * d
+}
+
+/// Apply the 4×4 luma transform matrix to a row-major 4×4 input block by
+/// multiplying the matrix into the block's columns (`M · X`).
+///
+/// The wiki spec's §"Macroblock transform and dequantization" pins the
+/// transform matrix [`LUMA_TRANSFORM_MATRIX`] but does not enumerate the
+/// full `M · X · M^T` two-sided transform expression; only `M` itself is
+/// quoted under "Transform coefficients". This helper applies `M` against
+/// the input's columns and returns the result in row-major order — the
+/// single-sided transform pass that is unambiguously what `M` alone
+/// produces against a column vector. It mirrors
+/// [`apply_chroma_dc_2x2_columns`] for the 4×4 luma case.
+///
+/// The input `block` is laid out row-major: `block[r * 4 + c]` is the
+/// sample at row `r`, column `c` (`r, c ∈ 0..4`). The returned `[i32; 16]`
+/// is laid out the same way: `out[r * 4 + c] = M[r, :] · X[:, c]`.
+///
+/// The unrounded i32 outputs feed into [`dequantize_coefficient`] for the
+/// per-sample dequant step; this helper does NOT apply any shift, bias, or
+/// quantiser scaling.
+///
+/// The full two-sided `M · X · M^T` transform (which the wiki spec does
+/// NOT spell out explicitly) is deliberately NOT folded in here — that
+/// derivation belongs in a future round once the docs pin it.
+///
+/// # Examples
+///
+/// A pure-DC column input (column 0 active, others zero) reproduces the
+/// shared column-0 weight `13` for every output row:
+///
+/// ```
+/// use oxideav_svq::svq3_dequant::apply_luma_transform_columns;
+/// // Column 0 holds [2, 0, 0, 0]^T (block[0] = 2, rest of column 0 = 0).
+/// let mut block = [0i32; 16];
+/// block[0] = 2; // (row 0, col 0)
+/// let out = apply_luma_transform_columns(block);
+/// // out[r][0] = 13 * 2 for every row r.
+/// assert_eq!(out[0], 26);
+/// assert_eq!(out[4], 26);
+/// assert_eq!(out[8], 26);
+/// assert_eq!(out[12], 26);
+/// ```
+#[inline]
+#[must_use]
+pub const fn apply_luma_transform_columns(block: [i32; 16]) -> [i32; 16] {
+    // block layout: row-major 4×4 (block[r * 4 + c] = sample at (r, c)).
+    let mut out = [0i32; 16];
+    // out[r * 4 + c] = M[r, :] · X[:, c]
+    //              = sum over k of M[r][k] * block[k * 4 + c]
+    let mut r = 0;
+    while r < 4 {
+        let row = LUMA_TRANSFORM_MATRIX[r];
+        let mut c = 0;
+        while c < 4 {
+            out[r * 4 + c] =
+                apply_luma_transform_row(row, block[c], block[4 + c], block[8 + c], block[12 + c]);
+            c += 1;
+        }
+        r += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -946,5 +1062,163 @@ mod tests {
         assert_eq!(block, [1, 0, 0, 0]);
         let transformed = apply_chroma_dc_2x2_columns(block);
         assert_eq!(transformed, [8, 0, 8, 0]);
+    }
+
+    // ---- 4×4 luma transform application ----
+
+    #[test]
+    fn luma_transform_row_sums_weights_for_all_ones_column() {
+        // Each row applied to [1, 1, 1, 1] returns the sum of its weights.
+        for row in LUMA_TRANSFORM_MATRIX.iter() {
+            let expected = row[0] + row[1] + row[2] + row[3];
+            assert_eq!(apply_luma_transform_row(*row, 1, 1, 1, 1), expected);
+        }
+    }
+
+    #[test]
+    fn luma_transform_row_pure_dc_column_yields_thirteen_times_a() {
+        // A column [a, 0, 0, 0] reduces every row to its shared col-0 weight
+        // (13) times a.
+        for row in LUMA_TRANSFORM_MATRIX.iter() {
+            for a in [-3, -1, 0, 1, 4, 17] {
+                assert_eq!(
+                    apply_luma_transform_row(*row, a, 0, 0, 0),
+                    LUMA_TRANSFORM_DC_COLUMN * a,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn luma_transform_row_explicit_dot_products() {
+        // Worked examples against the column [1, 2, 3, 4].
+        // Row 0 [13,17,1,7]:  13 + 34 + 3 + 28 = 78.
+        assert_eq!(
+            apply_luma_transform_row(LUMA_TRANSFORM_MATRIX[0], 1, 2, 3, 4),
+            78,
+        );
+        // Row 1 [13,7,-1,-17]: 13 + 14 - 3 - 68 = -44.
+        assert_eq!(
+            apply_luma_transform_row(LUMA_TRANSFORM_MATRIX[1], 1, 2, 3, 4),
+            -44,
+        );
+        // Row 2 [13,-7,-1,17]: 13 - 14 - 3 + 68 = 64.
+        assert_eq!(
+            apply_luma_transform_row(LUMA_TRANSFORM_MATRIX[2], 1, 2, 3, 4),
+            64,
+        );
+        // Row 3 [13,-17,1,-7]: 13 - 34 + 3 - 28 = -46.
+        assert_eq!(
+            apply_luma_transform_row(LUMA_TRANSFORM_MATRIX[3], 1, 2, 3, 4),
+            -46,
+        );
+    }
+
+    #[test]
+    fn luma_transform_row_is_linear_in_input() {
+        let row = LUMA_TRANSFORM_MATRIX[1];
+        let base = apply_luma_transform_row(row, 2, -3, 5, 7);
+        // Doubling every input doubles the output.
+        assert_eq!(apply_luma_transform_row(row, 4, -6, 10, 14), 2 * base);
+        // Negating every input negates the output.
+        assert_eq!(apply_luma_transform_row(row, -2, 3, -5, -7), -base);
+    }
+
+    #[test]
+    fn luma_transform_columns_all_zero_block_yields_all_zero_output() {
+        assert_eq!(apply_luma_transform_columns([0; 16]), [0; 16]);
+    }
+
+    #[test]
+    fn luma_transform_columns_pure_dc_column_repeats_thirteen_a_down_rows() {
+        // block[0] = a at (row 0, col 0); rest of column 0 zero. Each output
+        // row's column 0 is 13 * a; every other output column is zero.
+        let mut block = [0i32; 16];
+        block[0] = 3;
+        let out = apply_luma_transform_columns(block);
+        for r in 0..4 {
+            assert_eq!(out[r * 4], LUMA_TRANSFORM_DC_COLUMN * 3);
+            assert_eq!(out[r * 4 + 1], 0);
+            assert_eq!(out[r * 4 + 2], 0);
+            assert_eq!(out[r * 4 + 3], 0);
+        }
+    }
+
+    #[test]
+    fn luma_transform_columns_single_column_active_matches_per_row_dot() {
+        // Put a full column [1, 2, 3, 4]^T into column 2; every other column
+        // stays zero. Output column 2 must equal each row's dot against that
+        // column; all other output columns are zero.
+        let mut block = [0i32; 16];
+        block[2] = 1; // (0, 2)
+        block[6] = 2; // (1, 2)
+        block[10] = 3; // (2, 2)
+        block[14] = 4; // (3, 2)
+        let out = apply_luma_transform_columns(block);
+        for r in 0..4 {
+            let expected = apply_luma_transform_row(LUMA_TRANSFORM_MATRIX[r], 1, 2, 3, 4);
+            assert_eq!(out[r * 4 + 2], expected);
+            assert_eq!(out[r * 4], 0);
+            assert_eq!(out[r * 4 + 1], 0);
+            assert_eq!(out[r * 4 + 3], 0);
+        }
+    }
+
+    #[test]
+    fn luma_transform_columns_is_linear_in_input() {
+        let mut block = [0i32; 16];
+        for (i, slot) in block.iter_mut().enumerate() {
+            *slot = (i as i32) - 8;
+        }
+        let base = apply_luma_transform_columns(block);
+        let doubled: [i32; 16] = core::array::from_fn(|i| block[i] * 2);
+        let out_doubled = apply_luma_transform_columns(doubled);
+        for i in 0..16 {
+            assert_eq!(out_doubled[i], 2 * base[i]);
+        }
+        let negated: [i32; 16] = core::array::from_fn(|i| -block[i]);
+        let out_negated = apply_luma_transform_columns(negated);
+        for i in 0..16 {
+            assert_eq!(out_negated[i], -base[i]);
+        }
+    }
+
+    #[test]
+    fn luma_transform_columns_decomposes_into_per_row_per_column_dots() {
+        // The full helper must agree with the row helper applied
+        // position-by-position over an arbitrary block.
+        let mut block = [0i32; 16];
+        for (i, slot) in block.iter_mut().enumerate() {
+            *slot = ((i * 7 + 3) % 13) as i32 - 6;
+        }
+        let out = apply_luma_transform_columns(block);
+        for r in 0..4 {
+            for c in 0..4 {
+                let expected = apply_luma_transform_row(
+                    LUMA_TRANSFORM_MATRIX[r],
+                    block[c],
+                    block[4 + c],
+                    block[8 + c],
+                    block[12 + c],
+                );
+                assert_eq!(out[r * 4 + c], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn luma_transform_columns_const_evaluable_in_static_context() {
+        const IN: [i32; 16] = {
+            let mut b = [0i32; 16];
+            b[0] = 1;
+            b
+        };
+        const OUT: [i32; 16] = apply_luma_transform_columns(IN);
+        // Pure-DC column 0 → 13 down output column 0, zeros elsewhere.
+        assert_eq!(OUT[0], 13);
+        assert_eq!(OUT[4], 13);
+        assert_eq!(OUT[8], 13);
+        assert_eq!(OUT[12], 13);
+        assert_eq!(OUT[1], 0);
     }
 }
