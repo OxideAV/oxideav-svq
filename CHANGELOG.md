@@ -8,6 +8,68 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 282 — SVQ3 4×4 diagonal-down intra predictor.** The one
+  intra predictor the wiki spec pins completely in
+  `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Intra prediction" —
+  the 4×4 diagonal-down quirk, whose fill picture
+  (`a b c c / b c c c / c c c c / c c c c`) and three closed-form
+  samples (`a = (left[1] + top[1]) / 2`, `b = (left[2] + top[2]) /
+  2`, `c = (left[3] + top[3]) / 2`) are spelled out verbatim in the
+  local mirror — lands as a new `svq3_pred` module. Round 282 is
+  pixel arithmetic only — no new bitstream reads — and
+  `Svq3DecoderHandle::receive_frame` continues to return
+  `oxideav_core::Error::Unsupported`.
+  - New `svq3_pred` module surface:
+    - `diagonal_down_sample(left_k: u8, top_k: u8) -> u8` `const fn`
+      — one predicted sample, the spec's `(left[k] + top[k]) / 2`
+      closed form. The spec writes a plain integer `/ 2` with no
+      rounding bias; both operands are non-negative samples so the
+      division is an exact floor, and the result always fits in `u8`
+      (`(255 + 255) / 2 = 255`).
+    - `predict_diagonal_down_4x4(left: [u8; 4], top: [u8; 4]) ->
+      [u8; 16]` `const fn` — the full 4×4 predictor: derives `a` /
+      `b` / `c` from neighbour indices `1` / `2` / `3` and expands
+      them through the fill picture. Output is row-major
+      (`out[row * 4 + col]`), matching the `svq3_scan` /
+      `svq3_dequant` block layout so the eventual predicted+residual
+      writeback can combine the two element-wise.
+    - `DIAGONAL_DOWN_PATTERN: [u8; 16]` — the spec's fill picture
+      flattened row-major; each entry selects one of the derived
+      samples (`0` ⇒ `a`, `1` ⇒ `b`, `2` ⇒ `c`).
+    - `DIAGONAL_DOWN_NEIGHBOUR_INDICES: [usize; 3] = [1, 2, 3]` —
+      the neighbour-array indices the three closed forms consume.
+      Element `0` of either neighbour array is never referenced by
+      this predictor.
+    - `PRED_4X4_DIM = 4` / `PRED_4X4_SAMPLES = 16` block-geometry
+      constants.
+  - 15 new lib tests cover: the fill-picture transcription and its
+    `a×1 / b×2 / c×13` population; the neighbour-index constants;
+    the geometry constants; per-sample zero / max / saturation-free
+    bounds; floor division on odd sums; left/top symmetry of the
+    per-sample average (swept) and of the full block predictor;
+    uniform-neighbour identity swept over six values; agreement of
+    the block output with the three closed forms position-by-
+    position; the explicit picture-row layout against worked `a` /
+    `b` / `c` values; element-0 insensitivity under noise injection;
+    pattern-indexing consistency; a fully worked numeric example;
+    and `const`-site usability of both helpers.
+  - 2 doctest examples (one per helper) on the public surface.
+  - Total tests: 402 lib + 7 integration + 6 doc = 415 (up from 387
+    + 7 + 4 = 398).
+  - Round 282 targeted the full intra per-block reconstruction
+    composition (coefficients → dequant → inverse transform →
+    predicted+residual writeback), but every remaining stage of that
+    chain is doc-gapped: the 4×4 scan-order arrays (round 233's
+    ambiguity note), the two-sided `M · X · M^T` transform (rounds
+    262/272 deferrals), the numeric mode-to-predictor binding (the
+    wiki names "diagonal down" without binding it to a `0..=4` mode
+    value), the remaining H.264-back-referenced predictors (16×16
+    plane "transposed", chroma "always DC"), and the writeback clamp
+    all await pinning in `docs/video/svq3/`. The diagonal-down
+    predictor is the one intra-path stage the docs fully pin that
+    was still missing; it supplies the "predicted" operand of the
+    eventual writeback.
+
 - **Round 272 — SVQ3 4×4 luma transform application helpers.** The 4×4
   luma transform matrix the wiki spec
   (`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock transform

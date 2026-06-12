@@ -1,5 +1,27 @@
 //! Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec.
 //!
+//! **Round 282 — SVQ3 4×4 diagonal-down intra predictor.**
+//!
+//! Round 282 lands the one intra predictor the wiki spec pins
+//! completely in `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Intra
+//! prediction" as a new [`svq3_pred`] module: the 4×4 diagonal-down
+//! quirk, whose fill picture (`a b c c / b c c c / c c c c / c c c c`)
+//! and three closed-form samples (`a = (left[1] + top[1]) / 2`,
+//! `b = (left[2] + top[2]) / 2`, `c = (left[3] + top[3]) / 2`) are
+//! spelled out verbatim in the local mirror. The per-pair average
+//! lands as [`svq3_pred::diagonal_down_sample`], the fill picture as
+//! [`svq3_pred::DIAGONAL_DOWN_PATTERN`], and the combined block
+//! predictor as [`svq3_pred::predict_diagonal_down_4x4`] (row-major
+//! `[u8; 16]` output matching the [`svq3_scan`] / [`svq3_dequant`]
+//! block layout, so the eventual predicted+residual writeback can
+//! combine the two element-wise). The numeric prediction-mode binding
+//! for this predictor, the remaining H.264-back-referenced predictors,
+//! and the writeback clamp are NOT pinned in `docs/video/svq3/` and
+//! stay deferred. Total tests: 402 lib + 7 integration + 6 doc = 415
+//! (up from 387 + 7 + 4 = 398).
+//!
+//! ## Earlier rounds (carried forward)
+//!
 //! **Round 262 — SVQ3 2×2 chroma DC transform application helper.**
 //!
 //! Round 262 lands the per-block application of the 2×2 chroma DC
@@ -420,6 +442,7 @@ pub mod svq3_coeff;
 pub mod svq3_dequant;
 pub mod svq3_mb;
 pub mod svq3_mc;
+pub mod svq3_pred;
 pub mod svq3_scan;
 
 #[cfg(feature = "registry")]

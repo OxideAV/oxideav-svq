@@ -5,6 +5,34 @@ Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 
 ## Status
 
+**Round 282 — SVQ3 4×4 diagonal-down intra predictor.** Round 282
+lands the one intra predictor the wiki spec pins completely in
+`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Intra prediction" as a
+new `svq3_pred` module: the 4×4 diagonal-down quirk, whose fill
+picture (`a b c c / b c c c / c c c c / c c c c`) and three
+closed-form samples (`a = (left[1] + top[1]) / 2`, `b = (left[2] +
+top[2]) / 2`, `c = (left[3] + top[3]) / 2`) are spelled out verbatim
+in the local mirror. The per-pair average lands as the `const fn`
+`svq3_pred::diagonal_down_sample(left_k, top_k) -> u8` (the spec's
+plain integer `/ 2` — no rounding bias; operands are non-negative so
+the division is a floor), the fill picture as
+`svq3_pred::DIAGONAL_DOWN_PATTERN: [u8; 16]` (each entry selecting
+one of the derived `a` / `b` / `c` samples), and the combined block
+predictor as `svq3_pred::predict_diagonal_down_4x4(left, top) -> [u8;
+16]` (row-major output matching the `svq3_scan` / `svq3_dequant`
+block layout, so the eventual predicted+residual writeback can
+combine the two element-wise). The spec formulas never reference
+element `0` of either neighbour array; the three consumed indices are
+surfaced as `svq3_pred::DIAGONAL_DOWN_NEIGHBOUR_INDICES = [1, 2, 3]`.
+Round 282 targeted the full intra per-block reconstruction
+composition, but every remaining stage is doc-gapped: the 4×4
+scan-order arrays (round 233's ambiguity note), the two-sided `M · X
+· M^T` transform (rounds 262/272 deferrals), the numeric
+mode-to-predictor binding, the other H.264-back-referenced
+predictors, and the writeback clamp all await pinning in
+`docs/video/svq3/`. Total tests: 402 lib + 7 integration + 6 doc =
+415 (up from 387 + 7 + 4 = 398).
+
 **Round 272 — SVQ3 4×4 luma transform application helpers.** Round 272
 lands the per-block application of the 4×4 luma transform matrix the wiki
 spec pins in `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock
@@ -817,7 +845,32 @@ The standalone `svq3_mc` module surface (always available):
   Svq3MvPrecision) -> bool` `const fn` — checks whether an
   already-rounded sixths-grid value is on the precision's base.
 
+The standalone `svq3_pred` module surface (always available):
+
+* `svq3_pred::diagonal_down_sample(left_k: u8, top_k: u8) -> u8`
+  `const fn` — one diagonal-down predicted sample, the wiki spec's
+  `(left[k] + top[k]) / 2` closed form.
+* `svq3_pred::predict_diagonal_down_4x4(left: [u8; 4], top: [u8; 4])
+  -> [u8; 16]` `const fn` — the full 4×4 diagonal-down predictor;
+  row-major output.
+* `svq3_pred::DIAGONAL_DOWN_PATTERN: [u8; 16]` — the spec's fill
+  picture flattened row-major (`0` ⇒ `a`, `1` ⇒ `b`, `2` ⇒ `c`).
+* `svq3_pred::DIAGONAL_DOWN_NEIGHBOUR_INDICES: [usize; 3] = [1, 2,
+  3]` — the neighbour-array indices the three closed forms consume.
+* `svq3_pred::PRED_4X4_DIM = 4` / `svq3_pred::PRED_4X4_SAMPLES = 16`
+  — block-geometry constants.
+
 ## Clean-room provenance
+
+Round 282 was implemented strictly from
+`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Intra prediction" —
+the quirk paragraph beginning "4x4 diagonal down prediction is
+performed as", comprising the 4×4 fill picture and the three
+closed-form sample equations, all transcribed verbatim. The section's
+back-references to H.264 for the remaining predictors were
+specifically NOT chased into any other document; those predictors
+stay unimplemented until `docs/video/svq3/` carries their sample
+equations. No other source was consulted.
 
 Round 230 was implemented strictly from
 `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock transform and
