@@ -61,12 +61,22 @@
 //!
 //! ## Open work
 //!
-//! Round 230 lands the four data tables and the three closed-form
-//! helpers; it does NOT wire them into a residual-decode pipeline yet.
-//! The dezigzag stage that places the per-block
+//! Round 230 landed the four data tables and the three closed-form
+//! dequant helpers; later rounds added the single-sided column-multiply
+//! passes ([`apply_luma_transform_columns`] / [`apply_chroma_dc_2x2_columns`],
+//! i.e. `M · X`) and now the matching single-sided row-multiply passes
+//! ([`apply_luma_transform_rows`] / [`apply_chroma_dc_2x2_rows`], i.e.
+//! `X · M^T`). The full two-sided `M · X · M^T` transform that composes a
+//! column pass with a row pass is still NOT folded in: the wiki spec quotes
+//! the matrix `M` but does NOT enumerate the two-sided composition (operand
+//! order, any intermediate rounding/normalisation), so that derivation stays
+//! deferred until `docs/video/svq3/` pins it.
+//!
+//! None of these helpers are wired into a residual-decode pipeline yet. The
+//! dezigzag stage that places the per-block
 //! [`crate::svq3_coeff::Coefficient`] stream into a 4×4 grid and the
-//! IDCT that consumes the dequantized output remain out of scope —
-//! `Svq3DecoderHandle::receive_frame` continues to return
+//! IDCT/normalisation that consumes the transformed output remain out of
+//! scope — `Svq3DecoderHandle::receive_frame` continues to return
 //! `oxideav_core::Error::Unsupported`.
 
 use core::ops::Range;
@@ -502,6 +512,133 @@ pub const fn apply_luma_transform_columns(block: [i32; 16]) -> [i32; 16] {
         r += 1;
     }
     out
+}
+
+/// Apply the 4×4 luma transform matrix to a row-major 4×4 input block by
+/// multiplying the matrix into the block's **rows** (`X · M^T`).
+///
+/// This is the right-side mirror of [`apply_luma_transform_columns`]: where
+/// that helper applies the pinned matrix [`LUMA_TRANSFORM_MATRIX`] against the
+/// block's columns (the `M · X` pass), this one applies the *same* matrix
+/// against the block's rows. Output position `(r, c)` is the dot product of
+/// the block's row `r` with the matrix's row `c`:
+///
+/// ```text
+///   out[r, c] = X[r, :] · M[c, :]
+///             = sum over k of block[r * 4 + k] * LUMA_TRANSFORM_MATRIX[c][k]
+/// ```
+///
+/// (which equals `(X · M^T)[r, c]`, since column `c` of `M^T` is row `c` of
+/// `M`). Each output element therefore reuses the per-row dot product
+/// [`apply_luma_transform_row`] with `matrix_row = LUMA_TRANSFORM_MATRIX[c]`
+/// and the four samples drawn from row `r` of the block.
+///
+/// Like [`apply_luma_transform_columns`], this is a **single** matrix pass —
+/// only `M` (pinned verbatim by the wiki spec) is involved. The full two-sided
+/// `M · X · M^T` transform — composing this row pass with the column pass — is
+/// NOT folded in here: the wiki spec's §"Macroblock transform and
+/// dequantization" quotes the matrix under "Transform coefficients" but does
+/// NOT enumerate the two-sided composition, so that derivation stays deferred
+/// until the docs pin it.
+///
+/// The input `block` is laid out row-major (`block[r * 4 + c]` = sample at row
+/// `r`, column `c`); the returned `[i32; 16]` is laid out the same way. The
+/// unrounded i32 outputs feed into [`dequantize_coefficient`] for the
+/// per-sample dequant step; this helper applies no shift, bias, or quantiser
+/// scaling.
+///
+/// # Examples
+///
+/// A pure-DC row input (row 0 active, others zero) reproduces the shared
+/// column-0 weight `13` in output column 0, and the row's own AC structure in
+/// the other output columns:
+///
+/// ```
+/// use oxideav_svq::svq3_dequant::apply_luma_transform_rows;
+/// // Row 0 holds [a, 0, 0, 0] (block[0] = a, rest of row 0 = 0).
+/// let mut block = [0i32; 16];
+/// block[0] = 2; // (row 0, col 0)
+/// let out = apply_luma_transform_rows(block);
+/// // out[0, c] = block[0] * M[c][0] = 2 * 13 = 26 for every output column c,
+/// // because column 0 of M is all 13.
+/// assert_eq!(out[0], 26); // (0, 0)
+/// assert_eq!(out[1], 26); // (0, 1)
+/// assert_eq!(out[2], 26); // (0, 2)
+/// assert_eq!(out[3], 26); // (0, 3)
+/// // Rows 1..3 of the block are zero, so their outputs are zero.
+/// assert_eq!(out[4], 0);
+/// ```
+#[inline]
+#[must_use]
+pub const fn apply_luma_transform_rows(block: [i32; 16]) -> [i32; 16] {
+    // block layout: row-major 4×4 (block[r * 4 + c] = sample at (r, c)).
+    let mut out = [0i32; 16];
+    // out[r * 4 + c] = X[r, :] · M[c, :]
+    //              = sum over k of block[r * 4 + k] * M[c][k]
+    let mut r = 0;
+    while r < 4 {
+        let a = block[r * 4];
+        let b = block[r * 4 + 1];
+        let c_sample = block[r * 4 + 2];
+        let d = block[r * 4 + 3];
+        let mut c = 0;
+        while c < 4 {
+            out[r * 4 + c] = apply_luma_transform_row(LUMA_TRANSFORM_MATRIX[c], a, b, c_sample, d);
+            c += 1;
+        }
+        r += 1;
+    }
+    out
+}
+
+/// Apply the 2×2 chroma DC transform matrix to a row-major 2×2 input block by
+/// multiplying the matrix into the block's **rows** (`X · M^T`).
+///
+/// This is the right-side mirror of [`apply_chroma_dc_2x2_columns`]: it applies
+/// the *same* pinned matrix [`CHROMA_DC_TRANSFORM_MATRIX`] = `[[8, 8], [8, -8]]`
+/// against the block's rows instead of its columns. Output position `(r, c)` is
+/// the dot product of block row `r` with matrix row `c`:
+///
+/// * `out[0, 0] = X[0, :] · M[0, :] = 8 * (block[0, 0] + block[0, 1])`
+/// * `out[0, 1] = X[0, :] · M[1, :] = 8 * (block[0, 0] - block[0, 1])`
+/// * `out[1, 0] = X[1, :] · M[0, :] = 8 * (block[1, 0] + block[1, 1])`
+/// * `out[1, 1] = X[1, :] · M[1, :] = 8 * (block[1, 0] - block[1, 1])`
+///
+/// (which equals `(X · M^T)[r, c]`, since column `c` of `M^T` is row `c` of
+/// `M`, and this matrix is symmetric). Like its column-side sibling this is a
+/// **single** matrix pass — only `M` (pinned by the wiki spec under "chroma DCs
+/// need to be transformed first using the following matrix") is involved. The
+/// full two-sided `M · X · M^T` composition stays deferred until the docs pin
+/// it.
+///
+/// The input `block` is laid out row-major (`block[0]` = `(0, 0)`, `block[1]` =
+/// `(0, 1)`, `block[2]` = `(1, 0)`, `block[3]` = `(1, 1)`); the returned
+/// `[i32; 4]` is laid out the same way. This helper applies no shift, bias, or
+/// quantiser scaling.
+///
+/// # Examples
+///
+/// ```
+/// use oxideav_svq::svq3_dequant::apply_chroma_dc_2x2_rows;
+/// let block = [1, 0, 0, 1];
+/// // out[0,0] = 8 * (1 + 0) = 8;  out[0,1] = 8 * (1 - 0) = 8.
+/// // out[1,0] = 8 * (0 + 1) = 8;  out[1,1] = 8 * (0 - 1) = -8.
+/// assert_eq!(apply_chroma_dc_2x2_rows(block), [8, 8, 8, -8]);
+/// ```
+#[inline]
+#[must_use]
+pub const fn apply_chroma_dc_2x2_rows(block: [i32; 4]) -> [i32; 4] {
+    // block layout: row-major 2×2.
+    //   block[0] = (0, 0)   block[1] = (0, 1)
+    //   block[2] = (1, 0)   block[3] = (1, 1)
+    let row0 = CHROMA_DC_TRANSFORM_MATRIX[0];
+    let row1 = CHROMA_DC_TRANSFORM_MATRIX[1];
+    // out[r, c] = X[r, :] · M[c, :]: block row r against matrix row c.
+    let out_00 = apply_chroma_dc_transform_row(row0, block[0], block[1]);
+    let out_01 = apply_chroma_dc_transform_row(row1, block[0], block[1]);
+    let out_10 = apply_chroma_dc_transform_row(row0, block[2], block[3]);
+    let out_11 = apply_chroma_dc_transform_row(row1, block[2], block[3]);
+    [out_00, out_01, out_10, out_11]
 }
 
 #[cfg(test)]
@@ -1220,5 +1357,162 @@ mod tests {
         assert_eq!(OUT[8], 13);
         assert_eq!(OUT[12], 13);
         assert_eq!(OUT[1], 0);
+    }
+
+    #[test]
+    fn luma_transform_rows_doc_example() {
+        // Row 0 = [2, 0, 0, 0]; output row 0 = block[0] * M[c][0] = 2*13 = 26
+        // for every output column c (column 0 of M is all 13). Other rows zero.
+        let mut block = [0i32; 16];
+        block[0] = 2;
+        let out = apply_luma_transform_rows(block);
+        assert_eq!(out[0], 26);
+        assert_eq!(out[1], 26);
+        assert_eq!(out[2], 26);
+        assert_eq!(out[3], 26);
+        for &v in &out[4..] {
+            assert_eq!(v, 0);
+        }
+    }
+
+    #[test]
+    fn luma_transform_rows_single_active_row_picks_matrix_row_dot() {
+        // A single active block row r reproduces, in output row r, the dot
+        // product of that row's samples with each matrix row in turn.
+        let samples = [3i32, -5, 7, -2];
+        for active in 0..4 {
+            let mut block = [0i32; 16];
+            block[active * 4..active * 4 + 4].copy_from_slice(&samples);
+            let out = apply_luma_transform_rows(block);
+            for c in 0..4 {
+                let expected = apply_luma_transform_row(
+                    LUMA_TRANSFORM_MATRIX[c],
+                    samples[0],
+                    samples[1],
+                    samples[2],
+                    samples[3],
+                );
+                assert_eq!(out[active * 4 + c], expected, "row {active}, col {c}");
+            }
+            // Every other output row is zero.
+            for r in 0..4 {
+                if r != active {
+                    for c in 0..4 {
+                        assert_eq!(out[r * 4 + c], 0, "leak into row {r}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn luma_transform_rows_matches_explicit_x_mt_definition() {
+        // out[r, c] = sum_k block[r*4 + k] * M[c][k] over an arbitrary block.
+        let mut block = [0i32; 16];
+        for (i, slot) in block.iter_mut().enumerate() {
+            *slot = ((i * 5 + 2) % 11) as i32 - 5;
+        }
+        let out = apply_luma_transform_rows(block);
+        for r in 0..4 {
+            for c in 0..4 {
+                let mut expected = 0i32;
+                for k in 0..4 {
+                    expected += block[r * 4 + k] * LUMA_TRANSFORM_MATRIX[c][k];
+                }
+                assert_eq!(out[r * 4 + c], expected, "({r}, {c})");
+            }
+        }
+    }
+
+    #[test]
+    fn luma_transform_rows_is_columns_of_the_transposed_input() {
+        // X · M^T transposed equals M · X^T: applying the row helper to X and
+        // transposing must equal applying the column helper to X^T.
+        let mut block = [0i32; 16];
+        for (i, slot) in block.iter_mut().enumerate() {
+            *slot = (i as i32) - 8;
+        }
+        let mut transposed = [0i32; 16];
+        for r in 0..4 {
+            for c in 0..4 {
+                transposed[c * 4 + r] = block[r * 4 + c];
+            }
+        }
+        let rows_out = apply_luma_transform_rows(block);
+        let cols_of_transpose = apply_luma_transform_columns(transposed);
+        for r in 0..4 {
+            for c in 0..4 {
+                // rows_out[r][c] = X[r,:]·M[c,:] = (M·X^T)[c][r] = cols_of_transpose[c][r]
+                assert_eq!(
+                    rows_out[r * 4 + c],
+                    cols_of_transpose[c * 4 + r],
+                    "({r},{c})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn luma_transform_rows_const_evaluable_in_static_context() {
+        const IN: [i32; 16] = {
+            let mut b = [0i32; 16];
+            b[0] = 1;
+            b
+        };
+        const OUT: [i32; 16] = apply_luma_transform_rows(IN);
+        // Pure-DC row 0 → 13 across output row 0, zeros elsewhere.
+        assert_eq!(OUT[0], 13);
+        assert_eq!(OUT[1], 13);
+        assert_eq!(OUT[2], 13);
+        assert_eq!(OUT[3], 13);
+        assert_eq!(OUT[4], 0);
+    }
+
+    #[test]
+    fn chroma_dc_rows_doc_example() {
+        // out[0,0] = 8*(1+0)=8; out[0,1] = 8*(1-0)=8;
+        // out[1,0] = 8*(0+1)=8; out[1,1] = 8*(0-1)=-8.
+        assert_eq!(apply_chroma_dc_2x2_rows([1, 0, 0, 1]), [8, 8, 8, -8]);
+    }
+
+    #[test]
+    fn chroma_dc_rows_matches_explicit_x_mt_definition() {
+        for block in [
+            [1, 2, 3, 4],
+            [-3, 5, -7, 11],
+            [0, 0, 5, -5],
+            [127, -128, 64, -64],
+        ] {
+            let out = apply_chroma_dc_2x2_rows(block);
+            // out[r, c] = sum_k block[r*2 + k] * M[c][k]; M = [[8,8],[8,-8]].
+            for r in 0..2 {
+                for c in 0..2 {
+                    let expected = block[r * 2] * CHROMA_DC_TRANSFORM_MATRIX[c][0]
+                        + block[r * 2 + 1] * CHROMA_DC_TRANSFORM_MATRIX[c][1];
+                    assert_eq!(out[r * 2 + c], expected, "({r}, {c})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chroma_dc_rows_is_columns_of_the_transposed_input() {
+        // Same transpose relation as the luma case, on the 2×2 block.
+        for block in [[1, 2, 3, 4], [-9, 4, 6, -2]] {
+            let transposed = [block[0], block[2], block[1], block[3]];
+            let rows_out = apply_chroma_dc_2x2_rows(block);
+            let cols_of_transpose = apply_chroma_dc_2x2_columns(transposed);
+            // rows_out[r][c] = cols_of_transpose[c][r].
+            assert_eq!(rows_out[0], cols_of_transpose[0]); // (0,0)=(0,0)
+            assert_eq!(rows_out[1], cols_of_transpose[2]); // (0,1)=(1,0)
+            assert_eq!(rows_out[2], cols_of_transpose[1]); // (1,0)=(0,1)
+            assert_eq!(rows_out[3], cols_of_transpose[3]); // (1,1)=(1,1)
+        }
+    }
+
+    #[test]
+    fn chroma_dc_rows_const_evaluable_in_static_context() {
+        const OUT: [i32; 4] = apply_chroma_dc_2x2_rows([1, 0, 0, 1]);
+        assert_eq!(OUT, [8, 8, 8, -8]);
     }
 }

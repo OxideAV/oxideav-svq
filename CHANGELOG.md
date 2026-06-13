@@ -8,6 +8,25 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 290 — SVQ3 transform row-multiply (`X · M^T`) passes.** The
+  right-side mirror of the existing single-sided column passes
+  (`M · X`), applying the wiki-pinned transform matrix
+  (`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock transform
+  and dequantization") against a block's rows instead of its columns.
+  Pure arithmetic over the verbatim-pinned matrix `M`; no new bitstream
+  reads, and `Svq3DecoderHandle::receive_frame` continues to return
+  `oxideav_core::Error::Unsupported`.
+  - New `svq3_dequant` helpers:
+    - `apply_luma_transform_rows(block: [i32; 16]) -> [i32; 16]`
+      `const fn` — `out[r*4+c] = X[r,:] · M[c,:]` (= `(X · M^T)[r,c]`),
+      reusing `apply_luma_transform_row` with
+      `matrix_row = LUMA_TRANSFORM_MATRIX[c]`.
+    - `apply_chroma_dc_2x2_rows(block: [i32; 4]) -> [i32; 4]` `const fn`
+      — the 2×2 chroma DC analogue against `[[8, 8], [8, -8]]`.
+  - The full two-sided `M · X · M^T` composition the wiki does NOT
+    enumerate stays deferred until `docs/video/svq3/` pins the operand
+    order and any intermediate rounding.
+
 - **Round 282 — SVQ3 4×4 diagonal-down intra predictor.** The one
   intra predictor the wiki spec pins completely in
   `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Intra prediction" —

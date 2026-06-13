@@ -5,6 +5,24 @@ Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 
 ## Status
 
+**Round 290 — SVQ3 transform row-multiply (`X · M^T`) passes.** Round 290
+adds the right-side mirror of rounds 262/272's single-sided column passes:
+where those applied the wiki-pinned transform matrix (`docs/video/svq3/wiki/Sorenson_Video_3.wiki`
+§"Macroblock transform and dequantization") against the *columns* of a block
+(`M · X`), the new helpers apply the *same* matrix against the block's *rows*
+(`X · M^T`). Two new `const fn` helpers:
+`svq3_dequant::apply_luma_transform_rows(block: [i32; 16]) -> [i32; 16]`
+(`out[r*4+c] = X[r,:] · M[c,:]`, reusing `apply_luma_transform_row` with
+`matrix_row = LUMA_TRANSFORM_MATRIX[c]`) and
+`svq3_dequant::apply_chroma_dc_2x2_rows(block: [i32; 4]) -> [i32; 4]`
+(the 2×2 chroma analogue). Each is a single matrix pass involving only the
+verbatim-pinned `M`; the full two-sided `M · X · M^T` composition the wiki
+does NOT enumerate stays deferred. New tests cross-check the row pass against
+the explicit `X · M^T` definition and against the column pass on the
+transposed input (`(X·M^T)^T = M·X^T`). `Svq3DecoderHandle::receive_frame`
+continues to return `oxideav_core::Error::Unsupported`. Total tests: 411 lib
++ 7 integration + 8 doc = 426 (up from 402 + 7 + 6 = 415).
+
 **Round 282 — SVQ3 4×4 diagonal-down intra predictor.** Round 282
 lands the one intra predictor the wiki spec pins completely in
 `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Intra prediction" as a

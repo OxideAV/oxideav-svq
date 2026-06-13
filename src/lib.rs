@@ -17,8 +17,8 @@
 //! combine the two element-wise). The numeric prediction-mode binding
 //! for this predictor, the remaining H.264-back-referenced predictors,
 //! and the writeback clamp are NOT pinned in `docs/video/svq3/` and
-//! stay deferred. Total tests: 402 lib + 7 integration + 6 doc = 415
-//! (up from 387 + 7 + 4 = 398).
+//! stay deferred. Total tests: 411 lib + 7 integration + 8 doc = 426
+//! (up from 402 + 7 + 6 = 415).
 //!
 //! ## Earlier rounds (carried forward)
 //!
