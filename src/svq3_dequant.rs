@@ -591,6 +591,61 @@ pub const fn apply_luma_transform_rows(block: [i32; 16]) -> [i32; 16] {
     out
 }
 
+/// Apply the full **two-sided** 4×4 luma transform `M · X · M^T` to a
+/// row-major 4×4 input block.
+///
+/// This composes the two pinned single-sided passes already defined in this
+/// module:
+///
+/// * [`apply_luma_transform_rows`] performs the right-side pass `X · M^T`
+///   (the matrix multiplied into the block's rows), and
+/// * [`apply_luma_transform_columns`] performs the left-side pass `M · (·)`
+///   (the matrix multiplied into the block's columns).
+///
+/// Chaining them — columns-pass applied to the output of the rows-pass —
+/// realises `M · (X · M^T) = M · X · M^T`. Both factors are the *same* matrix
+/// `M` ([`LUMA_TRANSFORM_MATRIX`], pinned verbatim by the wiki spec's
+/// §"Macroblock transform and dequantization"); no new matrix or constant is
+/// introduced here. The composition order is the matrix-algebra associativity
+/// of two already-pinned passes, not an additional spec fact.
+///
+/// Consistent with both single-sided passes, **no inter-pass shift, bias, or
+/// quantiser scaling is applied** — the wiki spec lists the matrix under
+/// "Transform coefficients" without enumerating any normalisation between the
+/// two passes, so none is folded in. The unrounded i32 outputs feed the
+/// per-coefficient dequant step ([`dequantize_coefficient`]); equivalently the
+/// composition could be written `(M · X) · M^T` (columns then rows) — the two
+/// orderings agree exactly for integer matrix multiplication, which the
+/// [`tests`] module corroborates.
+///
+/// The input `block` is laid out row-major (`block[r * 4 + c]` = sample at row
+/// `r`, column `c`); the returned `[i32; 16]` is laid out the same way.
+///
+/// # Examples
+///
+/// A pure-DC block (only `(0, 0)` non-zero) yields the rank-one outer product
+/// of column 0 of `M` with itself, scaled by the DC sample — every output
+/// element is `13 * 13 * block[0]`:
+///
+/// ```
+/// use oxideav_svq::svq3_dequant::apply_luma_transform_2d;
+/// let mut block = [0i32; 16];
+/// block[0] = 1; // (row 0, col 0)
+/// let out = apply_luma_transform_2d(block);
+/// // Column 0 of M is all 13, so M · X · M^T for a single DC sample is the
+/// // all-(13 * 13) matrix.
+/// for v in out {
+///     assert_eq!(v, 13 * 13);
+/// }
+/// ```
+#[inline]
+#[must_use]
+pub const fn apply_luma_transform_2d(block: [i32; 16]) -> [i32; 16] {
+    // M · (X · M^T): right-side rows pass first, then the left-side columns
+    // pass. Both passes use the same pinned LUMA_TRANSFORM_MATRIX.
+    apply_luma_transform_columns(apply_luma_transform_rows(block))
+}
+
 /// Apply the 2×2 chroma DC transform matrix to a row-major 2×2 input block by
 /// multiplying the matrix into the block's **rows** (`X · M^T`).
 ///
@@ -639,6 +694,49 @@ pub const fn apply_chroma_dc_2x2_rows(block: [i32; 4]) -> [i32; 4] {
     let out_10 = apply_chroma_dc_transform_row(row0, block[2], block[3]);
     let out_11 = apply_chroma_dc_transform_row(row1, block[2], block[3]);
     [out_00, out_01, out_10, out_11]
+}
+
+/// Apply the full **two-sided** 2×2 chroma DC transform `M · X · M^T` to a
+/// row-major 2×2 input block.
+///
+/// This composes the two pinned single-sided chroma DC passes:
+///
+/// * [`apply_chroma_dc_2x2_rows`] performs the right-side pass `X · M^T`, and
+/// * [`apply_chroma_dc_2x2_columns`] performs the left-side pass `M · (·)`.
+///
+/// Chaining them realises `M · (X · M^T) = M · X · M^T`, where `M` is the
+/// pinned [`CHROMA_DC_TRANSFORM_MATRIX`] = `[[8, 8], [8, -8]]` (wiki spec:
+/// "chroma DCs need to be transformed first using the following matrix").
+/// No new matrix or constant is introduced; the composition order is matrix
+/// associativity of two already-pinned passes.
+///
+/// Consistent with both single-sided passes, **no inter-pass shift, bias, or
+/// quantiser scaling is applied** — the wiki spec does not enumerate a
+/// normalisation between the two passes. The unrounded i32 outputs feed
+/// [`dequantize_chroma_dc`]. Because `M` is symmetric, `(M · X) · M^T`
+/// (columns then rows) yields the same result, which the [`tests`] module
+/// corroborates.
+///
+/// The input `block` is laid out row-major (`block[0]` = `(0, 0)`, `block[1]`
+/// = `(0, 1)`, `block[2]` = `(1, 0)`, `block[3]` = `(1, 1)`); the returned
+/// `[i32; 4]` is laid out the same way.
+///
+/// # Examples
+///
+/// A pure-DC block (only `(0, 0)` non-zero) yields every output element equal
+/// to `8 * 8 * block[0]`, since column 0 of `M` is `[8, 8]`:
+///
+/// ```
+/// use oxideav_svq::svq3_dequant::apply_chroma_dc_2x2_2d;
+/// let block = [1, 0, 0, 0];
+/// assert_eq!(apply_chroma_dc_2x2_2d(block), [64, 64, 64, 64]);
+/// ```
+#[inline]
+#[must_use]
+pub const fn apply_chroma_dc_2x2_2d(block: [i32; 4]) -> [i32; 4] {
+    // M · (X · M^T): right-side rows pass first, then the left-side columns
+    // pass. Both passes use the same pinned CHROMA_DC_TRANSFORM_MATRIX.
+    apply_chroma_dc_2x2_columns(apply_chroma_dc_2x2_rows(block))
 }
 
 #[cfg(test)]
@@ -1514,5 +1612,161 @@ mod tests {
     fn chroma_dc_rows_const_evaluable_in_static_context() {
         const OUT: [i32; 4] = apply_chroma_dc_2x2_rows([1, 0, 0, 1]);
         assert_eq!(OUT, [8, 8, 8, -8]);
+    }
+
+    // ----- Two-sided luma transform M · X · M^T -----------------------------
+
+    /// Brute-force reference: triple-loop `M · X · M^T` for a row-major 4×4
+    /// block, computed straight from [`LUMA_TRANSFORM_MATRIX`]. Used only to
+    /// corroborate the composed helper; it duplicates no production code.
+    fn reference_luma_2d(block: [i32; 16]) -> [i32; 16] {
+        let m = LUMA_TRANSFORM_MATRIX;
+        let mut out = [0i32; 16];
+        for i in 0..4 {
+            for j in 0..4 {
+                let mut acc = 0i32;
+                for p in 0..4 {
+                    for q in 0..4 {
+                        // (M · X · M^T)[i][j] = sum_{p,q} M[i][p] * X[p][q] * M[j][q]
+                        acc += m[i][p] * block[p * 4 + q] * m[j][q];
+                    }
+                }
+                out[i * 4 + j] = acc;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn luma_2d_doc_example_pure_dc() {
+        let mut block = [0i32; 16];
+        block[0] = 1;
+        let out = apply_luma_transform_2d(block);
+        // M · X · M^T for a single DC sample is the all-(13*13) matrix.
+        for v in out {
+            assert_eq!(v, 13 * 13);
+        }
+    }
+
+    #[test]
+    fn luma_2d_matches_brute_force_reference() {
+        for block in [
+            {
+                let mut b = [0i32; 16];
+                b[0] = 5;
+                b
+            },
+            {
+                let mut b = [0i32; 16];
+                let mut k = 0;
+                while k < 16 {
+                    b[k] = k as i32 - 7;
+                    k += 1;
+                }
+                b
+            },
+            [3, -1, 4, -1, 5, -9, 2, -6, 5, -3, 5, -8, 9, -7, 9, -3],
+            [
+                -100, 100, -50, 50, 25, -25, 12, -12, 6, -6, 3, -3, 1, -1, 0, 0,
+            ],
+        ] {
+            assert_eq!(apply_luma_transform_2d(block), reference_luma_2d(block));
+        }
+    }
+
+    #[test]
+    fn luma_2d_order_independent_columns_then_rows() {
+        // (M · X) · M^T must equal M · (X · M^T) for integer matrix multiply.
+        for block in [
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            [-5, 0, 17, -3, 8, 8, -8, 1, 0, 0, 4, -4, 100, -100, 2, -2],
+        ] {
+            let rows_then_cols = apply_luma_transform_2d(block);
+            let cols_then_rows = apply_luma_transform_rows(apply_luma_transform_columns(block));
+            assert_eq!(rows_then_cols, cols_then_rows);
+        }
+    }
+
+    #[test]
+    fn luma_2d_is_linear_in_input() {
+        let x = [
+            1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16,
+        ];
+        let y = [16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
+        let mut sum = [0i32; 16];
+        for k in 0..16 {
+            sum[k] = x[k] + y[k];
+        }
+        let tx = apply_luma_transform_2d(x);
+        let ty = apply_luma_transform_2d(y);
+        let tsum = apply_luma_transform_2d(sum);
+        for k in 0..16 {
+            assert_eq!(tsum[k], tx[k] + ty[k]);
+        }
+    }
+
+    #[test]
+    fn luma_2d_const_evaluable_in_static_context() {
+        const IN: [i32; 16] = {
+            let mut b = [0i32; 16];
+            b[0] = 1;
+            b
+        };
+        const OUT: [i32; 16] = apply_luma_transform_2d(IN);
+        assert_eq!(OUT[0], 13 * 13);
+        assert_eq!(OUT[15], 13 * 13);
+    }
+
+    // ----- Two-sided chroma DC transform M · X · M^T ------------------------
+
+    /// Brute-force reference for the 2×2 chroma DC two-sided transform.
+    fn reference_chroma_2d(block: [i32; 4]) -> [i32; 4] {
+        let m = CHROMA_DC_TRANSFORM_MATRIX;
+        let mut out = [0i32; 4];
+        for i in 0..2 {
+            for j in 0..2 {
+                let mut acc = 0i32;
+                for p in 0..2 {
+                    for q in 0..2 {
+                        acc += m[i][p] * block[p * 2 + q] * m[j][q];
+                    }
+                }
+                out[i * 2 + j] = acc;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn chroma_2d_doc_example_pure_dc() {
+        assert_eq!(apply_chroma_dc_2x2_2d([1, 0, 0, 0]), [64, 64, 64, 64]);
+    }
+
+    #[test]
+    fn chroma_2d_matches_brute_force_reference() {
+        for block in [
+            [1, 2, 3, 4],
+            [-3, 5, -7, 11],
+            [0, 0, 5, -5],
+            [127, -128, 64, -64],
+        ] {
+            assert_eq!(apply_chroma_dc_2x2_2d(block), reference_chroma_2d(block));
+        }
+    }
+
+    #[test]
+    fn chroma_2d_order_independent_columns_then_rows() {
+        // M is symmetric, so columns-then-rows equals rows-then-columns.
+        for block in [[1, 2, 3, 4], [-9, 4, 6, -2], [100, -100, 50, -50]] {
+            let rows_then_cols = apply_chroma_dc_2x2_2d(block);
+            let cols_then_rows = apply_chroma_dc_2x2_rows(apply_chroma_dc_2x2_columns(block));
+            assert_eq!(rows_then_cols, cols_then_rows);
+        }
+    }
+
+    #[test]
+    fn chroma_2d_const_evaluable_in_static_context() {
+        const OUT: [i32; 4] = apply_chroma_dc_2x2_2d([1, 0, 0, 0]);
+        assert_eq!(OUT, [64, 64, 64, 64]);
     }
 }

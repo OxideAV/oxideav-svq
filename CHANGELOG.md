@@ -8,6 +8,27 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 295 — SVQ3 two-sided transform `M · X · M^T` composition.**
+  Composes the two single-sided passes (`M · X` column pass from rounds
+  262/272 and `X · M^T` row pass from round 290) into the full two-sided
+  transform implied by the wiki-pinned matrix
+  (`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock transform
+  and dequantization"). Pure functional composition of already-pinned
+  helpers — no new matrix or constant — and `Svq3DecoderHandle::receive_frame`
+  continues to return `oxideav_core::Error::Unsupported`.
+  - New `svq3_dequant` helpers:
+    - `apply_luma_transform_2d(block: [i32; 16]) -> [i32; 16]` `const fn`
+      — `apply_luma_transform_columns(apply_luma_transform_rows(block))`,
+      realising `M · (X · M^T) = M · X · M^T`.
+    - `apply_chroma_dc_2x2_2d(block: [i32; 4]) -> [i32; 4]` `const fn`
+      — the 2×2 chroma DC analogue.
+  - Consistent with both single-sided passes, no inter-pass shift, bias,
+    or quantiser scaling is applied (the wiki does not enumerate any
+    normalisation between passes). The composition order is matrix
+    associativity, not an additional spec fact; tests corroborate against
+    a brute-force `M · X · M^T` triple-loop reference and confirm the
+    column-then-row ordering agrees.
+
 - **Round 290 — SVQ3 transform row-multiply (`X · M^T`) passes.** The
   right-side mirror of the existing single-sided column passes
   (`M · X`), applying the wiki-pinned transform matrix

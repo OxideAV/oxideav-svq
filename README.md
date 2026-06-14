@@ -5,6 +5,29 @@ Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 
 ## Status
 
+**Round 295 — SVQ3 two-sided transform `M · X · M^T` composition.** Round 295
+composes the two single-sided passes landed across rounds 262/272 (`M · X`,
+the column pass) and round 290 (`X · M^T`, the row pass) into the full
+two-sided transform the wiki spec's
+(`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock transform and
+dequantization") matrix implies. Two new `const fn` helpers chain the existing
+pinned passes — no new matrix or constant is introduced:
+`svq3_dequant::apply_luma_transform_2d(block: [i32; 16]) -> [i32; 16]`
+(= `apply_luma_transform_columns(apply_luma_transform_rows(block))`, realising
+`M · (X · M^T) = M · X · M^T`) and
+`svq3_dequant::apply_chroma_dc_2x2_2d(block: [i32; 4]) -> [i32; 4]`
+(the 2×2 chroma analogue). The composition order is matrix-algebra
+associativity of two already-pinned passes, not an additional spec fact, and
+consistent with both single-sided helpers **no inter-pass shift, bias, or
+quantiser scaling is applied** — the wiki lists the matrix under "Transform
+coefficients" without enumerating any normalisation between passes. New tests
+corroborate each helper against a brute-force triple-loop `M · X · M^T`
+reference, verify the order-independence (`(M·X)·M^T = M·(X·M^T)`; the chroma
+matrix is symmetric), and check linearity and `const`-context evaluability.
+`Svq3DecoderHandle::receive_frame` continues to return
+`oxideav_core::Error::Unsupported`. Total tests: 420 lib + 7 integration + 10
+doc = 437 (up from 411 + 7 + 8 = 426).
+
 **Round 290 — SVQ3 transform row-multiply (`X · M^T`) passes.** Round 290
 adds the right-side mirror of rounds 262/272's single-sided column passes:
 where those applied the wiki-pinned transform matrix (`docs/video/svq3/wiki/Sorenson_Video_3.wiki`
