@@ -27,7 +27,7 @@
 //! Their SHA-256s appear in `docs/video/svq1/tables/MANIFEST-02.sha256`
 //! and are matched bit-for-bit by the local mirrors.
 //!
-//! No FFmpeg / libav* / Sorenson-SDK source is read at any step.
+//! No external implementation source is consulted.
 //!
 //! ## Clip LUT (`SVQ1_CLIP_LUT`)
 //!

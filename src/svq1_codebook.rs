@@ -12,7 +12,7 @@
 //! SHA-256 `ac3509bf22aa1458dfc6e1af980956c0153b4c287af452ae5b9cac6f923be169`,
 //! file offset `0x5d200..0x62c00` (VMA `0x67dcd200..0x67dd2c00`).
 //!
-//! No FFmpeg / libav* / Sorenson-SDK source is read at any step.
+//! No external implementation source is consulted.
 //!
 //! ## Size arithmetic
 //!

@@ -983,7 +983,7 @@ Header" + line 9 (FourCC list) — a verbatim local mirror of the
 multimedia.cx Sorenson_Video_1 wiki page (fetched 2026-05-06,
 CC-BY-SA per multimedia.cx terms).
 
-No external library source (FFmpeg / libavcodec / MPlayer / etc.),
+No external library source,
 no archived `old` branch of this crate, and no online cross-checks
 were consulted across any of the four rounds. The wiki spec's
 "Appendix A: SVQ1 Data Tables" lists upstream source-tree pointers

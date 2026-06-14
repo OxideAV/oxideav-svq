@@ -1069,7 +1069,7 @@ Round 4 was implemented strictly from
 §"Intra macroblock information decoding" of the same local mirror.
 No additional spec documents were opened during round 4.
 
-No external library source (FFmpeg / libavcodec / MPlayer / etc.),
+No external library source,
 no archived `old` branch of this crate, and no online cross-checks
 were consulted in any of the four rounds.
 
