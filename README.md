@@ -5,6 +5,31 @@ Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 
 ## Status
 
+**Round 302 — SVQ1 within-half codebook-vector accessor.** Round 302
+surfaces the canonical *within-half* vector addressing the SVQ1 cleanroom
+spec now pins in `docs/video/svq1/spec/14-codebook-architecture.md` §14.5
+(the `(level, half, stage, vec_idx, byte_idx)` convention) and §14.8 (the
+`half_payload[stage_idx * 16 * V_L + vec_idx * V_L + byte_idx]` arithmetic,
+stated as holding "regardless of hypothesis"). Two new helpers turn the raw
+L=0..L=3 codebook payload into addressable vectors *within a half a caller has
+already isolated*: `svq1_codebook::vector_byte_offset_in_half(level, stage,
+vec_idx) -> Option<usize>` (`const fn`; the pinned offset arithmetic, with
+`stage` 1-based `1..=6` per §14.3, `vec_idx` `0..=15`, and `None` for the
+absent L=4 / L=5 levels and out-of-range stage / index) and
+`svq1_codebook::codebook_vector_in_half(half, level, stage, vec_idx) ->
+Option<&[i8]>` (borrows the `V_L`-byte vector, returning `None` if the offset
+is invalid or the supplied half is too short). The **cross-half / cross-level**
+concatenation order (intra-vs-inter ordering inside the contiguous 23004-byte
+payload) is the explicitly-open §14.8 item — two unresolved hypotheses
+distinguishable only by a Validator round — so these helpers deliberately do
+NOT decide where a half begins inside the payload; they resolve offsets only
+*within* a half the caller supplies. Tests cross-check the offset against an
+independent recompute over the full stage×vec grid, prove the offsets tile each
+half with no gaps or overlaps and end exactly on the half boundary, and verify
+short-half / absent-level / out-of-range rejection and `const`-context use.
+`Svq1` / `Svq3` decode entry points remain unchanged. Total tests: 431 lib + 7
+integration + 12 doc = 450 (up from 420 + 7 + 10 = 437).
+
 **Round 295 — SVQ3 two-sided transform `M · X · M^T` composition.** Round 295
 composes the two single-sided passes landed across rounds 262/272 (`M · X`,
 the column pass) and round 290 (`X · M^T`, the row pass) into the full

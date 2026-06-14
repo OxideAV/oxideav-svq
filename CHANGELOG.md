@@ -8,6 +8,30 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 302 — SVQ1 within-half codebook-vector accessor.** Surfaces
+  the canonical *within-half* vector addressing pinned by
+  `docs/video/svq1/spec/14-codebook-architecture.md` §14.5 (the
+  `(level, half, stage, vec_idx, byte_idx)` convention) and §14.8 (the
+  `half_payload[stage_idx * 16 * V_L + vec_idx * V_L + byte_idx]`
+  arithmetic, stated as holding "regardless of hypothesis"). The
+  cross-half / cross-level concatenation order remains the still-open
+  §14.8 item, so these helpers operate only WITHIN a half the caller
+  has isolated.
+  - New `svq1_codebook` helpers:
+    - `vector_byte_offset_in_half(level, stage, vec_idx) -> Option<usize>`
+      `const fn` — the byte offset of stage `stage` (1-based, `1..=6`)
+      entry `vec_idx` (`0..=15`) within one level half; `None` for the
+      absent L=4 / L=5 levels and for out-of-range `stage` / `vec_idx`.
+    - `codebook_vector_in_half(half, level, stage, vec_idx) -> Option<&[i8]>`
+      — borrows the `V_L`-byte vector from a caller-supplied half slice,
+      returning `None` if the offset is invalid or the half is too short.
+  - 11 new lib tests (offset arithmetic vs an independent recompute over
+    the full stage×vec grid, unique-and-tiling coverage, half-boundary
+    alignment, short-half / absent-level / out-of-range rejection,
+    `const`-context evaluability) and 2 doc tests. Total: 431 lib + 7
+    integration + 12 doc = 450 (up from 420 + 7 + 10 = 437).
+    `Svq1`/`Svq3` decode entry points remain unchanged.
+
 - **Round 295 — SVQ3 two-sided transform `M · X · M^T` composition.**
   Composes the two single-sided passes (`M · X` column pass from rounds
   262/272 and `X · M^T` row pass from round 290) into the full two-sided

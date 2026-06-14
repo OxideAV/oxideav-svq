@@ -52,16 +52,35 @@
 //! the `None` invariant. See [`Svq1Level::absence_record`] for the
 //! ergonomic `Svq1Level → Option<Svq1AbsentLevelRecord>` accessor.
 //!
+//! ## Within-half vector addressing (pinned)
+//!
+//! The *within-half* layout — where stage `k`'s vector `v` lives
+//! inside one codebook half (intra OR inter) of a single level — IS
+//! pinned by `docs/video/svq1/spec/14-codebook-architecture.md` §14.5
+//! (addressing convention) and §14.8 (the canonical
+//! `half_payload[stage_idx * 16 * V_L + vec_idx * V_L + byte_idx]`
+//! arithmetic, stated as the layout that holds "regardless of
+//! hypothesis"). [`vector_byte_offset_in_half`] and
+//! [`codebook_vector_in_half`] surface that arithmetic: given a
+//! caller-supplied half-slice for a level, they resolve a
+//! `(stage, vec_idx)` pair to its byte offset / `&[i8]` view. These
+//! helpers operate only WITHIN a half the caller already isolated, so
+//! they do not depend on the still-open ordering question below.
+//!
 //! ## Open work (not blocked on this crate)
 //!
-//! The exact intra-vs-inter ordering and the stage-vs-level
-//! interleave *within* the 23004-byte payload is a sibling docs spec
-//! task per the `codebook-l0l3.meta` "NOTE: the precise intra/inter
-//! ordering and stage-vs-level interleave WITHIN this region is the
-//! L0..L3 spec's concern (sibling task)". Until the layout spec lands,
-//! this module exposes the raw payload + per-level byte counts but
-//! does NOT yet expose a `(level, stage, intra_or_inter, vector_idx)
-//! → &[i8]` accessor.
+//! The exact intra-vs-inter ordering and the *cross-half / cross-
+//! level* concatenation order *within* the 23004-byte payload is a
+//! sibling docs spec task — `docs/video/svq1/spec/14-codebook-architecture.md`
+//! §14.8 leaves it as an explicit OPEN item with two unresolved
+//! hypotheses (A: intra-first level-ascending; B: level-major
+//! intra-then-inter), distinguishable only by a Validator round or a
+//! statistical-boundary discrimination not yet performed. Until that
+//! lands, this module exposes the raw payload, per-level byte counts,
+//! and the pinned within-half accessor, but does NOT yet expose a
+//! whole-payload `(level, stage, intra_or_inter, vector_idx) → &[i8]`
+//! accessor — the byte offset of a given half within the contiguous
+//! payload is what §14.8 has not yet fixed.
 
 use crate::svq1_blocktree::Svq1Level;
 
@@ -215,6 +234,111 @@ pub fn codebook_descriptor() -> &'static [u8] {
 /// offset `+0x14`. All entries are in the range 1..=4.
 pub fn block_shape_lut() -> &'static [u8] {
     &SVQ1_BLOCK_SHAPE_LUT
+}
+
+/// Byte offset of mean-removed vector `vec_idx` of stage `stage`
+/// within one codebook **half** (intra OR inter) of level `level`.
+///
+/// Implements the canonical within-half addressing arithmetic pinned
+/// by `docs/video/svq1/spec/14-codebook-architecture.md` §14.5
+/// (the `(level, half, stage, vec_idx, byte_idx)` convention) and
+/// §14.8 (the layout that holds "regardless of hypothesis"):
+///
+/// ```text
+///   offset = stage_idx * 16 * V_L + vec_idx * V_L
+/// ```
+///
+/// where `V_L` is [`Svq1Level::vector_length`], `16` is
+/// [`SVQ1_ENTRIES_PER_STAGE`], and `stage_idx = stage - 1` (the spec
+/// numbers stages `1..=6` in §14.3; this helper takes that 1-based
+/// `stage` directly). The returned offset is the start of the
+/// vector's `V_L` bytes within the half; the bytes themselves run in
+/// output-raster order per §14.8.
+///
+/// Returns `None` if:
+///
+/// * `level` is L=4 or L=5 (no codebook half exists — see
+///   [`Svq1Level::codebook_bytes_per_half`]);
+/// * `stage` is outside `1..=SVQ1_STAGES_PER_LEVEL` (`1..=6`); or
+/// * `vec_idx` is outside `0..SVQ1_ENTRIES_PER_STAGE` (`0..=15`).
+///
+/// This resolves an offset *within* a half only; it does NOT decide
+/// where that half begins inside the contiguous L=0..L=3 payload —
+/// that cross-half ordering is the still-open §14.8 item.
+///
+/// ```
+/// use oxideav_svq::svq1_blocktree::Svq1Level;
+/// use oxideav_svq::svq1_codebook::vector_byte_offset_in_half;
+///
+/// // L=0 vectors are 8 bytes: stage 1 vec 0 starts at 0, vec 1 at 8;
+/// // stage 2 vec 0 at 16 * 8 = 128.
+/// assert_eq!(vector_byte_offset_in_half(Svq1Level::L0, 1, 0), Some(0));
+/// assert_eq!(vector_byte_offset_in_half(Svq1Level::L0, 1, 1), Some(8));
+/// assert_eq!(vector_byte_offset_in_half(Svq1Level::L0, 2, 0), Some(128));
+/// // L=4 has no codebook.
+/// assert_eq!(vector_byte_offset_in_half(Svq1Level::L4, 1, 0), None);
+/// ```
+pub const fn vector_byte_offset_in_half(
+    level: Svq1Level,
+    stage: usize,
+    vec_idx: usize,
+) -> Option<usize> {
+    let vector_length = level.vector_length() as usize;
+    // L=4 / L=5 have no codebook half (vector_length is non-zero for
+    // them, so gate on the codebook presence explicitly).
+    if level.codebook_bytes_per_half().is_none() {
+        return None;
+    }
+    if stage < 1 || stage > SVQ1_STAGES_PER_LEVEL {
+        return None;
+    }
+    if vec_idx >= SVQ1_ENTRIES_PER_STAGE {
+        return None;
+    }
+    let stage_idx = stage - 1;
+    Some(stage_idx * SVQ1_ENTRIES_PER_STAGE * vector_length + vec_idx * vector_length)
+}
+
+/// Borrow the `V_L`-byte mean-removed vector for stage `stage`,
+/// entry `vec_idx`, of level `level` from a caller-supplied codebook
+/// **half** slice.
+///
+/// `half` is one codebook half (intra OR inter) for the given level —
+/// the caller is responsible for isolating it from the contiguous
+/// L=0..L=3 payload, because the cross-half / cross-level ordering is
+/// the still-open §14.8 item. The returned slice is the vector's
+/// `Svq1Level::vector_length` signed bytes in output-raster order, per
+/// `docs/video/svq1/spec/14-codebook-architecture.md` §14.8.
+///
+/// Returns `None` if [`vector_byte_offset_in_half`] returns `None`
+/// (absent level / out-of-range `stage` / out-of-range `vec_idx`), or
+/// if `half` is too short to contain the addressed vector — i.e.
+/// shorter than `offset + V_L`. A correctly-sized half is
+/// `Svq1Level::codebook_bytes_per_half(level)` bytes long, which
+/// always contains every in-range `(stage, vec_idx)`.
+///
+/// ```
+/// use oxideav_svq::svq1_blocktree::Svq1Level;
+/// use oxideav_svq::svq1_codebook::codebook_vector_in_half;
+///
+/// // A synthetic L=0 half: 768 bytes, each byte equal to its index
+/// // modulo 251 cast to i8 (just to make positions distinguishable).
+/// let half: Vec<i8> = (0..768).map(|i| (i % 251) as i8).collect();
+/// // Stage 1, vector 1 occupies bytes 8..16.
+/// let v = codebook_vector_in_half(&half, Svq1Level::L0, 1, 1).unwrap();
+/// assert_eq!(v.len(), 8);
+/// assert_eq!(v[0], 8);
+/// assert_eq!(v[7], 15);
+/// ```
+pub fn codebook_vector_in_half(
+    half: &[i8],
+    level: Svq1Level,
+    stage: usize,
+    vec_idx: usize,
+) -> Option<&[i8]> {
+    let offset = vector_byte_offset_in_half(level, stage, vec_idx)?;
+    let vector_length = level.vector_length() as usize;
+    half.get(offset..offset + vector_length)
 }
 
 #[cfg(test)]
@@ -429,5 +553,177 @@ mod tests {
                 "absence_record / codebook_bytes_per_half disagree at {level:?}"
             );
         }
+    }
+
+    /// The four present levels, paired with their vector length.
+    const PRESENT_LEVELS: [(Svq1Level, usize); 4] = [
+        (Svq1Level::L0, 8),
+        (Svq1Level::L1, 16),
+        (Svq1Level::L2, 32),
+        (Svq1Level::L3, 64),
+    ];
+
+    #[test]
+    fn vector_offset_first_vector_is_zero_for_every_present_level() {
+        // §14.8: half_payload[stage_idx * 16 * V_L + vec_idx * V_L].
+        // Stage 1 (stage_idx 0), vec 0 → offset 0 for every level.
+        for (level, _) in PRESENT_LEVELS {
+            assert_eq!(vector_byte_offset_in_half(level, 1, 0), Some(0));
+        }
+    }
+
+    #[test]
+    fn vector_offset_matches_canonical_arithmetic() {
+        // Spot-check the closed form against an independent recompute
+        // across the full (stage, vec_idx) grid for each present level.
+        for (level, v_l) in PRESENT_LEVELS {
+            for stage in 1..=SVQ1_STAGES_PER_LEVEL {
+                for vec_idx in 0..SVQ1_ENTRIES_PER_STAGE {
+                    let expected = (stage - 1) * SVQ1_ENTRIES_PER_STAGE * v_l + vec_idx * v_l;
+                    assert_eq!(
+                        vector_byte_offset_in_half(level, stage, vec_idx),
+                        Some(expected),
+                        "offset mismatch at {level:?} stage {stage} vec {vec_idx}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vector_offset_last_entry_ends_exactly_at_half_size() {
+        // The final addressable byte (stage 6, vec 15, last byte of the
+        // vector) must be the last byte of the half: offset + V_L ==
+        // codebook_bytes_per_half(level).
+        for (level, v_l) in PRESENT_LEVELS {
+            let last = vector_byte_offset_in_half(
+                level,
+                SVQ1_STAGES_PER_LEVEL,
+                SVQ1_ENTRIES_PER_STAGE - 1,
+            )
+            .unwrap();
+            assert_eq!(
+                last + v_l,
+                level.codebook_bytes_per_half().unwrap(),
+                "last vector of {level:?} does not end at the half boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn vector_offset_rejects_absent_levels() {
+        assert_eq!(vector_byte_offset_in_half(Svq1Level::L4, 1, 0), None);
+        assert_eq!(vector_byte_offset_in_half(Svq1Level::L5, 1, 0), None);
+    }
+
+    #[test]
+    fn vector_offset_rejects_out_of_range_stage() {
+        // Stage is 1-based 1..=6; 0 and 7 are out of range.
+        assert_eq!(vector_byte_offset_in_half(Svq1Level::L0, 0, 0), None);
+        assert_eq!(
+            vector_byte_offset_in_half(Svq1Level::L0, SVQ1_STAGES_PER_LEVEL + 1, 0),
+            None
+        );
+        // The boundary stage 6 IS valid.
+        assert!(vector_byte_offset_in_half(Svq1Level::L0, SVQ1_STAGES_PER_LEVEL, 0).is_some());
+    }
+
+    #[test]
+    fn vector_offset_rejects_out_of_range_vec_idx() {
+        assert_eq!(
+            vector_byte_offset_in_half(Svq1Level::L0, 1, SVQ1_ENTRIES_PER_STAGE),
+            None
+        );
+        // The boundary entry 15 IS valid.
+        assert!(vector_byte_offset_in_half(Svq1Level::L0, 1, SVQ1_ENTRIES_PER_STAGE - 1).is_some());
+    }
+
+    #[test]
+    fn vector_offsets_are_unique_and_cover_the_half() {
+        // Every (stage, vec_idx) maps to a distinct, V_L-aligned
+        // offset, and the set of offsets exactly tiles the half with no
+        // gaps or overlaps.
+        for (level, v_l) in PRESENT_LEVELS {
+            let mut seen = vec![false; level.codebook_bytes_per_half().unwrap() / v_l];
+            for stage in 1..=SVQ1_STAGES_PER_LEVEL {
+                for vec_idx in 0..SVQ1_ENTRIES_PER_STAGE {
+                    let off = vector_byte_offset_in_half(level, stage, vec_idx).unwrap();
+                    assert_eq!(off % v_l, 0, "offset {off} not V_L-aligned at {level:?}");
+                    let slot = off / v_l;
+                    assert!(!seen[slot], "duplicate slot {slot} at {level:?}");
+                    seen[slot] = true;
+                }
+            }
+            assert!(
+                seen.iter().all(|&b| b),
+                "offsets do not tile the full half for {level:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vector_borrow_returns_correct_length_and_bytes() {
+        // Synthetic half whose byte j holds (j % 251) as i8 so each
+        // position is identifiable.
+        for (level, v_l) in PRESENT_LEVELS {
+            let half_len = level.codebook_bytes_per_half().unwrap();
+            let half: Vec<i8> = (0..half_len).map(|j| (j % 251) as i8).collect();
+            for stage in 1..=SVQ1_STAGES_PER_LEVEL {
+                for vec_idx in 0..SVQ1_ENTRIES_PER_STAGE {
+                    let off = vector_byte_offset_in_half(level, stage, vec_idx).unwrap();
+                    let v = codebook_vector_in_half(&half, level, stage, vec_idx).unwrap();
+                    assert_eq!(v.len(), v_l, "wrong vector length at {level:?}");
+                    for (k, &byte) in v.iter().enumerate() {
+                        assert_eq!(byte, ((off + k) % 251) as i8);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vector_borrow_rejects_short_half() {
+        // A half one byte too short to hold the last vector returns None
+        // rather than panicking.
+        let level = Svq1Level::L0;
+        let v_l = 8;
+        let full = level.codebook_bytes_per_half().unwrap();
+        let short: Vec<i8> = vec![0; full - 1];
+        // Last vector needs bytes [full - v_l .. full); the half ends at
+        // full - 1, so the borrow fails.
+        assert_eq!(
+            codebook_vector_in_half(
+                &short,
+                level,
+                SVQ1_STAGES_PER_LEVEL,
+                SVQ1_ENTRIES_PER_STAGE - 1
+            ),
+            None
+        );
+        // But a half exactly v_l shorter still serves all but the last.
+        assert!(
+            codebook_vector_in_half(&short, level, SVQ1_STAGES_PER_LEVEL, 0).is_some(),
+            "earlier vectors should still be addressable in a one-byte-short half"
+        );
+        let _ = v_l;
+    }
+
+    #[test]
+    fn vector_borrow_rejects_absent_and_out_of_range() {
+        let dummy: Vec<i8> = vec![0; 64];
+        assert_eq!(codebook_vector_in_half(&dummy, Svq1Level::L4, 1, 0), None);
+        assert_eq!(codebook_vector_in_half(&dummy, Svq1Level::L0, 0, 0), None);
+        assert_eq!(
+            codebook_vector_in_half(&dummy, Svq1Level::L0, 1, SVQ1_ENTRIES_PER_STAGE),
+            None
+        );
+    }
+
+    #[test]
+    fn vector_offset_is_const_usable() {
+        const OFF: Option<usize> = vector_byte_offset_in_half(Svq1Level::L3, 2, 3);
+        // L=3 V_L = 64: stage 2 (idx 1) vec 3 → 1*16*64 + 3*64 = 1216.
+        assert_eq!(OFF, Some(16 * 64 + 3 * 64));
+        assert_eq!(OFF, Some(1216));
     }
 }
