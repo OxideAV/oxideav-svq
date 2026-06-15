@@ -8,6 +8,34 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 315 — SVQ1 leaf stage-accumulation reconstruction.** Composes
+  the already-staged mean step (`svq1_mean`), within-half codebook lookup
+  (`svq1_codebook::codebook_vector_in_half`), and per-step `[0, 255]`
+  clamp (`svq1_mean::saturate_u8`) into the fixed-order leaf
+  reconstruction the spec pins in
+  `docs/video/svq1/spec/04-multistage-vq-decoder.md` §4.5 —
+  `predictor → mean → stage-1 → … → stage-N`, saturating AFTER EACH add
+  (§4.5.1), written in output-raster order (§4.7.1). The composition
+  order is the spec's mandate over already-pinned passes; no new
+  arithmetic, constant, or codebook addressing is introduced.
+  - New `svq1_reconstruct` module:
+    - `reconstruct_leaf(level, half, predictor, mean, stages) ->
+      Result<Vec<u8>, ReconstructError>` — the per-position §4.5 loop.
+      Empty `stages` is the §4.5.4 mean-only collapse (`N = 0`); SKIP
+      (`N = -1`, §4.5.5) is the caller's short-circuit, not a value of
+      this function.
+    - `LeafStage { stage, vec_idx }` — one decoded stage (ascending
+      order per §4.2); `MAX_STAGES = 6` (§4.1).
+    - `ReconstructError` — absent level (§4.1.2), mis-sized predictor
+      (§4.3), stage overflow (§4.1.1), codebook-lookup failure (§4.3).
+  - 11 new lib tests including the §4.8 worked example bit-exact
+    (`predictor=0, mean=61, stage-1 idx=4, stage-2 idx=14` → raster
+    `[55 39 50 77 / 93 81 49 46]`), the §4.8.3 intermediate rows, the
+    §4.8.5 per-step-vs-deferred divergence (per-step → 230, not 255),
+    inter mean-only saturation, an independent recompute sweep, and the
+    four error paths; plus 1 doc test. Total: 449 lib + 7 integration
+    + 14 doc = 470 (up from 438 + 7 + 13 = 458).
+
 - **Round 310 — SVQ3 chroma DC full dequantization pipeline.** Composes
   the three already-pinned chroma DC stages into the ordered pipeline the
   wiki spec mandates in `docs/video/svq3/wiki/Sorenson_Video_3.wiki`

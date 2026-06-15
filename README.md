@@ -25,11 +25,18 @@ the full reconstruction pipelines are wired. What is implemented:
   as bit-exact compile-time constants. L4 / L5 codebooks are
   architecturally absent (always subdivided) and modelled as such.
 * Mean-removal arithmetic (intra `u8` / inter `s9`, saturating).
+* The per-leaf stage-accumulation reconstruction (`reconstruct_leaf`):
+  the fixed-order `predictor → mean → stage-1 … stage-N` summation with
+  the `[0, 255]` clamp applied after every add, in output-raster order
+  (spec/04 §4.5 / §4.7.1). Verified bit-exact against the §4.8 worked
+  example (`mean=61`, two stages → `[55 39 50 77 / 93 81 49 46]`).
 
 The remaining SVQ1 gap is the intra-vs-inter / stage-vs-level
-interleave *within* the codebook payload, plus the mean / index VLC
-wire-up — both pending in `docs/video/svq1/`. Until they land, full
-plane reconstruction is blocked.
+interleave *within* the codebook payload (which fixes the byte offset
+of each `(level, half)` page the reconstructor reads), plus the
+stage-count / mean / index VLC wire-up — all pending in
+`docs/video/svq1/`. Until they land, full plane reconstruction is
+blocked on bitstream-driven field decode.
 
 ### SVQ3
 
