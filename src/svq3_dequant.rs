@@ -739,6 +739,92 @@ pub const fn apply_chroma_dc_2x2_2d(block: [i32; 4]) -> [i32; 4] {
     apply_chroma_dc_2x2_columns(apply_chroma_dc_2x2_rows(block))
 }
 
+/// Run the full chroma DC dequantization pipeline on a row-major 2×2 chroma
+/// DC block: **transform first, then per-sample dequantize, then finalise**.
+///
+/// The wiki spec's §"Macroblock transform and dequantization" pins this
+/// ordering explicitly. It gives the chroma DC dequantization expression
+///
+/// ```text
+///   dc = (svq3_dequant_coeff[Q] * (block[0] >> 3)) >> 1;
+/// ```
+///
+/// and immediately notes: "Please note that chroma DCs need to be
+/// **transformed first** using the following matrix" — the 2×2
+/// [`CHROMA_DC_TRANSFORM_MATRIX`] = `[[8, 8], [8, -8]]`. The shared
+/// dequantization formula (`out = (... + 0x80000) >> 20`) then finalises
+/// every coefficient.
+///
+/// This helper composes the three already-pinned stages in the order the
+/// spec mandates, introducing no new constant or arithmetic:
+///
+/// 1. [`apply_chroma_dc_2x2_2d`] applies the two-sided `M · X · M^T`
+///    transform to the input block (the "transformed first" step);
+/// 2. [`dequantize_chroma_dc`] applies `(svq3_dequant_coeff[Q] *
+///    (sample >> 3)) >> 1` to each transformed sample, where the spec's
+///    `block[0]` is the per-sample placeholder; and
+/// 3. [`finalise_dc`] applies the shared `(x + 0x80000) >> 20` rounding
+///    finalisation to each result.
+///
+/// The input `block` is laid out row-major (`block[0]` = `(0, 0)`,
+/// `block[1]` = `(0, 1)`, `block[2]` = `(1, 0)`, `block[3]` = `(1, 1)`);
+/// the returned `[i32; 4]` carries the four fully dequantized chroma DC
+/// values in the same layout, ready for the per-block reconstruction
+/// writeback.
+///
+/// The caller must ensure `q < DEQUANT_COEFF_TABLE_LEN`; this helper is
+/// `const fn` and so cannot validate the index dynamically.
+///
+/// # Panics
+///
+/// Panics if `q >= DEQUANT_COEFF_TABLE_LEN`. (`const fn` array index
+/// out-of-bounds is a compile-time error for static `q`, a runtime panic
+/// otherwise.)
+///
+/// # Examples
+///
+/// A pure-DC input block (only `(0, 0)` non-zero) transforms to four equal
+/// samples `8 * 8 * block[0]`, each of which is then dequantized and
+/// finalised identically:
+///
+/// ```
+/// use oxideav_svq::svq3_dequant::{
+///     apply_chroma_dc_2x2_2d, dequantize_chroma_dc, finalise_dc,
+///     dequantize_chroma_dc_block,
+/// };
+///
+/// let q = 12;
+/// let block = [1, 0, 0, 0];
+/// let out = dequantize_chroma_dc_block(q, block);
+///
+/// // Equivalent to the explicit stage-by-stage composition.
+/// let transformed = apply_chroma_dc_2x2_2d(block);
+/// let expected = [
+///     finalise_dc(dequantize_chroma_dc(q, transformed[0])),
+///     finalise_dc(dequantize_chroma_dc(q, transformed[1])),
+///     finalise_dc(dequantize_chroma_dc(q, transformed[2])),
+///     finalise_dc(dequantize_chroma_dc(q, transformed[3])),
+/// ];
+/// assert_eq!(out, expected);
+/// // All four are equal for a pure-DC input.
+/// assert_eq!(out[0], out[1]);
+/// assert_eq!(out[1], out[2]);
+/// assert_eq!(out[2], out[3]);
+/// ```
+#[inline]
+#[must_use]
+pub const fn dequantize_chroma_dc_block(q: u32, block: [i32; 4]) -> [i32; 4] {
+    // Stage 1: transform the 2×2 chroma DC block first (spec mandate).
+    let transformed = apply_chroma_dc_2x2_2d(block);
+    // Stages 2+3: per-sample chroma DC dequant, then shared finalisation.
+    [
+        finalise_dc(dequantize_chroma_dc(q, transformed[0])),
+        finalise_dc(dequantize_chroma_dc(q, transformed[1])),
+        finalise_dc(dequantize_chroma_dc(q, transformed[2])),
+        finalise_dc(dequantize_chroma_dc(q, transformed[3])),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1768,5 +1854,123 @@ mod tests {
     fn chroma_2d_const_evaluable_in_static_context() {
         const OUT: [i32; 4] = apply_chroma_dc_2x2_2d([1, 0, 0, 0]);
         assert_eq!(OUT, [64, 64, 64, 64]);
+    }
+
+    // --- chroma DC full pipeline (transform → dequant → finalise) ---
+
+    /// Independent re-derivation of the chroma DC pipeline: transform the
+    /// 2×2 block with the brute-force `M · X · M^T` reference, then apply
+    /// the spec's per-sample chroma DC dequant and the shared finalisation,
+    /// using none of the production helpers under test.
+    fn reference_chroma_dc_pipeline(q: u32, block: [i32; 4]) -> [i32; 4] {
+        let transformed = reference_chroma_2d(block);
+        let coeff = DEQUANT_COEFF_TABLE[q as usize] as i32;
+        let mut out = [0i32; 4];
+        let mut i = 0;
+        while i < 4 {
+            // (svq3_dequant_coeff[Q] * (sample >> 3)) >> 1
+            let dc = (coeff * (transformed[i] >> 3)) >> 1;
+            // shared finalisation (x + 0x80000) >> 20
+            out[i] = (dc + 0x80000) >> 20;
+            i += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn chroma_dc_block_matches_independent_reference() {
+        for q in [0u32, 1, 12, 24, 31] {
+            for block in [
+                [1, 0, 0, 0],
+                [1, 2, 3, 4],
+                [-3, 5, -7, 11],
+                [0, 0, 5, -5],
+                [127, -128, 64, -64],
+            ] {
+                assert_eq!(
+                    dequantize_chroma_dc_block(q, block),
+                    reference_chroma_dc_pipeline(q, block),
+                    "mismatch for q={q}, block={block:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chroma_dc_block_equals_explicit_staged_composition() {
+        // The helper must equal: transform (production 2d helper) → dequant
+        // each sample → finalise each sample, in that exact order.
+        for q in [0u32, 7, 31] {
+            for block in [[1, 2, 3, 4], [-9, 4, 6, -2], [100, -100, 50, -50]] {
+                let transformed = apply_chroma_dc_2x2_2d(block);
+                let expected = [
+                    finalise_dc(dequantize_chroma_dc(q, transformed[0])),
+                    finalise_dc(dequantize_chroma_dc(q, transformed[1])),
+                    finalise_dc(dequantize_chroma_dc(q, transformed[2])),
+                    finalise_dc(dequantize_chroma_dc(q, transformed[3])),
+                ];
+                assert_eq!(dequantize_chroma_dc_block(q, block), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn chroma_dc_block_pure_dc_yields_four_equal_samples() {
+        // A pure-DC input transforms to four equal samples, so the whole
+        // pipeline must produce four identical outputs regardless of Q.
+        for q in [0u32, 5, 18, 31] {
+            for v in [1i32, 7, 64, -64, 255, -255] {
+                let out = dequantize_chroma_dc_block(q, [v, 0, 0, 0]);
+                assert_eq!(out[0], out[1], "q={q}, v={v}");
+                assert_eq!(out[1], out[2], "q={q}, v={v}");
+                assert_eq!(out[2], out[3], "q={q}, v={v}");
+            }
+        }
+    }
+
+    #[test]
+    fn chroma_dc_block_transforms_before_dequantizing() {
+        // Order matters: dequantizing the raw (untransformed) block first
+        // and then transforming would generally differ from the spec order.
+        // Pick a block where the two orders diverge to lock the ordering in.
+        let q = 24;
+        let block = [37, -11, 5, 23];
+        let spec_order = dequantize_chroma_dc_block(q, block);
+
+        // Wrong order: dequant+finalise the raw samples, then transform.
+        let mut wrong = [0i32; 4];
+        let mut i = 0;
+        while i < 4 {
+            wrong[i] = finalise_dc(dequantize_chroma_dc(q, block[i]));
+            i += 1;
+        }
+        let wrong_then_transform = apply_chroma_dc_2x2_2d(wrong);
+
+        assert_ne!(
+            spec_order, wrong_then_transform,
+            "transform-first ordering is not observable on this fixture"
+        );
+    }
+
+    #[test]
+    fn chroma_dc_block_zero_input_is_zero() {
+        for q in [0u32, 15, 31] {
+            assert_eq!(dequantize_chroma_dc_block(q, [0, 0, 0, 0]), [0, 0, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn chroma_dc_block_const_evaluable_in_static_context() {
+        const OUT: [i32; 4] = dequantize_chroma_dc_block(12, [1, 0, 0, 0]);
+        // Pure-DC: all four equal.
+        assert_eq!(OUT[0], OUT[1]);
+        assert_eq!(OUT[1], OUT[2]);
+        assert_eq!(OUT[2], OUT[3]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn chroma_dc_block_panics_on_out_of_range_quantiser() {
+        let _ = dequantize_chroma_dc_block(DEQUANT_COEFF_TABLE_LEN as u32, [1, 2, 3, 4]);
     }
 }

@@ -8,6 +8,28 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 310 — SVQ3 chroma DC full dequantization pipeline.** Composes
+  the three already-pinned chroma DC stages into the ordered pipeline the
+  wiki spec mandates in `docs/video/svq3/wiki/Sorenson_Video_3.wiki`
+  §"Macroblock transform and dequantization", which gives the chroma DC
+  dequant expression `dc = (svq3_dequant_coeff[Q] * (block[0] >> 3)) >> 1`
+  and notes "chroma DCs need to be **transformed first** using the
+  [`8 8 / 8 -8`] matrix" — pinning the order transform → dequant →
+  finalise.
+  - New `svq3_dequant` helper:
+    - `dequantize_chroma_dc_block(q: u32, block: [i32; 4]) -> [i32; 4]`
+      `const fn` — chains `apply_chroma_dc_2x2_2d` (two-sided
+      `M · X · M^T` transform) → `dequantize_chroma_dc` (per transformed
+      sample) → `finalise_dc`, preserving the row-major 2×2 layout. No
+      new matrix, constant, or arithmetic is introduced; the composition
+      order is the spec's "first" mandate over already-pinned passes.
+  - 7 new lib tests (independent brute-force re-derivation, explicit
+    staged composition, pure-DC four-equal-outputs, transform-first
+    ordering divergence, zero-input, `const`-context evaluability,
+    out-of-range-quantiser panic) and 1 doc test. Total: 438 lib + 7
+    integration + 13 doc = 458 (up from 431 + 7 + 12 = 450).
+    `Svq3DecoderHandle::receive_frame` remains `Error::Unsupported`.
+
 - **Round 302 — SVQ1 within-half codebook-vector accessor.** Surfaces
   the canonical *within-half* vector addressing pinned by
   `docs/video/svq1/spec/14-codebook-architecture.md` §14.5 (the

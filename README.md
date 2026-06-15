@@ -5,6 +5,34 @@ Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 
 ## Status
 
+**Round 310 — SVQ3 chroma DC full dequantization pipeline.** Round 310
+composes the three already-pinned chroma DC stages into the ordered
+pipeline the wiki spec mandates in
+`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock transform and
+dequantization". That section gives the chroma DC dequant expression
+`dc = (svq3_dequant_coeff[Q] * (block[0] >> 3)) >> 1` and immediately
+notes "chroma DCs need to be **transformed first** using the [`8 8 / 8
+-8`] matrix" — pinning the order: transform first, then per-sample
+dequant, then the shared `(x + 0x80000) >> 20` finalisation. One new
+`const fn` helper `svq3_dequant::dequantize_chroma_dc_block(q: u32,
+block: [i32; 4]) -> [i32; 4]` chains the existing
+`apply_chroma_dc_2x2_2d` (two-sided `M · X · M^T` transform from round
+295) → `dequantize_chroma_dc` (per transformed sample) → `finalise_dc`,
+introducing no new matrix, constant, or arithmetic — the composition
+order is the spec's "first" mandate over already-pinned passes (the same
+shape as round 295's transform composition). The row-major 2×2 layout is
+preserved end to end so the four fully-dequantized chroma DC values feed
+the eventual per-block reconstruction writeback directly. New tests
+cross-check the helper against an independent brute-force re-derivation
+of the whole pipeline, against the explicit staged composition,
+corroborate that a pure-DC input yields four equal outputs, lock the
+transform-first ordering by showing it diverges from the wrong
+(dequant-then-transform) order on a chosen fixture, and verify the
+zero-input, `const`-context, and out-of-range-quantiser-panic paths.
+`Svq3DecoderHandle::receive_frame` continues to return
+`oxideav_core::Error::Unsupported`. Total tests: 438 lib + 7 integration
++ 13 doc = 458 (up from 431 + 7 + 12 = 450).
+
 **Round 302 — SVQ1 within-half codebook-vector accessor.** Round 302
 surfaces the canonical *within-half* vector addressing the SVQ1 cleanroom
 spec now pins in `docs/video/svq1/spec/14-codebook-architecture.md` §14.5
