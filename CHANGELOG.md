@@ -8,6 +8,25 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 320 — SVQ1 motion-vector median-of-three predictor.** New
+  `svq1_motion_predictor` module landing the per-block predictor of
+  `docs/video/svq1/spec/06-motion-vectors.md` §6.4: the
+  component-independent `MEDIAN(pl, pt, ptr)` (`median3`) over the
+  previous-left / previous-top / previous-top-right neighbour MVs,
+  the §6.4.2 absent-neighbour fallback (`(0,0)`-substituted median for
+  two present neighbours, single-vector verbatim short-circuit for one
+  present, `(0,0)` for none), and the §6.6 final-vector component clip
+  to `[-32, +31]` (`clip_component` / `final_motion_vector`). Pure
+  arithmetic — no `BitReader` use. The per-component differential VLC
+  (T02) decode is intentionally deferred: spec/06 §6.2.3 / §6.10
+  open-item 1 flags a bit-stream-affecting Reading A/B disambiguation
+  pending a Validator round, and the predictor + clip arithmetic wired
+  here is shared by both readings. New types `Svq1Mv` (signed half-pel
+  `(x, y)` pair, `ZERO` constant) and `Neighbours` (three optional
+  candidate vectors). Verified bit-exact against the §6.4.1 worked
+  example (`pl=(0,0), pt=(5,17), ptr=(-9,12) → predictor=(0,12)`) plus
+  tie / saturation / one-vs-two-present coverage (11 unit tests).
+
 - **Round 315 — SVQ1 leaf stage-accumulation reconstruction.** Composes
   the already-staged mean step (`svq1_mean`), within-half codebook lookup
   (`svq1_codebook::codebook_vector_in_half`), and per-step `[0, 255]`

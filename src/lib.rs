@@ -436,6 +436,7 @@ pub mod svq1_blocktree;
 pub mod svq1_codebook;
 pub mod svq1_helper_luts;
 pub mod svq1_mean;
+pub mod svq1_motion_predictor;
 pub mod svq1_reconstruct;
 pub mod svq1_stage_indices;
 pub mod svq3;

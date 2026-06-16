@@ -25,6 +25,17 @@ the full reconstruction pipelines are wired. What is implemented:
   as bit-exact compile-time constants. L4 / L5 codebooks are
   architecturally absent (always subdivided) and modelled as such.
 * Mean-removal arithmetic (intra `u8` / inter `s9`, saturating).
+* The inter motion-vector **median-of-three predictor**
+  (`svq1_motion_predictor`): the component-independent
+  `MEDIAN(pl, pt, ptr)` baseline with the absent-neighbour fallback
+  (one-present short-circuit, `(0,0)`-substituted median otherwise),
+  plus the `[-32, +31]` final-vector component clip (spec/06 §6.4 /
+  §6.6). Verified bit-exact against the §6.4.1 worked example
+  (`pl=(0,0), pt=(5,17), ptr=(-9,12) → predictor=(0,12)`). The
+  per-component differential VLC (T02) read is deferred: spec/06
+  §6.2.3 flags a bit-stream-affecting Reading A/B ambiguity pending a
+  Validator round, so only the unambiguous predictor + clip
+  arithmetic (shared by both readings) is wired.
 * The per-leaf stage-accumulation reconstruction (`reconstruct_leaf`):
   the fixed-order `predictor → mean → stage-1 … stage-N` summation with
   the `[0, 255]` clamp applied after every add, in output-raster order
@@ -34,8 +45,9 @@ the full reconstruction pipelines are wired. What is implemented:
 The remaining SVQ1 gap is the intra-vs-inter / stage-vs-level
 interleave *within* the codebook payload (which fixes the byte offset
 of each `(level, half)` page the reconstructor reads), plus the
-stage-count / mean / index VLC wire-up — all pending in
-`docs/video/svq1/`. Until they land, full plane reconstruction is
+stage-count / mean / index VLC wire-up, and the MV-component VLC
+(T02) whose Reading A/B disambiguation (spec/06 §6.2.3) awaits a
+Validator round. Until they land, full plane reconstruction is
 blocked on bitstream-driven field decode.
 
 ### SVQ3
