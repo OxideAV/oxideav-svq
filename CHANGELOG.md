@@ -8,6 +8,31 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 326 — SVQ1 motion-vector cache + neighbour-selection
+  geometry.** New `svq1_mv_cache` module landing the per-plane MV cache
+  of `docs/video/svq1/spec/06-motion-vectors.md` §6.8 and the
+  neighbour-selection geometry of §6.4.3 (INTER, single MV) / §6.4.4
+  (INTER_4MV, per-sub-block), the caller-side counterpart of the §6.4
+  median predictor (which takes the three candidate neighbours but
+  leaves their selection + storage to the caller). `Svq1MvCache` is a
+  `(mb_cols × 2) × (mb_rows × 2)` grid of 8×8-block MVs (the §6.1.1
+  granularity invariant), initialised to `(0, 0)` (§6.8.1) with a
+  single-frame lifetime (§6.8.2). `inter_neighbours` selects
+  `{pl=(r,c−1), pt=(r−2,c), ptr=(r−2,c+2)}` reproducing the wiki grid
+  `[1 2 / 3 4]` → `{N, C, E}`; `inter_4mv_neighbours` selects the four
+  per-sub-block triples of the §6.4.4 table (including the §6.4.4 note
+  that sub-blocks 3/4 use within-MB top-left vectors as `ptr`).
+  `decode_inter` / `decode_inter_4mv` compose the predictor + §6.6 clip
+  + §6.8.1 cache update; the INTER_4MV path is strictly serial (§6.4.5,
+  sub-block N reads sub-blocks `< N`). `store_inter` broadcasts to all
+  four slots, `store_skip_intra` applies the §6.9 `(0,0)` reset. Out-of-
+  bounds `get` is an **absent** neighbour (§6.4.2), distinct from an
+  in-bounds `(0,0)` slot. Pure indexing + storage — no `BitReader` use;
+  the differential `(dx, dy)` (the §6.2.3 Reading A/B-ambiguous T02 wire
+  decode) is caller-supplied. Verified against the wiki grid positions,
+  the §6.4.1 worked example through the cache path, and serial INTER_4MV
+  propagation (14 unit tests).
+
 - **Round 320 — SVQ1 motion-vector median-of-three predictor.** New
   `svq1_motion_predictor` module landing the per-block predictor of
   `docs/video/svq1/spec/06-motion-vectors.md` §6.4: the

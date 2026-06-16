@@ -36,6 +36,18 @@ the full reconstruction pipelines are wired. What is implemented:
   §6.2.3 flags a bit-stream-affecting Reading A/B ambiguity pending a
   Validator round, so only the unambiguous predictor + clip
   arithmetic (shared by both readings) is wired.
+* The per-plane **motion-vector cache + neighbour-selection geometry**
+  (`svq1_mv_cache`): the `(mb_cols × 2) × (mb_rows × 2)` grid of 8×8
+  block MVs (spec/06 §6.8 / §6.1.1 granularity invariant), the INTER
+  single-MV neighbour triple `{pl=(r,c−1), pt=(r−2,c), ptr=(r−2,c+2)}`
+  (§6.4.3, reproducing the wiki grid `[1 2 / 3 4] → {N, C, E}`), the
+  four per-sub-block INTER_4MV triples of §6.4.4 (with the within-MB
+  top-left-as-`ptr` deviation for sub-blocks 3/4), the strictly-serial
+  §6.4.5 INTER_4MV decode, and the §6.8.1 / §6.9 cache-update + SKIP /
+  INTRA `(0,0)` reset rules. Out-of-bounds lookups are *absent*
+  neighbours (§6.4.2), distinct from in-bounds `(0,0)` slots. Pure
+  indexing + storage feeding `svq1_motion_predictor`; the differential
+  `(dx, dy)` remains caller-supplied (the deferred T02 wire decode).
 * The per-leaf stage-accumulation reconstruction (`reconstruct_leaf`):
   the fixed-order `predictor → mean → stage-1 … stage-N` summation with
   the `[0, 255]` clamp applied after every add, in output-raster order
@@ -47,8 +59,12 @@ interleave *within* the codebook payload (which fixes the byte offset
 of each `(level, half)` page the reconstructor reads), plus the
 stage-count / mean / index VLC wire-up, and the MV-component VLC
 (T02) whose Reading A/B disambiguation (spec/06 §6.2.3) awaits a
-Validator round. Until they land, full plane reconstruction is
-blocked on bitstream-driven field decode.
+Validator round. The inter MV path now has its predictor (§6.4),
+final-vector clip (§6.6), per-plane cache (§6.8) and INTER /
+INTER_4MV neighbour-selection geometry (§6.4.3 / §6.4.4) wired; only
+the T02 differential wire decode and the half-pel reference sampling
+(§6.5, de-facto only) remain. Until the deferred field decodes land,
+full plane reconstruction is blocked on bitstream-driven field decode.
 
 ### SVQ3
 
