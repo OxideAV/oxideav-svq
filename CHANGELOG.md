@@ -8,6 +8,26 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 331 — SVQ3 4×4 scan-order arrays + selection rule.** Lands
+  the two 16-entry 4×4 coefficient scan tables that round 233 had
+  deferred for lack of a pinned source: `NORMAL_ZIGZAG_4X4_SCAN`
+  (`0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15`) and
+  `ALT_SCAN_4X4_SCAN`
+  (`0, 1, 2, 6, 10, 3, 7, 11, 4, 8, 5, 9, 12, 13, 14, 15`),
+  transcribed bit-exact from
+  `docs/video/svq3/spec/01-reconstruction-composition.md` Gap 1 (the
+  Sorenson Video QuickTime Component `.data` tables at file offsets
+  `0x7e5a8` / `0x7e5b8`). Adds the quantiser-driven selection helper
+  `select_4x4_scan` (alt-scan only for a luma 4×4-intra block at
+  slice quantiser `< 24`, threshold `ALT_SCAN_QUANTISER_THRESHOLD`),
+  the `ALT_SCAN_4X4_HALF_LEN = 8` two-half marker (wiki §"Macroblock
+  layer" cross-check), and the `place_4x4_normal_zigzag` /
+  `place_4x4_alt_scan` / `place_4x4` convenience wrappers over the
+  existing generic `place_coefficients_in_scan_order`. 11 new unit
+  tests assert the bit-exact byte values, full-permutation /
+  DC-first invariants, the two-half split, the selection boundary at
+  `Q == 24`, and the placement routing.
+
 - **Round 326 — SVQ1 motion-vector cache + neighbour-selection
   geometry.** New `svq1_mv_cache` module landing the per-plane MV cache
   of `docs/video/svq1/spec/06-motion-vectors.md` §6.8 and the

@@ -29,18 +29,20 @@
 //!   placement order — this is the only ambiguity-free 2×2 scan and is
 //!   what the chroma DC `(run, value)` walker emits.
 //!
-//! * **4×4 alt-scan ("Dezigzag pattern (from H.264)" picture)** — the
-//!   wiki spec depicts a 16-position scan order in §"Macroblock layer"
-//!   as ASCII art. The picture has two recognised-ambiguous
-//!   characteristics (see "Open work" below) so round 233 does **not**
-//!   transcribe the 4×4 scan-order array. The infrastructure
-//!   [`place_coefficients_in_scan_order`] can consume it once the array
-//!   is pinned by a future docs round.
-//!
-//! * **4×4 normal-zigzag (default case)** — the wiki spec mentions
-//!   "normal zigzag is used" in §"Macroblock layer" but does not depict
-//!   a scan-order picture for this case. Round 233 does **not**
-//!   transcribe a 4×4 normal-zigzag array.
+//! * **4×4 normal-zigzag (default case)** and **4×4 alt-scan** — both
+//!   16-position scan arrays are now pinned by
+//!   `docs/video/svq3/spec/01-reconstruction-composition.md` Gap 1,
+//!   which recovers them as two adjacent live tables in the Sorenson
+//!   Video QuickTime Component's `.data` segment (file offsets
+//!   `0x7e5a8` / `0x7e5b8`), cross-checked against the wiki's
+//!   §"Macroblock layer" two-half alt-scan structure. They land here as
+//!   [`NORMAL_ZIGZAG_4X4_SCAN`] / [`ALT_SCAN_4X4_SCAN`], consumed via
+//!   [`place_coefficients_in_scan_order`] (or the
+//!   [`place_4x4_normal_zigzag`] / [`place_4x4_alt_scan`] /
+//!   [`place_4x4`] wrappers). Per spec/01 Gap 1 the alt-scan is selected
+//!   **only for a luma 4×4-intra block when the slice quantiser is < 24**
+//!   ([`select_4x4_scan`]); every other 4×4 block uses the normal
+//!   zigzag.
 //!
 //! ## Placement contract
 //!
@@ -61,21 +63,10 @@
 //!
 //! ## Open work
 //!
-//! * The wiki's §"Macroblock layer" "Dezigzag pattern (from H.264)"
-//!   ASCII art has two unresolved characteristics: (a) the picture's
-//!   row-0 horizontal arrows connect three adjacent positions
-//!   `(0,0)→(0,1)→(0,2)`, which is not the H.264 frame-zigzag opening
-//!   triple `(0,0)→(0,1)→(1,0)` and is also not the H.264 alt-scan
-//!   opening triple `(0,0)→(1,0)→(0,1)`; (b) the wiki text uses "normal
-//!   zigzag" as the not-this-picture case without depicting a second
-//!   pattern. Round 233 surfaces the placement infrastructure and the
-//!   unambiguous chroma DC 2×2 scan; the 4×4 scan-order arrays for
-//!   both alt-scan and normal-zigzag cases are deferred to the round
-//!   that pins their canonical interpretation in `docs/video/svq3/`.
-//!
-//! * Round 233 does NOT wire the placement output into
-//!   [`crate::svq3_dequant`] — the dezigzag step's caller will perform
-//!   that wiring once the 4×4 scan-order arrays land.
+//! * The placement output is still not wired into
+//!   [`crate::svq3_dequant`] — the per-block caller will perform that
+//!   wiring (and the 2D reshape) once the macroblock decode loop that
+//!   drives both is assembled.
 
 use crate::svq3_coeff::Coefficient;
 
@@ -93,6 +84,76 @@ pub const CHROMA_DC_2X2_LEN: usize = 4;
 /// as a placement-side capacity constant for consistency with
 /// [`CHROMA_DC_2X2_LEN`].
 pub const FULL_4X4_LEN: usize = 16;
+
+/// 4×4 **normal-zigzag** scan order (the default case).
+///
+/// Pinned by `docs/video/svq3/spec/01-reconstruction-composition.md`
+/// Gap 1, which recovers it as a live 16-byte table in the Sorenson
+/// Video QuickTime Component's `.data` segment (file offset `0x7e5a8` /
+/// VA `0x67dee5a8`), dereferenced directly inside the dequant/reorder
+/// routine. Each entry is the **destination 4×4 raster index**
+/// (`row * 4 + col`) for the n-th decoded coefficient. This is the
+/// default reorder map; the [`ALT_SCAN_4X4_SCAN`] is used only for the
+/// luma-4×4-intra-low-quantiser case (see [`select_4x4_scan`]).
+pub const NORMAL_ZIGZAG_4X4_SCAN: [usize; FULL_4X4_LEN] =
+    [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
+
+/// 4×4 **alternate-scan** order.
+///
+/// Pinned by `docs/video/svq3/spec/01-reconstruction-composition.md`
+/// Gap 1, recovered as the table adjacent to [`NORMAL_ZIGZAG_4X4_SCAN`]
+/// in the same `.data` segment (file offset `0x7e5b8` / VA
+/// `0x67dee5b8`), passed by pointer into the coefficient reader and
+/// selected conditionally. Each entry is the **destination 4×4 raster
+/// index** (`row * 4 + col`) for the n-th decoded coefficient.
+///
+/// The wiki §"Macroblock layer" notes the alt-scan block is "coded in
+/// two parts of up to eight coefficients corresponding to each
+/// half-scan"; this array splits exactly into two 8-entry halves
+/// (`[0, 1, 2, 6, 10, 3, 7, 11]` then `[4, 8, 5, 9, 12, 13, 14, 15]`),
+/// confirming the two-half structure ([`ALT_SCAN_4X4_HALF_LEN`]).
+pub const ALT_SCAN_4X4_SCAN: [usize; FULL_4X4_LEN] =
+    [0, 1, 2, 6, 10, 3, 7, 11, 4, 8, 5, 9, 12, 13, 14, 15];
+
+/// Number of coefficients in each half-scan of the 4×4 alternate scan.
+///
+/// Per the wiki §"Macroblock layer" the alt-scan block is coded in two
+/// parts of up to eight coefficients; [`ALT_SCAN_4X4_SCAN`] splits at
+/// this length into its two recognised halves.
+pub const ALT_SCAN_4X4_HALF_LEN: usize = 8;
+
+/// Quantiser threshold below which the luma-4×4-intra alternate scan is
+/// selected.
+///
+/// Per `docs/video/svq3/spec/01-reconstruction-composition.md` Gap 1,
+/// the alternate scan ([`ALT_SCAN_4X4_SCAN`]) is used **only for luma
+/// blocks in a 4×4-intra macroblock when the slice quantiser is
+/// `< 24`**; otherwise the normal zigzag ([`NORMAL_ZIGZAG_4X4_SCAN`]) is
+/// used. See [`select_4x4_scan`].
+pub const ALT_SCAN_QUANTISER_THRESHOLD: u32 = 24;
+
+/// Select the 4×4 coefficient scan order for a luma block.
+///
+/// Per `docs/video/svq3/spec/01-reconstruction-composition.md` Gap 1,
+/// the alternate scan is used **only** when the block is a luma block of
+/// a 4×4-intra macroblock *and* the slice quantiser is strictly below
+/// [`ALT_SCAN_QUANTISER_THRESHOLD`] (`< 24`). Every other case — inter
+/// blocks, 16×16-intra blocks, chroma AC blocks, or any block at
+/// `quantiser >= 24` — uses the normal zigzag.
+///
+/// * `is_luma_4x4_intra` — the block belongs to a 4×4-intra MB's luma
+///   plane (the only regime where the alt-scan applies).
+/// * `quantiser` — the slice quantiser `Q`.
+pub const fn select_4x4_scan(
+    is_luma_4x4_intra: bool,
+    quantiser: u32,
+) -> &'static [usize; FULL_4X4_LEN] {
+    if is_luma_4x4_intra && quantiser < ALT_SCAN_QUANTISER_THRESHOLD {
+        &ALT_SCAN_4X4_SCAN
+    } else {
+        &NORMAL_ZIGZAG_4X4_SCAN
+    }
+}
 
 /// 2×2 chroma DC scan order — row-major.
 ///
@@ -260,6 +321,45 @@ pub fn place_coefficients_in_scan_order<const DEST_LEN: usize>(
 /// [`crate::svq3_dequant::CHROMA_DC_TRANSFORM_MATRIX`] application.
 pub fn place_chroma_dc_2x2(coeffs: &[Coefficient]) -> Result<[i32; CHROMA_DC_2X2_LEN], ScanError> {
     place_coefficients_in_scan_order::<CHROMA_DC_2X2_LEN>(coeffs, &CHROMA_DC_2X2_SCAN)
+}
+
+/// Place a 4×4 coefficient stream into a 16-entry flat block using the
+/// **normal-zigzag** scan ([`NORMAL_ZIGZAG_4X4_SCAN`]).
+///
+/// Convenience wrapper around [`place_coefficients_in_scan_order`]. The
+/// returned block is in 4×4 row-major order (so `block[r * 4 + c]` is
+/// the coefficient at matrix position `(r, c)`), ready for the
+/// [`crate::svq3_dequant`] per-coefficient dequant.
+pub fn place_4x4_normal_zigzag(coeffs: &[Coefficient]) -> Result<[i32; FULL_4X4_LEN], ScanError> {
+    place_coefficients_in_scan_order::<FULL_4X4_LEN>(coeffs, &NORMAL_ZIGZAG_4X4_SCAN)
+}
+
+/// Place a 4×4 coefficient stream into a 16-entry flat block using the
+/// **alternate scan** ([`ALT_SCAN_4X4_SCAN`]).
+///
+/// Convenience wrapper around [`place_coefficients_in_scan_order`]. The
+/// returned block is in 4×4 row-major order. Per spec/01 Gap 1 this scan
+/// is only correct for a luma block of a 4×4-intra MB at quantiser
+/// `< 24`; use [`select_4x4_scan`] / [`place_4x4`] to apply the
+/// selection rule.
+pub fn place_4x4_alt_scan(coeffs: &[Coefficient]) -> Result<[i32; FULL_4X4_LEN], ScanError> {
+    place_coefficients_in_scan_order::<FULL_4X4_LEN>(coeffs, &ALT_SCAN_4X4_SCAN)
+}
+
+/// Place a 4×4 coefficient stream, selecting the scan order per the
+/// spec/01 Gap 1 rule.
+///
+/// Picks [`ALT_SCAN_4X4_SCAN`] when `is_luma_4x4_intra && quantiser < 24`
+/// (see [`select_4x4_scan`]) and [`NORMAL_ZIGZAG_4X4_SCAN`] otherwise,
+/// then walks the `(run, value)` stream into a 16-entry 4×4 row-major
+/// block.
+pub fn place_4x4(
+    coeffs: &[Coefficient],
+    is_luma_4x4_intra: bool,
+    quantiser: u32,
+) -> Result<[i32; FULL_4X4_LEN], ScanError> {
+    let scan = select_4x4_scan(is_luma_4x4_intra, quantiser);
+    place_coefficients_in_scan_order::<FULL_4X4_LEN>(coeffs, scan)
 }
 
 #[cfg(test)]
@@ -504,6 +604,144 @@ mod tests {
     }
 
     // ---- Error Display sanity -----------------------------------------
+
+    // ---- 4×4 scan-order arrays (spec/01 Gap 1) ------------------------
+
+    #[test]
+    fn normal_zigzag_4x4_matches_spec_bytes() {
+        // docs/video/svq3/spec/01-reconstruction-composition.md Gap 1,
+        // file offset 0x7e5a8.
+        assert_eq!(
+            NORMAL_ZIGZAG_4X4_SCAN,
+            [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15]
+        );
+    }
+
+    #[test]
+    fn alt_scan_4x4_matches_spec_bytes() {
+        // docs/video/svq3/spec/01-reconstruction-composition.md Gap 1,
+        // file offset 0x7e5b8.
+        assert_eq!(
+            ALT_SCAN_4X4_SCAN,
+            [0, 1, 2, 6, 10, 3, 7, 11, 4, 8, 5, 9, 12, 13, 14, 15]
+        );
+    }
+
+    #[test]
+    fn both_4x4_scans_are_full_permutations() {
+        for scan in [&NORMAL_ZIGZAG_4X4_SCAN, &ALT_SCAN_4X4_SCAN] {
+            assert_eq!(scan.len(), FULL_4X4_LEN);
+            let mut seen = [false; FULL_4X4_LEN];
+            for &entry in scan.iter() {
+                assert!(entry < FULL_4X4_LEN, "entry {entry} out of range");
+                assert!(!seen[entry], "entry {entry} seen twice");
+                seen[entry] = true;
+            }
+            assert!(seen.iter().all(|&b| b), "scan missed a position");
+        }
+    }
+
+    #[test]
+    fn both_4x4_scans_start_at_dc() {
+        // The DC coefficient (raster index 0) must be the first decoded
+        // position in either scan.
+        assert_eq!(NORMAL_ZIGZAG_4X4_SCAN[0], 0);
+        assert_eq!(ALT_SCAN_4X4_SCAN[0], 0);
+    }
+
+    #[test]
+    fn alt_scan_splits_into_two_recognised_halves() {
+        // Per the wiki §"Macroblock layer" two-half structure, the
+        // alt-scan is coded in two parts of up to eight coefficients.
+        assert_eq!(ALT_SCAN_4X4_HALF_LEN, 8);
+        let (first, second) = ALT_SCAN_4X4_SCAN.split_at(ALT_SCAN_4X4_HALF_LEN);
+        assert_eq!(first, [0, 1, 2, 6, 10, 3, 7, 11]);
+        assert_eq!(second, [4, 8, 5, 9, 12, 13, 14, 15]);
+    }
+
+    #[test]
+    fn the_two_4x4_scans_differ() {
+        // Confirms we transcribed two distinct tables, not the same one.
+        assert_ne!(NORMAL_ZIGZAG_4X4_SCAN, ALT_SCAN_4X4_SCAN);
+    }
+
+    // ---- 4×4 scan selection rule (spec/01 Gap 1) ----------------------
+
+    #[test]
+    fn select_4x4_uses_alt_scan_only_for_luma_4x4_intra_below_threshold() {
+        assert_eq!(ALT_SCAN_QUANTISER_THRESHOLD, 24);
+        // luma 4×4-intra, Q < 24 → alt-scan.
+        assert_eq!(select_4x4_scan(true, 0), &ALT_SCAN_4X4_SCAN);
+        assert_eq!(select_4x4_scan(true, 23), &ALT_SCAN_4X4_SCAN);
+        // boundary: Q == 24 → normal zigzag.
+        assert_eq!(select_4x4_scan(true, 24), &NORMAL_ZIGZAG_4X4_SCAN);
+        // Q > 24 → normal zigzag.
+        assert_eq!(select_4x4_scan(true, 31), &NORMAL_ZIGZAG_4X4_SCAN);
+        // not luma-4×4-intra (e.g. inter / 16×16-intra / chroma AC) →
+        // normal zigzag regardless of quantiser.
+        assert_eq!(select_4x4_scan(false, 0), &NORMAL_ZIGZAG_4X4_SCAN);
+        assert_eq!(select_4x4_scan(false, 23), &NORMAL_ZIGZAG_4X4_SCAN);
+    }
+
+    // ---- 4×4 placement wrappers ---------------------------------------
+
+    #[test]
+    fn place_4x4_normal_zigzag_places_dc_then_first_ac() {
+        // Two run=0 coeffs land at scan positions 0 and 1 → raster
+        // indices NORMAL_ZIGZAG[0]=0 and NORMAL_ZIGZAG[1]=1.
+        let block = place_4x4_normal_zigzag(&[
+            Coefficient { run: 0, value: 9 },
+            Coefficient { run: 0, value: 4 },
+        ])
+        .unwrap();
+        let mut expected = [0i32; FULL_4X4_LEN];
+        expected[0] = 9;
+        expected[1] = 4;
+        assert_eq!(block, expected);
+    }
+
+    #[test]
+    fn place_4x4_alt_scan_routes_third_coefficient_to_raster_index_2() {
+        // Scan positions 0,1,2 in alt-scan map to raster 0,1,2.
+        // A run=2 on the first coeff places it at scan position 2 →
+        // ALT_SCAN[2] = 2.
+        let block = place_4x4_alt_scan(&[Coefficient { run: 2, value: 5 }]).unwrap();
+        let mut expected = [0i32; FULL_4X4_LEN];
+        expected[ALT_SCAN_4X4_SCAN[2]] = 5;
+        assert_eq!(block, expected);
+        assert_eq!(block[2], 5);
+    }
+
+    #[test]
+    fn place_4x4_dispatches_on_selection_rule() {
+        let coeffs = [Coefficient { run: 5, value: 11 }];
+        // luma 4×4-intra, Q=10 → alt-scan, scan pos 5 → ALT_SCAN[5]=3.
+        let alt = place_4x4(&coeffs, true, 10).unwrap();
+        assert_eq!(alt[ALT_SCAN_4X4_SCAN[5]], 11);
+        assert_eq!(alt, place_4x4_alt_scan(&coeffs).unwrap());
+        // same block at Q=24 → normal zigzag, scan pos 5 → ZIGZAG[5]=2.
+        let zig = place_4x4(&coeffs, true, 24).unwrap();
+        assert_eq!(zig[NORMAL_ZIGZAG_4X4_SCAN[5]], 11);
+        assert_eq!(zig, place_4x4_normal_zigzag(&coeffs).unwrap());
+        // the two routings differ for this coefficient.
+        assert_ne!(alt, zig);
+    }
+
+    #[test]
+    fn place_4x4_full_block_normal_zigzag_is_scan_permutation() {
+        // Sixteen run=0 coeffs with value = scan-position fill every
+        // raster cell with its inverse-permuted scan position.
+        let coeffs: Vec<Coefficient> = (0..FULL_4X4_LEN as i32)
+            .map(|v| Coefficient {
+                run: 0,
+                value: v + 1,
+            })
+            .collect();
+        let block = place_4x4_normal_zigzag(&coeffs).unwrap();
+        for (scan_pos, &raster) in NORMAL_ZIGZAG_4X4_SCAN.iter().enumerate() {
+            assert_eq!(block[raster], scan_pos as i32 + 1);
+        }
+    }
 
     #[test]
     fn scan_error_display_messages_mention_module_prefix() {

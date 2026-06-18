@@ -72,16 +72,24 @@ full plane reconstruction is blocked on bitstream-driven field decode.
   reversed), macroblock-type tree walk, and the Golomb-coded
   `(run, value)` residual coefficient walkers (chroma-DC, alt-scan,
   normal-scan).
-* Per-block coefficient placement (2×2 chroma DC scan order),
-  dequantization arithmetic (luma / chroma-DC transform matrices,
+* Per-block coefficient placement: the 2×2 chroma DC scan order plus
+  both 4×4 scan-order arrays — the normal zigzag
+  (`NORMAL_ZIGZAG_4X4_SCAN`) and the alternate scan
+  (`ALT_SCAN_4X4_SCAN`), transcribed bit-exact from the
+  `docs/video/svq3/spec/01` Gap 1 binary tables (`.data` offsets
+  `0x7e5a8` / `0x7e5b8`), with the quantiser-driven selection rule
+  (`select_4x4_scan`: alt-scan only for a luma 4×4-intra block at
+  quantiser `< 24`) and the `place_4x4*` wrappers. The alt-scan's
+  two-half (8 + 8) structure is asserted against the wiki cross-check.
+* Dequantization arithmetic (luma / chroma-DC transform matrices,
   the per-quantiser scale table, the dequant expressions), the
   two-sided `M·X·Mᵀ` transform composition, thirdpel motion-compensation
   interpolation, and the 4×4 diagonal-down intra predictor.
 
-The remaining SVQ3 gaps — the 4×4 scan-order arrays, the
-mode-to-predictor binding, the other intra predictors, the
-motion-vector-component VLC, CBP coding, and the IDCT writeback — await
-pinning in `docs/video/svq3/`.
+The remaining SVQ3 gaps — the mode-to-predictor binding, the other
+intra predictors, the motion-vector-component VLC, CBP coding, and the
+IDCT writeback — await pinning in `docs/video/svq3/`. The 4×4
+scan-order arrays are now pinned (spec/01 Gap 1).
 
 ## Cargo features
 
