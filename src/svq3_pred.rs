@@ -347,9 +347,9 @@ impl Svq3IntraMode {
     pub const DEFAULT: Self = Self::Dc;
 
     /// Map the resolved wire value (`0..=4`) to the typed mode. Returns
-    /// [`Error::BadBitWidth`] for values outside `0..=4` (the SVQ3 4×4
-    /// intra-mode space, per spec/01 Gap 3 + the wiki `pred_table`
-    /// range).
+    /// [`crate::Error::BadBitWidth`] for values outside `0..=4` (the
+    /// SVQ3 4×4 intra-mode space, per spec/01 Gap 3 + the wiki
+    /// `pred_table` range).
     pub const fn from_value(value: u8) -> crate::Result<Self> {
         match value {
             0 => Ok(Self::Vertical),

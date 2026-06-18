@@ -8,6 +8,28 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 339 — SVQ3 macroblock-level intra predictor-selection loop
+  (`svq3_recon`).** Assembles the leaf primitives into the
+  macroblock-level reconstruction loop the README named as the open
+  lacks-tail. `reconstruct_intra_luma_macroblock` walks the 16 luma
+  4×4 sub-blocks of a `LumaMacroblock` carrier in the wiki's documented
+  processing order (`svq3_mb::INTRA_4X4_SCAN_ORDER`, with the spatial
+  layout in the new `LUMA_BLOCK_GRID_POS` index→cell map derived from
+  the same wiki picture), assembles each sub-block's neighbours
+  (top row + left column + corner, with macroblock-edge availability)
+  from the running reconstructed plane — including the out-of-MB
+  `above` / `leftcol` neighbour rows the carrier holds — selects +
+  applies the predictor via `predict_intra_4x4`, and composes the
+  caller-supplied residual block via Gap 5's `Clip1(pred + residual)`
+  writeback. The loop is residual-provider-driven: the residual
+  pipeline (dequant · `M·X·Mᵀ` · fused `>>20`, spec/01 Gap 2) stays a
+  deferred docs-gap because Gap 2 does not pin the exact
+  dequant-multiply / transform interleave as a per-element formula. 11
+  new unit tests cover the grid-position inversion, neighbour assembly
+  for interior / top-left / edge sub-blocks, the scan-order dependency
+  sequencing, and end-to-end flat-DC / vertical / horizontal /
+  residual-add macroblock reconstruction.
+
 - **Round 339 — SVQ3 16×16 plane (transposed) + 8×8 chroma DC
   predictors (spec/01 Gap 4).** Lands the two H.264-back-referenced
   predictors whose decode-side sample equations

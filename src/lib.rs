@@ -1,5 +1,48 @@
 //! Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec.
 //!
+//! **Round 339 — SVQ3 macroblock-level intra predictor-selection loop.**
+//!
+//! Round 339 closes the SVQ3 intra-reconstruction lacks-tail the README
+//! named ("the mode-to-predictor binding, the other intra predictors …
+//! await assembly into the macroblock loop"). Three layers land:
+//!
+//! 1. The **mode-to-predictor binding** + the standard-H.264 4×4
+//!    predictors `docs/video/svq3/spec/01-reconstruction-composition.md`
+//!    Gap 3 names — [`svq3_pred::Svq3IntraMode`] (the value↔mode table
+//!    `0=Vertical / 1=Horizontal / 2=DC / 3=DiagonalDownLeft /
+//!    4=DiagonalDownRight`, default DC), the
+//!    [`svq3_pred::predict_vertical_4x4`] /
+//!    [`svq3_pred::predict_horizontal_4x4`] / [`svq3_pred::predict_dc_4x4`]
+//!    / [`svq3_pred::predict_diagonal_down_right_4x4`] predictors over an
+//!    [`svq3_pred::Intra4x4Neighbours`] carrier, and the
+//!    [`svq3_pred::predict_intra_4x4`] dispatcher with standard-H.264 DC
+//!    fallback.
+//! 2. The **16×16 plane (transposed) + 8×8 chroma DC** predictors Gap 4
+//!    pins — [`svq3_pred::predict_plane_16x16`] (SVQ3's transposed plane
+//!    fit), [`svq3_pred::predict_dc_16x16`], and
+//!    [`svq3_pred::predict_chroma_dc_8x8`] (chroma "DC mode only" with
+//!    per-quadrant availability averaging).
+//! 3. The **macroblock-level predictor-selection loop** itself — the new
+//!    [`svq3_recon`] module: [`svq3_recon::reconstruct_intra_luma_macroblock`]
+//!    walks the 16 luma 4×4 sub-blocks in the wiki's documented
+//!    processing order ([`svq3_mb::INTRA_4X4_SCAN_ORDER`] /
+//!    [`svq3_recon::LUMA_BLOCK_GRID_POS`]), assembles each sub-block's
+//!    neighbours from the running reconstructed plane (the
+//!    [`svq3_recon::LumaMacroblock`] carrier with out-of-MB neighbour
+//!    rows), selects + applies the predictor, and composes the
+//!    caller-supplied residual via Gap 5's `Clip1(pred + residual)`.
+//!
+//! The loop is residual-provider-driven: the residual pipeline (dequant
+//! · `M·X·Mᵀ` transform · fused shift, Gap 2) is left a deferred
+//! docs-gap because Gap 2 does not give the exact dequant-multiply /
+//! transform interleave as a per-element formula. Inter macroblocks,
+//! CBP-driven residual presence, and the intra-mode VLC wire decode stay
+//! gated on their own docs gaps. `Svq3DecoderHandle::receive_frame`
+//! continues to return `oxideav_core::Error::Unsupported` until the
+//! residual pipeline + bitstream-driven mode/CBP decode land.
+//!
+//! ## Earlier rounds (carried forward)
+//!
 //! **Round 282 — SVQ3 4×4 diagonal-down intra predictor.**
 //!
 //! Round 282 lands the one intra predictor the wiki spec pins
@@ -446,6 +489,7 @@ pub mod svq3_dequant;
 pub mod svq3_mb;
 pub mod svq3_mc;
 pub mod svq3_pred;
+pub mod svq3_recon;
 pub mod svq3_scan;
 
 #[cfg(feature = "registry")]
