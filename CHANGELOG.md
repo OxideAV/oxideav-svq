@@ -8,6 +8,25 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 339 — SVQ3 16×16 plane (transposed) + 8×8 chroma DC
+  predictors (spec/01 Gap 4).** Lands the two H.264-back-referenced
+  predictors whose decode-side sample equations
+  `docs/video/svq3/spec/01-reconstruction-composition.md` Gap 4 now
+  pins. `predict_plane_16x16` implements the standard H.264 16×16
+  plane fit (`H`/`V`/`a`/`b`/`c` from `top[]`/`left[]`, constants
+  `5`/`32`/`>>6`/`16`/`>>5`) with SVQ3's documented **transpose**
+  (`b` applied along `y`, `c` along `x`) and the 8-bit `Clip1`
+  writeback. `predict_chroma_dc_8x8` implements Gap 4's chroma "DC
+  mode only" rule with the per-4×4-quadrant availability-driven
+  averaging (`(Σtop+Σleft+4)>>3` / `(Σ+2)>>2` / `128`). The companion
+  `predict_dc_16x16` 16×16 DC predictor covers the macroblock-edge
+  fallback where the plane predictor's neighbours are not both
+  available. `PRED_16X16_DIM`/`_SAMPLES` and
+  `PRED_CHROMA_DIM`/`_SAMPLES` surface the block geometries. 10 new
+  unit tests cover uniform-neighbour reproduction, the transpose
+  axis-assignment, the DC availability cases, and per-quadrant chroma
+  DC independence.
+
 - **Round 339 — SVQ3 4×4 intra-mode binding + the standard-H.264
   predictors.** Lands the four 4×4 intra predictors `docs/video/svq3/
   spec/01-reconstruction-composition.md` Gap 3 names as "standard

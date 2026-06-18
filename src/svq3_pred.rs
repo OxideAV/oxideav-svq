@@ -620,6 +620,201 @@ pub const fn predict_intra_4x4(
     }
 }
 
+/// Width / height of a 16×16 luma macroblock prediction block.
+pub const PRED_16X16_DIM: usize = 16;
+
+/// Number of samples in one 16×16 predicted block.
+pub const PRED_16X16_SAMPLES: usize = PRED_16X16_DIM * PRED_16X16_DIM;
+
+/// The SVQ3 16×16 luma **plane** predictor — the standard H.264 plane
+/// prediction "but transposed", per
+/// `docs/video/svq3/spec/01-reconstruction-composition.md` Gap 4.
+///
+/// Gap 4 pins the decode-side equations. With the top row `top[0..=15]`
+/// (`top[x]`, x = 0..15) and left column `left[0..=15]` (`left[y]`,
+/// y = 0..15):
+///
+/// ```text
+///   H = Σ_{x'=1..7} x' · ( top[7+x']  − top[7−x']  )
+///   V = Σ_{y'=1..7} y' · ( left[7+y'] − left[7−y'] )
+///   a = 16 · ( top[15] + left[15] )
+///   b = (5·H + 32) >> 6
+///   c = (5·V + 32) >> 6
+/// ```
+///
+/// Standard H.264 writes the plane back as
+/// `Clip1( (a + b·(x−7) + c·(y−7) + 16) >> 5 )`; SVQ3's documented
+/// **transpose** swaps the per-pixel coordinate roles so `b` is applied
+/// along `y` and `c` along `x`:
+///
+/// ```text
+///   pred[x, y] = Clip1( (a + b·(y−7) + c·(x−7) + 16) >> 5 )
+/// ```
+///
+/// (`x` = col, `y` = row). All constants (`5`, `32`, `>>6`, `16`,
+/// `>>5`) are the standard H.264 plane constants per Gap 4. The output
+/// is row-major (`out[y * 16 + x]`). The `Clip1` clamp is the same
+/// 8-bit `[0, 255]` saturation as [`reconstruct_sample`]
+/// ([`RECON_SAMPLE_MIN`] / [`RECON_SAMPLE_MAX`]).
+///
+/// This predictor requires both the top row and the left column. The
+/// caller (macroblock loop) only selects the plane predictor for an
+/// interior macroblock where both are available; for an edge macroblock
+/// the 16×16 DC predictor [`predict_dc_16x16`] is used instead.
+#[must_use]
+pub const fn predict_plane_16x16(
+    top: [u8; PRED_16X16_DIM],
+    left: [u8; PRED_16X16_DIM],
+) -> [u8; PRED_16X16_SAMPLES] {
+    // H = Σ_{x'=1..7} x' · (top[7+x'] − top[7−x'])
+    let mut h: i32 = 0;
+    let mut k = 1;
+    while k <= 7 {
+        h += (k as i32) * (top[7 + k] as i32 - top[7 - k] as i32);
+        k += 1;
+    }
+    // V = Σ_{y'=1..7} y' · (left[7+y'] − left[7−y'])
+    let mut v: i32 = 0;
+    k = 1;
+    while k <= 7 {
+        v += (k as i32) * (left[7 + k] as i32 - left[7 - k] as i32);
+        k += 1;
+    }
+    let a = 16 * (top[15] as i32 + left[15] as i32);
+    let b = (5 * h + 32) >> 6;
+    let c = (5 * v + 32) >> 6;
+
+    let mut out = [0u8; PRED_16X16_SAMPLES];
+    let mut y = 0; // row
+    while y < PRED_16X16_DIM {
+        let mut x = 0; // col
+        while x < PRED_16X16_DIM {
+            // SVQ3 transpose: b along y, c along x.
+            let raw = (a + b * (y as i32 - 7) + c * (x as i32 - 7) + 16) >> 5;
+            let clamped = if raw < RECON_SAMPLE_MIN {
+                RECON_SAMPLE_MIN
+            } else if raw > RECON_SAMPLE_MAX {
+                RECON_SAMPLE_MAX
+            } else {
+                raw
+            };
+            out[y * PRED_16X16_DIM + x] = clamped as u8;
+            x += 1;
+        }
+        y += 1;
+    }
+    out
+}
+
+/// The 16×16 luma **DC** predictor — the standard H.264 16×16 DC mode
+/// used by SVQ3 at macroblock edges where the plane predictor's
+/// neighbours are not both available.
+///
+/// Follows the same availability-driven averaging rule as the 4×4 DC
+/// predictor (Gap 3 / standard H.264), scaled to the 16-sample
+/// neighbour rows:
+///
+/// * both available: `(Σ top + Σ left + 16) >> 5`
+/// * only top: `(Σ top + 8) >> 4`
+/// * only left: `(Σ left + 8) >> 4`
+/// * neither: `128`
+///
+/// The single DC value is broadcast to all 256 positions (row-major).
+#[must_use]
+pub fn predict_dc_16x16(
+    top: [u8; PRED_16X16_DIM],
+    left: [u8; PRED_16X16_DIM],
+    top_available: bool,
+    left_available: bool,
+) -> [u8; PRED_16X16_SAMPLES] {
+    let mut sum_top: i32 = 0;
+    let mut sum_left: i32 = 0;
+    for i in 0..PRED_16X16_DIM {
+        sum_top += top[i] as i32;
+        sum_left += left[i] as i32;
+    }
+    let dc = if top_available && left_available {
+        (sum_top + sum_left + 16) >> 5
+    } else if top_available {
+        (sum_top + 8) >> 4
+    } else if left_available {
+        (sum_left + 8) >> 4
+    } else {
+        128
+    };
+    [dc as u8; PRED_16X16_SAMPLES]
+}
+
+/// Width / height of one 8×8 chroma prediction block (one chroma
+/// plane of a macroblock).
+pub const PRED_CHROMA_DIM: usize = 8;
+
+/// Number of samples in one 8×8 chroma predicted block.
+pub const PRED_CHROMA_SAMPLES: usize = PRED_CHROMA_DIM * PRED_CHROMA_DIM;
+
+/// The SVQ3 8×8 chroma predictor — **DC mode only**, per
+/// `docs/video/svq3/spec/01-reconstruction-composition.md` Gap 4
+/// ("SVQ3 forces chroma to DC mode only (no chroma plane / vertical /
+/// horizontal selection)").
+///
+/// Gap 4 pins the per-4×4-quadrant DC value via the standard H.264
+/// chroma-DC averaging over available neighbours. Each of the four 4×4
+/// quadrants of the 8×8 block averages its own 4 top samples and 4
+/// left samples:
+///
+/// ```text
+///   if both top and left available:  dc = (Σ top[0..3] + Σ left[0..3] + 4) >> 3
+///   elif only top available:         dc = (Σ top[0..3] + 2) >> 2
+///   elif only left available:        dc = (Σ left[0..3] + 2) >> 2
+///   else:                            dc = 128
+/// ```
+///
+/// applied per the four 4×4 chroma-DC quadrants exactly as H.264
+/// chroma DC. `top[0..=7]` / `left[0..=7]` are the 8 reconstructed
+/// neighbour samples above / to the left of the 8×8 chroma block.
+/// For quadrant `(qr, qc)` (qr, qc ∈ {0, 1}) the top group is
+/// `top[qc*4 .. qc*4+4]` and the left group is
+/// `left[qr*4 .. qr*4+4]`. The single quadrant DC value fills the
+/// quadrant's 4×4 samples; the four quadrant values are written into
+/// the row-major 8×8 output (`out[y * 8 + x]`).
+#[must_use]
+pub fn predict_chroma_dc_8x8(
+    top: [u8; PRED_CHROMA_DIM],
+    left: [u8; PRED_CHROMA_DIM],
+    top_available: bool,
+    left_available: bool,
+) -> [u8; PRED_CHROMA_SAMPLES] {
+    // Per-quadrant DC: sum the 4 top samples / 4 left samples of the
+    // quadrant, then the availability-driven rounding.
+    let quad_dc = |top4: i32, left4: i32| -> u8 {
+        let dc = if top_available && left_available {
+            (top4 + left4 + 4) >> 3
+        } else if top_available {
+            (top4 + 2) >> 2
+        } else if left_available {
+            (left4 + 2) >> 2
+        } else {
+            128
+        };
+        dc as u8
+    };
+    let group_sum = |arr: &[u8; PRED_CHROMA_DIM], base: usize| -> i32 {
+        arr[base] as i32 + arr[base + 1] as i32 + arr[base + 2] as i32 + arr[base + 3] as i32
+    };
+
+    let mut out = [0u8; PRED_CHROMA_SAMPLES];
+    for y in 0..PRED_CHROMA_DIM {
+        let qr = y / 4; // quadrant row
+        let left4 = group_sum(&left, qr * 4);
+        for x in 0..PRED_CHROMA_DIM {
+            let qc = x / 4; // quadrant col
+            let top4 = group_sum(&top, qc * 4);
+            out[y * PRED_CHROMA_DIM + x] = quad_dc(top4, left4);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1119,5 +1314,130 @@ mod tests {
         assert_eq!(DC, [5u8; 16]); // (10+26+4)>>3 = 5
         assert_eq!(DISP, DC);
         assert_eq!(DDR[0], DDR[0]); // smoke
+    }
+
+    // ---- 16×16 plane / DC + chroma DC (spec/01 Gap 4) ----------------
+
+    #[test]
+    fn plane16_uniform_neighbours_reproduce_value() {
+        // Uniform neighbours → H = V = 0, a = 16*2v = 32v,
+        // pred = (32v + 16) >> 5 = v (for v in 0..=255, the +16 rounds
+        // 32v/32 exactly to v).
+        for &v in [0u8, 1, 50, 100, 128, 200, 255].iter() {
+            let out = predict_plane_16x16([v; 16], [v; 16]);
+            assert_eq!(out, [v; 256], "uniform {v}");
+        }
+    }
+
+    #[test]
+    fn plane16_dim_constants() {
+        assert_eq!(PRED_16X16_DIM, 16);
+        assert_eq!(PRED_16X16_SAMPLES, 256);
+    }
+
+    #[test]
+    fn plane16_transpose_b_along_y_c_along_x() {
+        // Construct neighbours that give a known H, V and verify the
+        // transposed application: b applied along y, c along x.
+        // Use a horizontal ramp in `top` and flat `left`.
+        let mut top = [0u8; 16];
+        for (i, t) in top.iter_mut().enumerate() {
+            *t = (8 * i) as u8; // 0,8,16,...,120
+        }
+        let left = [60u8; 16];
+        let out = predict_plane_16x16(top, left);
+
+        // Recompute b, c the same way the function does.
+        let mut h = 0i32;
+        for k in 1..=7i32 {
+            h += k * (top[7 + k as usize] as i32 - top[7 - k as usize] as i32);
+        }
+        let v = 0i32; // left flat
+        let a = 16 * (top[15] as i32 + left[15] as i32);
+        let b = (5 * h + 32) >> 6;
+        let c = (5 * v + 32) >> 6;
+        // c == 0 (V == 0), so prediction varies only along y (via b).
+        assert_eq!(c, 0);
+        // Spot-check (x=3, y=5): (a + b*(5-7) + c*(3-7) + 16) >> 5.
+        let raw = (a + b * (5 - 7) + c * (3 - 7) + 16) >> 5;
+        let expected = raw.clamp(0, 255) as u8;
+        assert_eq!(out[5 * 16 + 3], expected);
+    }
+
+    #[test]
+    fn dc16_both_available() {
+        // Σtop = 16*10 = 160, Σleft = 16*22 = 352, total 512;
+        // (512 + 16) >> 5 = 16.
+        let out = predict_dc_16x16([10; 16], [22; 16], true, true);
+        assert_eq!(out, [16u8; 256]);
+    }
+
+    #[test]
+    fn dc16_partial_and_none() {
+        // Only top: (Σtop + 8) >> 4. Σtop = 16*16 = 256 → (264)>>4 = 16.
+        let out = predict_dc_16x16([16; 16], [99; 16], true, false);
+        assert_eq!(out, [16u8; 256]);
+        // Only left.
+        let out = predict_dc_16x16([99; 16], [16; 16], false, true);
+        assert_eq!(out, [16u8; 256]);
+        // Neither → 128.
+        let out = predict_dc_16x16([3; 16], [3; 16], false, false);
+        assert_eq!(out, [128u8; 256]);
+    }
+
+    #[test]
+    fn chroma_dc_dim_constants() {
+        assert_eq!(PRED_CHROMA_DIM, 8);
+        assert_eq!(PRED_CHROMA_SAMPLES, 64);
+    }
+
+    #[test]
+    fn chroma_dc_uniform_both_available() {
+        // top4 = left4 = 4*v; (4v + 4v + 4) >> 3 = v (for v even-ish).
+        // Use v = 10: (40 + 40 + 4) >> 3 = 10.
+        let out = predict_chroma_dc_8x8([10; 8], [10; 8], true, true);
+        assert_eq!(out, [10u8; 64]);
+    }
+
+    #[test]
+    fn chroma_dc_per_quadrant_independence() {
+        // top: left half (cols 0..3) = 0, right half (cols 4..7) = 40.
+        // left: top half (rows 0..3) = 80, bottom half (rows 4..7) = 0.
+        let top = [0, 0, 0, 0, 40, 40, 40, 40];
+        let left = [80, 80, 80, 80, 0, 0, 0, 0];
+        let out = predict_chroma_dc_8x8(top, left, true, true);
+        // Quadrant (qr=0,qc=0): top4 = 0, left4 = 320 →
+        //   (0 + 320 + 4) >> 3 = 40.
+        assert_eq!(out[0], 40);
+        // Quadrant (qr=0,qc=1): top4 = 160, left4 = 320 →
+        //   (160 + 320 + 4) >> 3 = 60.
+        assert_eq!(out[4], 60);
+        // Quadrant (qr=1,qc=0): top4 = 0, left4 = 0 → 0.
+        assert_eq!(out[4 * 8], 0);
+        // Quadrant (qr=1,qc=1): top4 = 160, left4 = 0 →
+        //   (160 + 0 + 4) >> 3 = 20.
+        assert_eq!(out[4 * 8 + 4], 20);
+        // All samples within a quadrant share the same value.
+        for y in 0..4 {
+            for x in 0..4 {
+                assert_eq!(out[y * 8 + x], 40, "Q00 ({y},{x})");
+            }
+        }
+    }
+
+    #[test]
+    fn chroma_dc_neither_available_is_128() {
+        let out = predict_chroma_dc_8x8([5; 8], [5; 8], false, false);
+        assert_eq!(out, [128u8; 64]);
+    }
+
+    #[test]
+    fn chroma_dc_only_top_or_left() {
+        // Only top: per quadrant (top4 + 2) >> 2.
+        // top all 10 → top4 = 40 → (42) >> 2 = 10.
+        let out = predict_chroma_dc_8x8([10; 8], [99; 8], true, false);
+        assert_eq!(out, [10u8; 64]);
+        let out = predict_chroma_dc_8x8([99; 8], [10; 8], false, true);
+        assert_eq!(out, [10u8; 64]);
     }
 }
