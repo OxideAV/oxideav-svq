@@ -85,11 +85,15 @@ full plane reconstruction is blocked on bitstream-driven field decode.
   the per-quantiser scale table, the dequant expressions), the
   two-sided `M·X·Mᵀ` transform composition, thirdpel motion-compensation
   interpolation, and the 4×4 diagonal-down intra predictor.
+* The predicted+residual writeback composition (`reconstruct_sample` /
+  `reconstruct_4x4`): the 8-bit saturating `Clip1(pred + residual)` sum
+  with no extra rounding on the add, pinned by spec/01 Gap 5.
 
 The remaining SVQ3 gaps — the mode-to-predictor binding, the other
-intra predictors, the motion-vector-component VLC, CBP coding, and the
-IDCT writeback — await pinning in `docs/video/svq3/`. The 4×4
-scan-order arrays are now pinned (spec/01 Gap 1).
+intra predictors, the motion-vector-component VLC, and CBP coding —
+await assembly into the macroblock loop. The 4×4 scan-order arrays
+(spec/01 Gap 1) and the predicted+residual writeback clamp (spec/01
+Gap 5) are now pinned and landed.
 
 ## Cargo features
 

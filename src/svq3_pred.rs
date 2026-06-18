@@ -48,15 +48,39 @@
 //!   wiki pins only "plane prediction is the same as in H.264 but
 //!   transposed"), and the chroma DC predictor ("8x8 chroma always
 //!   uses DC prediction") are back-referenced to H.264 rather than
-//!   spelled out locally — they stay out of scope until
-//!   `docs/video/svq3/` carries their sample equations.
-//! * The predicted+residual writeback (clamp range / rounding of
-//!   `predicted + residual`) is not pinned in `docs/video/svq3/`
-//!   either; this module produces the predicted block only.
+//!   spelled out locally — `docs/video/svq3/spec/01-reconstruction-composition.md`
+//!   Gap 4 now carries their sample equations; their block predictors
+//!   are deferred to a later round.
+//!
+//! ## Reconstruction-composition writeback (spec/01 Gap 5)
+//!
+//! `docs/video/svq3/spec/01-reconstruction-composition.md` Gap 5 pins
+//! the predicted+residual writeback as the standard 8-bit saturating
+//! sum with **no extra rounding on the add** — all rounding already
+//! lives inside the dequant/transform pass
+//! ([`crate::svq3_dequant`]) and the interpolation filters:
+//!
+//! > ```text
+//! > recon[x,y] = Clip1( pred[x,y] + residual[x,y] )
+//! >            = clip( pred[x,y] + residual[x,y], 0, 255 )
+//! > ```
+//!
+//! That writeback lands here as [`reconstruct_sample`] (one clamped
+//! sum) and [`reconstruct_4x4`] (the 4×4-block composition that takes
+//! a predicted `[u8; 16]` block — e.g. from
+//! [`predict_diagonal_down_4x4`] — and the dequantised/transformed
+//! residual `[i32; 16]` from [`crate::svq3_dequant`] and produces the
+//! reconstructed `[u8; 16]`). The clamp is the ordinary H.264
+//! `Clip1_Y` / `Clip1_C` at `BitDepth = 8` ⇒ range `[0, 255]`
+//! ([`RECON_SAMPLE_MIN`] / [`RECON_SAMPLE_MAX`]).
+//!
+//! ## Open work
 //!
 //! `Svq3DecoderHandle::receive_frame` continues to return
-//! `oxideav_core::Error::Unsupported` — round 282 lands the pixel
-//! arithmetic only.
+//! `oxideav_core::Error::Unsupported` — this module lands the
+//! per-block pixel arithmetic and writeback composition only; the
+//! macroblock loop that drives predictor selection, residual decode,
+//! and writeback is not yet assembled.
 
 /// Width / height of the 4×4 intra-predicted sub-block, and the
 /// length of the `left` / `top` neighbour arrays the spec formulas
@@ -158,6 +182,118 @@ pub const fn predict_diagonal_down_4x4(
     let mut i = 0;
     while i < PRED_4X4_SAMPLES {
         out[i] = derived[DIAGONAL_DOWN_PATTERN[i] as usize];
+        i += 1;
+    }
+    out
+}
+
+/// Minimum reconstructed sample value — the lower bound of the
+/// spec/01 Gap 5 `Clip1` saturating clamp at `BitDepth = 8`.
+///
+/// Per `docs/video/svq3/spec/01-reconstruction-composition.md` Gap 5
+/// the writeback clamp is the ordinary H.264 `Clip1_Y` / `Clip1_C`
+/// with `BitDepth = 8`, i.e. `clip(·, 0, 255)`.
+pub const RECON_SAMPLE_MIN: i32 = 0;
+
+/// Maximum reconstructed sample value — the upper bound of the
+/// spec/01 Gap 5 `Clip1` saturating clamp at `BitDepth = 8`
+/// (`(1 << 8) - 1 = 255`).
+pub const RECON_SAMPLE_MAX: i32 = 255;
+
+/// Compose one reconstructed sample from a predicted sample and its
+/// residual, applying the spec/01 Gap 5 saturating clamp.
+///
+/// `docs/video/svq3/spec/01-reconstruction-composition.md` Gap 5 pins
+/// per-sample reconstruction as
+///
+/// ```text
+///   recon[x,y] = Clip1( pred[x,y] + residual[x,y] )
+///              = clip( pred[x,y] + residual[x,y], 0, 255 )
+/// ```
+///
+/// with **no per-sample rounding term on the add itself** — all
+/// rounding already lives inside the dequant/transform pass
+/// ([`crate::svq3_dequant`], the fused `+0x80000 … >> 20`) and the
+/// interpolation filters. This helper therefore performs the plain
+/// signed sum `pred + residual` and clamps it into
+/// `[RECON_SAMPLE_MIN, RECON_SAMPLE_MAX]` (`[0, 255]`).
+///
+/// `pred` is a previously-produced predicted sample (intra predictor
+/// output such as [`predict_diagonal_down_4x4`], or an inter
+/// motion-compensated predictor); `residual` is the inverse-
+/// transformed, dequantised coefficient from [`crate::svq3_dequant`].
+/// The sum is computed in `i64` before clamping so a residual that
+/// drives the sum below `0` or above `255` — including a pathological
+/// residual at the `i32` extremes — saturates rather than wrapping.
+///
+/// ```
+/// use oxideav_svq::svq3_pred::reconstruct_sample;
+///
+/// // In-range sum passes through unchanged.
+/// assert_eq!(reconstruct_sample(100, 27), 127);
+/// // Negative residual that underflows saturates to 0.
+/// assert_eq!(reconstruct_sample(10, -50), 0);
+/// // Positive residual that overflows saturates to 255.
+/// assert_eq!(reconstruct_sample(200, 100), 255);
+/// ```
+#[inline]
+#[must_use]
+pub const fn reconstruct_sample(pred: u8, residual: i32) -> u8 {
+    // Widen to i64 so the add cannot overflow even for a pathological
+    // residual at the i32 extremes; the clamp then bounds it to [0, 255].
+    let sum = pred as i64 + residual as i64;
+    let clamped = if sum < RECON_SAMPLE_MIN as i64 {
+        RECON_SAMPLE_MIN
+    } else if sum > RECON_SAMPLE_MAX as i64 {
+        RECON_SAMPLE_MAX
+    } else {
+        sum as i32
+    };
+    clamped as u8
+}
+
+/// Compose a reconstructed 4×4 block from a predicted block and its
+/// residual block, applying the spec/01 Gap 5 saturating clamp
+/// element-wise.
+///
+/// This is the per-block form of [`reconstruct_sample`]: it walks the
+/// two row-major `[_; 16]` blocks in lockstep and writes
+/// `Clip1(pred[i] + residual[i])` at each position. Both inputs use
+/// the same row-major 4×4 layout (`block[row * 4 + col]`) as
+/// [`predict_diagonal_down_4x4`] and the
+/// [`crate::svq3_dequant`] transform output, so the reconstructed
+/// block is laid out the same way.
+///
+/// `predicted` is the intra/inter predictor output for the block;
+/// `residual` is the dequantised, inverse-transformed coefficient
+/// block from [`crate::svq3_dequant`] (already rounded by its fused
+/// `+0x80000 … >> 20`). No additional rounding is applied to the sum,
+/// per spec/01 Gap 5.
+///
+/// ```
+/// use oxideav_svq::svq3_pred::{predict_diagonal_down_4x4, reconstruct_4x4};
+///
+/// // A uniform predictor plus an all-zero residual reproduces the
+/// // prediction; a non-zero residual at a position shifts that sample.
+/// let pred = predict_diagonal_down_4x4([5; 4], [5; 4]); // all 5s
+/// let mut residual = [0i32; 16];
+/// residual[0] = 10;
+/// residual[15] = -100; // underflows -> clamps to 0
+/// let recon = reconstruct_4x4(pred, residual);
+/// assert_eq!(recon[0], 15);
+/// assert_eq!(recon[1], 5);
+/// assert_eq!(recon[15], 0);
+/// ```
+#[inline]
+#[must_use]
+pub const fn reconstruct_4x4(
+    predicted: [u8; PRED_4X4_SAMPLES],
+    residual: [i32; PRED_4X4_SAMPLES],
+) -> [u8; PRED_4X4_SAMPLES] {
+    let mut out = [0u8; PRED_4X4_SAMPLES];
+    let mut i = 0;
+    while i < PRED_4X4_SAMPLES {
+        out[i] = reconstruct_sample(predicted[i], residual[i]);
         i += 1;
     }
     out
@@ -346,5 +482,101 @@ mod tests {
         assert_eq!(BLOCK[0], 2);
         assert_eq!(BLOCK[1], 4);
         assert_eq!(BLOCK[15], 6);
+    }
+
+    // ---- spec/01 Gap 5: predicted+residual writeback composition -----
+
+    #[test]
+    fn recon_clamp_bounds_match_8bit() {
+        assert_eq!(RECON_SAMPLE_MIN, 0);
+        assert_eq!(RECON_SAMPLE_MAX, 255);
+        assert_eq!(RECON_SAMPLE_MAX, (1i32 << 8) - 1);
+    }
+
+    #[test]
+    fn recon_sample_in_range_is_plain_sum() {
+        // No rounding term on the add — the in-range case is the exact
+        // signed sum pred + residual.
+        assert_eq!(reconstruct_sample(0, 0), 0);
+        assert_eq!(reconstruct_sample(100, 27), 127);
+        assert_eq!(reconstruct_sample(255, 0), 255);
+        assert_eq!(reconstruct_sample(128, -28), 100);
+        assert_eq!(reconstruct_sample(0, 255), 255);
+    }
+
+    #[test]
+    fn recon_sample_saturates_low() {
+        assert_eq!(reconstruct_sample(10, -50), 0);
+        assert_eq!(reconstruct_sample(0, -1), 0);
+        assert_eq!(reconstruct_sample(0, i32::MIN), 0);
+        assert_eq!(reconstruct_sample(127, -128), 0); // exactly 0, not below
+        assert_eq!(reconstruct_sample(127, -127), 0);
+    }
+
+    #[test]
+    fn recon_sample_saturates_high() {
+        assert_eq!(reconstruct_sample(200, 100), 255);
+        assert_eq!(reconstruct_sample(255, 1), 255);
+        assert_eq!(reconstruct_sample(255, i32::MAX), 255);
+        assert_eq!(reconstruct_sample(200, 55), 255); // exactly 255
+        assert_eq!(reconstruct_sample(200, 56), 255); // one over -> clamps
+    }
+
+    #[test]
+    fn recon_sample_zero_residual_is_identity() {
+        for pred in 0u8..=255 {
+            assert_eq!(reconstruct_sample(pred, 0), pred, "pred {pred}");
+        }
+    }
+
+    #[test]
+    fn recon_4x4_zero_residual_reproduces_prediction() {
+        let pred = predict_diagonal_down_4x4([9, 10, 20, 30], [7, 14, 21, 31]);
+        let recon = reconstruct_4x4(pred, [0i32; PRED_4X4_SAMPLES]);
+        assert_eq!(recon, pred);
+    }
+
+    #[test]
+    fn recon_4x4_is_elementwise_clamped_sum() {
+        let pred = predict_diagonal_down_4x4([5; 4], [5; 4]); // all 5s
+        let mut residual = [0i32; PRED_4X4_SAMPLES];
+        residual[0] = 10;
+        residual[7] = 250; // 5 + 250 = 255
+        residual[8] = 251; // 5 + 251 = 256 -> clamps to 255
+        residual[15] = -100; // 5 - 100 -> clamps to 0
+        let recon = reconstruct_4x4(pred, residual);
+        assert_eq!(recon[0], 15);
+        assert_eq!(recon[1], 5);
+        assert_eq!(recon[7], 255);
+        assert_eq!(recon[8], 255);
+        assert_eq!(recon[15], 0);
+        // Every other position is the untouched prediction (5).
+        for i in [2usize, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14] {
+            assert_eq!(recon[i], 5, "position {i}");
+        }
+    }
+
+    #[test]
+    fn recon_4x4_matches_per_sample_helper() {
+        let pred = predict_diagonal_down_4x4([200, 17, 48, 99], [3, 250, 5, 130]);
+        let residual: [i32; PRED_4X4_SAMPLES] = [
+            0, 5, -300, 400, 1, -1, 127, -127, 255, -255, 12, -12, 50, -50, 200, -200,
+        ];
+        let block = reconstruct_4x4(pred, residual);
+        for i in 0..PRED_4X4_SAMPLES {
+            assert_eq!(
+                block[i],
+                reconstruct_sample(pred[i], residual[i]),
+                "position {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn recon_helpers_are_const_usable() {
+        const SAMPLE: u8 = reconstruct_sample(100, 27);
+        const BLOCK: [u8; PRED_4X4_SAMPLES] = reconstruct_4x4([5u8; 16], [10i32; 16]);
+        assert_eq!(SAMPLE, 127);
+        assert_eq!(BLOCK, [15u8; 16]);
     }
 }
