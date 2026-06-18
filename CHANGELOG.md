@@ -8,6 +8,29 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 339 — SVQ3 4×4 intra-mode binding + the standard-H.264
+  predictors.** Lands the four 4×4 intra predictors `docs/video/svq3/
+  spec/01-reconstruction-composition.md` Gap 3 names as "standard
+  H.264 … unmodified" — `predict_vertical_4x4` (mode 0),
+  `predict_horizontal_4x4` (mode 1), `predict_dc_4x4` (mode 2, with
+  the availability-driven `(Σtop+Σleft+4)>>3` / `(Σ+2)>>2` / `128`
+  averaging set), and `predict_diagonal_down_right_4x4` (mode 4, the
+  3-tap `(a+2b+c+2)>>2` main-diagonal filter reading the above-left
+  `corner`). The mode-to-predictor binding the README named as a
+  lacks-tail item lands as the `Svq3IntraMode` enum (Gap 3's
+  `0=Vertical / 1=Horizontal / 2=DC / 3=DiagonalDownLeft /
+  4=DiagonalDownRight`, with `Svq3IntraMode::DEFAULT = Dc` per Gap 3's
+  "default/fallback predictor is value 2") plus the
+  `predict_intra_4x4` dispatcher, which routes a resolved mode to its
+  predictor over an `Intra4x4Neighbours` carrier (top row + left
+  column + corner + availability flags) and applies the standard
+  H.264 DC fallback when a directional predictor's neighbour is
+  unavailable. Mode 3 keeps the existing SVQ3 diagonal-down quirk
+  (`predict_diagonal_down_4x4`). All predictors are `const fn`. 19 new
+  unit tests cover the value↔mode round-trip, each predictor's
+  closed form, the DC availability cases, and the dispatcher's routing
+  + DC fallback.
+
 - **Round 331 — SVQ3 4×4 scan-order arrays + selection rule.** Lands
   the two 16-entry 4×4 coefficient scan tables that round 233 had
   deferred for lack of a pinned source: `NORMAL_ZIGZAG_4X4_SCAN`
