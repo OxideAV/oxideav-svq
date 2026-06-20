@@ -8,6 +8,25 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 353 — SVQ3 signed-Golomb entropy layer: motion-vector
+  difference + quantiser-delta wire decode (`svq3_mv`).** Lands the
+  signed variable-length codes the wiki §"Inter macroblock information
+  decoding" names but the structural scaffold left unread. New
+  `svq3_mv` module: `read_se_golomb` (signed Exp-Golomb `se(v)`,
+  layered on the existing unsigned `read_ue_golomb`, folding code_num
+  `k` onto the signed line `0→0, 1→+1, 2→−1, …`); `read_mv_difference`
+  reading the **Y component first** then X per the wiki, into a typed
+  `MotionVectorDifference`; `read_mb_mv_differences` pulling the exact
+  per-partition count from `Svq3MbType::num_motion_vectors` (0 for
+  SKIP / intra / B-direct, 1/2/4/8/16 for the P inter modes, 2 for
+  B-bidirectional) in raster order; and `read_quantiser_delta` for the
+  optional pre-coefficient signed quant delta. 17 unit tests cover the
+  `se(v)` folding table, signed round-trips, Y-then-X order, exact bit
+  consumption, per-mode MV counts, and truncation propagation. The
+  CBP field the wiki flags as "coded the same way as in H.264" remains
+  a DOCS-GAP: its codeword↔value mapping is the H.264 `me(v)` table,
+  not reproduced under `docs/video/svq3/`.
+
 - **Round 339 — SVQ3 macroblock-level intra predictor-selection loop
   (`svq3_recon`).** Assembles the leaf primitives into the
   macroblock-level reconstruction loop the README named as the open

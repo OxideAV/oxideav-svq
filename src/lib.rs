@@ -488,6 +488,7 @@ pub mod svq3_coeff;
 pub mod svq3_dequant;
 pub mod svq3_mb;
 pub mod svq3_mc;
+pub mod svq3_mv;
 pub mod svq3_pred;
 pub mod svq3_recon;
 pub mod svq3_scan;
