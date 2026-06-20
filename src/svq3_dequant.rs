@@ -59,25 +59,39 @@
 //! 0x80000` (`= 1 << 19`) additive bias is the standard
 //! `(x + 2^{n-1}) >> n` round-half-up step.
 //!
-//! ## Open work
+//! ## Residual interleave (spec/01 Gap 2 — now pinned)
 //!
 //! Round 230 landed the four data tables and the three closed-form
 //! dequant helpers; later rounds added the single-sided column-multiply
 //! passes ([`apply_luma_transform_columns`] / [`apply_chroma_dc_2x2_columns`],
-//! i.e. `M · X`) and now the matching single-sided row-multiply passes
+//! i.e. `M · X`) and the matching single-sided row-multiply passes
 //! ([`apply_luma_transform_rows`] / [`apply_chroma_dc_2x2_rows`], i.e.
-//! `X · M^T`). The full two-sided `M · X · M^T` transform that composes a
-//! column pass with a row pass is still NOT folded in: the wiki spec quotes
-//! the matrix `M` but does NOT enumerate the two-sided composition (operand
-//! order, any intermediate rounding/normalisation), so that derivation stays
-//! deferred until `docs/video/svq3/` pins it.
+//! `X · M^T`), then composed them into the two-sided `M · X · M^T`
+//! transform ([`apply_luma_transform_2d`] / [`apply_chroma_dc_2x2_2d`]).
 //!
-//! None of these helpers are wired into a residual-decode pipeline yet. The
-//! dezigzag stage that places the per-block
-//! [`crate::svq3_coeff::Coefficient`] stream into a 4×4 grid and the
-//! IDCT/normalisation that consumes the transformed output remain out of
-//! scope — `Svq3DecoderHandle::receive_frame` continues to return
-//! `oxideav_core::Error::Unsupported`.
+//! `docs/video/svq3/spec/01-reconstruction-composition.md` **Gap 2**
+//! now pins the previously-deferred facts: the transform is the
+//! **two-sided** `M · X · M^T` (rows pass then columns pass over the
+//! same kernel), and the dequantisation is **fused into the same pass**
+//! as the inverse transform — the per-element store is
+//! `out = (coeff·DEQUANT_COEFF_TABLE[Q] + dc + 0x80000) >> 20`, with the
+//! single `>> 20` ([`DEQUANT_SHIFT`]) being the *only* post-transform
+//! shift (there is **no** additional H.264-style `>> 6` normalisation).
+//! This module now wires those facts into the luma residual-interleave
+//! pipeline [`dequantize_transform_luma_block`] (and its separate-DC
+//! variant [`dequantize_transform_luma_block_with_dc`]): place →
+//! per-coefficient dequant-scale → two-sided transform → fused
+//! `+ 0x80000 >> 20`.
+//!
+//! The wire-format decode that *feeds* this pipeline (the intra-mode
+//! VLC, the CBP enumeration deciding which sub-blocks carry residual,
+//! and the inter motion-vector VLC) is **not** pinned by spec/01 — the
+//! wiki states only "CBP is coded the same way as in H.264" / "motion
+//! vector differences are coded as signed variable-length codes" without
+//! enumerating the H.264 CBP code-number mapping or the MV-VLC bit
+//! layout — so those stay deferred docs-gaps and
+//! `Svq3DecoderHandle::receive_frame` continues to return
+//! `oxideav_core::Error::Unsupported` for full-frame decode.
 
 use core::ops::Range;
 
@@ -823,6 +837,115 @@ pub const fn dequantize_chroma_dc_block(q: u32, block: [i32; 4]) -> [i32; 4] {
         finalise_dc(dequantize_chroma_dc(q, transformed[2])),
         finalise_dc(dequantize_chroma_dc(q, transformed[3])),
     ]
+}
+
+/// Scale a placed 4×4 luma coefficient block by the per-quantiser
+/// dequant coefficient `DEQUANT_COEFF_TABLE[Q]`, in-place per element.
+///
+/// This is the dequant-multiply half of spec/01 Gap 2's fused
+/// `out = (coeff·DEQUANT_COEFF_TABLE[Q] + dc + 0x80000) >> 20` store:
+/// every placed coefficient `coeff` is multiplied by the quantiser
+/// scale `DEQUANT_COEFF_TABLE[Q]` *before* the two-sided transform runs,
+/// matching the binary's "dequantisation … and the inverse transform
+/// are performed in the same pass". The additive `dc`, round bias
+/// `0x80000`, and `>> 20` shift are applied *after* the transform by the
+/// caller (see [`dequantize_transform_luma_block`]); this helper does
+/// none of those.
+///
+/// The input `block` is row-major (`block[r * 4 + c]`); the output keeps
+/// the same layout with each entry multiplied by the scale.
+///
+/// The caller must ensure `q < DEQUANT_COEFF_TABLE_LEN`.
+///
+/// # Panics
+///
+/// Panics if `q >= DEQUANT_COEFF_TABLE_LEN`.
+#[inline]
+#[must_use]
+pub const fn scale_luma_block_by_quantiser(q: u32, block: [i32; 16]) -> [i32; 16] {
+    let scale = DEQUANT_COEFF_TABLE[q as usize] as i32;
+    let mut out = [0i32; 16];
+    let mut i = 0;
+    while i < 16 {
+        out[i] = block[i] * scale;
+        i += 1;
+    }
+    out
+}
+
+/// Run the **full luma residual interleave** on a placed 4×4 luma
+/// coefficient block: per-coefficient dequant-scale → two-sided
+/// `M · X · M^T` transform → fused `+ dc + 0x80000 >> 20`.
+///
+/// This composes spec/01 Gap 2's pinned per-element formula
+///
+/// ```text
+///   out[i] = ( transform( coeff · DEQUANT_COEFF_TABLE[Q] )[i]
+///              + dc + 0x80000 ) >> 20
+/// ```
+///
+/// in the order the binary realises it (the dequant multiply folded into
+/// the same pass as the inverse transform, the single `>> 20` being the
+/// only post-transform shift — no extra `>> 6`):
+///
+/// 1. [`scale_luma_block_by_quantiser`] multiplies every placed
+///    coefficient by `DEQUANT_COEFF_TABLE[Q]`;
+/// 2. [`apply_luma_transform_2d`] applies the two-sided `M · X · M^T`
+///    transform (rows pass then columns pass over the pinned
+///    [`LUMA_TRANSFORM_MATRIX`]); and
+/// 3. each transformed sample is finalised with `(s + dc + 0x80000) >> 20`
+///    ([`DEQUANT_ROUND`] / [`DEQUANT_SHIFT`]), where `dc` is the
+///    additive override term (`0` for the common no-separate-DC luma
+///    block — see [`dequantize_transform_luma_block`]).
+///
+/// The input `block` is the row-major placed coefficient grid from
+/// [`crate::svq3_scan::place_4x4`]; the returned `[i32; 16]` is the
+/// fully-dequantised, inverse-transformed **residual** ready for the
+/// `Clip1(pred + residual)` writeback ([`crate::svq3_pred::reconstruct_4x4`]).
+///
+/// The caller must ensure `q < DEQUANT_COEFF_TABLE_LEN`.
+///
+/// # Panics
+///
+/// Panics if `q >= DEQUANT_COEFF_TABLE_LEN`.
+#[inline]
+#[must_use]
+pub const fn dequantize_transform_luma_block_with_dc(
+    q: u32,
+    block: [i32; 16],
+    dc: i32,
+) -> [i32; 16] {
+    // Stage 1: per-coefficient dequant multiply (same pass as transform).
+    let scaled = scale_luma_block_by_quantiser(q, block);
+    // Stage 2: two-sided M · X · M^T inverse transform.
+    let transformed = apply_luma_transform_2d(scaled);
+    // Stage 3: fused +dc +0x80000 >>20 — the single post-transform shift.
+    let mut out = [0i32; 16];
+    let mut i = 0;
+    while i < 16 {
+        out[i] = (transformed[i] + dc + DEQUANT_ROUND) >> DEQUANT_SHIFT;
+        i += 1;
+    }
+    out
+}
+
+/// Run the luma residual interleave with no separate-DC override
+/// (`dc = 0`), the common case for a 4×4-intra luma block whose DC is
+/// carried inline in `block[0]` rather than in a separate DC stream.
+///
+/// Thin wrapper over [`dequantize_transform_luma_block_with_dc`] with
+/// `dc = 0` — spec/01 Gap 2's `dc = 0 unless overridden`. Use the
+/// `_with_dc` form for the intra-luma separate-DC branch, where the
+/// caller supplies `dc = INTRA_LUMA_DC_SCALE · block[0]` (see
+/// [`dequantize_intra_luma_dc`]) computed from the separate DC block.
+///
+/// # Panics
+///
+/// Panics if `q >= DEQUANT_COEFF_TABLE_LEN`.
+#[inline]
+#[must_use]
+pub const fn dequantize_transform_luma_block(q: u32, block: [i32; 16]) -> [i32; 16] {
+    dequantize_transform_luma_block_with_dc(q, block, 0)
 }
 
 #[cfg(test)]
@@ -1972,5 +2095,113 @@ mod tests {
     #[should_panic]
     fn chroma_dc_block_panics_on_out_of_range_quantiser() {
         let _ = dequantize_chroma_dc_block(DEQUANT_COEFF_TABLE_LEN as u32, [1, 2, 3, 4]);
+    }
+
+    // ---- Luma residual interleave (spec/01 Gap 2) ----------------------
+
+    #[test]
+    fn scale_luma_block_multiplies_every_entry() {
+        let q = 7;
+        let scale = DEQUANT_COEFF_TABLE[q as usize] as i32;
+        let mut block = [0i32; 16];
+        for (i, b) in block.iter_mut().enumerate() {
+            *b = (i as i32) - 8; // mix of signs
+        }
+        let out = scale_luma_block_by_quantiser(q, block);
+        for i in 0..16 {
+            assert_eq!(out[i], block[i] * scale, "entry {i}");
+        }
+    }
+
+    #[test]
+    fn luma_residual_all_zero_input_is_zero() {
+        // Zero coefficients → transform of zero is zero → (0 + 0 + round)
+        // >> 20 = 0 for round = 0x80000 (< 2^20).
+        for q in [0u32, 12, 31] {
+            assert_eq!(dequantize_transform_luma_block(q, [0i32; 16]), [0i32; 16]);
+        }
+    }
+
+    #[test]
+    fn luma_residual_matches_explicit_stage_composition() {
+        // The composed pipeline must equal the explicit
+        // scale → transform → (+0x80000 >>20) stage chain.
+        let q = 9;
+        let mut block = [0i32; 16];
+        for (i, b) in block.iter_mut().enumerate() {
+            *b = ((i as i32) * 3 - 17) % 11;
+        }
+        let composed = dequantize_transform_luma_block(q, block);
+
+        let scaled = scale_luma_block_by_quantiser(q, block);
+        let transformed = apply_luma_transform_2d(scaled);
+        let mut expected = [0i32; 16];
+        for i in 0..16 {
+            expected[i] = (transformed[i] + DEQUANT_ROUND) >> DEQUANT_SHIFT;
+        }
+        assert_eq!(composed, expected);
+    }
+
+    #[test]
+    fn luma_residual_pure_dc_is_flat_block() {
+        // A pure-DC placed block (only block[0] non-zero) transforms to
+        // the all-(13·13·coeff·scale) matrix (Gap 2 rank-one outer
+        // product), so after the uniform +0x80000 >>20 every output
+        // element is identical.
+        let q = 14;
+        let mut block = [0i32; 16];
+        block[0] = 5;
+        let out = dequantize_transform_luma_block(q, block);
+        for w in out.iter() {
+            assert_eq!(*w, out[0], "pure-DC residual must be flat");
+        }
+        // Cross-check the exact value: 13·13·coeff·scale then round/shift.
+        let scale = DEQUANT_COEFF_TABLE[q as usize] as i32;
+        let expected = (13 * 13 * 5 * scale + DEQUANT_ROUND) >> DEQUANT_SHIFT;
+        assert_eq!(out[0], expected);
+    }
+
+    #[test]
+    fn luma_residual_dc_override_shifts_every_output() {
+        // The separate-DC `dc` override is added to every transformed
+        // sample before the shift; with a transform output of zero
+        // (zero coefficients) the residual is uniformly
+        // (dc + 0x80000) >> 20.
+        let q = 3;
+        let dc = 7 << 20; // a clean multiple to make the shift exact
+        let out = dequantize_transform_luma_block_with_dc(q, [0i32; 16], dc);
+        let expected = (dc + DEQUANT_ROUND) >> DEQUANT_SHIFT;
+        for w in out.iter() {
+            assert_eq!(*w, expected);
+        }
+    }
+
+    #[test]
+    fn luma_residual_dc_zero_matches_no_dc_wrapper() {
+        let q = 20;
+        let mut block = [0i32; 16];
+        for (i, b) in block.iter_mut().enumerate() {
+            *b = (i as i32) - 6;
+        }
+        assert_eq!(
+            dequantize_transform_luma_block(q, block),
+            dequantize_transform_luma_block_with_dc(q, block, 0),
+        );
+    }
+
+    #[test]
+    fn luma_residual_const_evaluable() {
+        const OUT: [i32; 16] = dequantize_transform_luma_block(10, {
+            let mut b = [0i32; 16];
+            b[0] = 1;
+            b
+        });
+        assert_eq!(OUT[0], OUT[15]); // pure-DC flat
+    }
+
+    #[test]
+    #[should_panic]
+    fn luma_residual_panics_on_out_of_range_quantiser() {
+        let _ = dequantize_transform_luma_block(DEQUANT_COEFF_TABLE_LEN as u32, [1i32; 16]);
     }
 }
