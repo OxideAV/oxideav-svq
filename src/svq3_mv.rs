@@ -54,8 +54,8 @@
 
 use crate::bitreader::BitReader;
 use crate::error::Result;
-use crate::svq3::read_ue_golomb;
-use crate::svq3_mb::Svq3MbType;
+use crate::svq3::{read_ue_golomb, Svq3FrameType};
+use crate::svq3_mb::{read_inter_mv_precision, Svq3MbType, Svq3MvPrecision};
 
 /// Read one signed Exp-Golomb codeword (`se(v)`).
 ///
@@ -168,6 +168,70 @@ pub fn read_mb_mv_differences(
 /// Returns [`crate::error::Error::Truncated`] on a short read.
 pub fn read_quantiser_delta(br: &mut BitReader<'_>) -> Result<i32> {
     read_se_golomb(br)
+}
+
+/// The decoded inter-macroblock motion header: the chosen sub-pixel
+/// precision plus every per-partition motion-vector difference, in
+/// raster partition order.
+///
+/// This is the composition of the two staged inter-MB wire fields the
+/// wiki §"Inter macroblock information decoding" describes in order:
+///
+/// 1. the precision selector (`read_inter_mv_precision`, frame-type
+///    aware: B-frames are always halfpel and consume no bit), then
+/// 2. the per-partition motion-vector differences, Y component first
+///    each ([`read_mb_mv_differences`]).
+///
+/// The motion-vector *predictor* + absolute-vector reconstruction (the
+/// median neighbour combination and the wiki's fraction-of-six
+/// precision rounding) is a separate stage and is not part of this
+/// header; this struct carries the raw decoded wire fields only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Svq3InterMacroblockHeader {
+    /// The sub-pixel precision for this macroblock's motion
+    /// compensation. Always [`Svq3MvPrecision::Halfpel`] for B-frame
+    /// inter macroblocks (consumes no bit); selected per the
+    /// three-branch rule for P-frame inter macroblocks.
+    pub precision: Svq3MvPrecision,
+    /// The per-partition motion-vector differences, in raster
+    /// partition order. The length equals
+    /// [`Svq3MbType::num_motion_vectors`] for the macroblock type.
+    pub mv_differences: Vec<MotionVectorDifference>,
+}
+
+/// Read an inter-macroblock motion header from the slice body bit
+/// reader.
+///
+/// Composes the precision selector and the per-partition MV-difference
+/// list for an inter-coded macroblock, in the wiki's documented field
+/// order. `has_thirdpel` / `has_halfpel` come from the sequence
+/// header's precision-capability flags; `frame_type` governs whether
+/// the precision selector consumes a bit (P-frame) or is implicit
+/// halfpel (B-frame).
+///
+/// SKIP macroblocks carry no motion header and B-direct macroblocks
+/// derive their motion vectors rather than coding them; callers should
+/// detect those via [`Svq3MbType::is_skip`] /
+/// [`Svq3MbType::num_motion_vectors`] before invoking this. When this
+/// function is called on a zero-MV inter type it still reads the
+/// precision selector (the P-frame precision bit is part of the inter
+/// macroblock envelope) but produces an empty `mv_differences` list.
+///
+/// Returns [`crate::error::Error::Truncated`] on a short read at any
+/// field.
+pub fn read_inter_macroblock_header(
+    br: &mut BitReader<'_>,
+    mb_type: Svq3MbType,
+    frame_type: Svq3FrameType,
+    has_thirdpel: bool,
+    has_halfpel: bool,
+) -> Result<Svq3InterMacroblockHeader> {
+    let precision = read_inter_mv_precision(br, frame_type, has_thirdpel, has_halfpel)?;
+    let mv_differences = read_mb_mv_differences(br, mb_type)?;
+    Ok(Svq3InterMacroblockHeader {
+        precision,
+        mv_differences,
+    })
 }
 
 #[cfg(test)]
@@ -400,5 +464,116 @@ mod tests {
         // One bit must remain unconsumed (the trailing marker).
         assert_eq!(br.bits_remaining(), before - br.bits_consumed());
         assert_eq!(br.read_bit().unwrap(), 1);
+    }
+
+    #[test]
+    fn inter_mb_header_p_frame_16x16_reads_precision_then_one_mv() {
+        // No precision flags set → fullpel, zero precision bits.
+        // Then one (dy, dx) pair: dy = +2 (k=3), dx = +1 (k=1).
+        let buf = pack(&[se(2), se(1)]);
+        let mut br = BitReader::new(&buf);
+        let hdr = read_inter_macroblock_header(
+            &mut br,
+            Svq3MbType::PInter(PFrameInterMode::Inter16x16),
+            Svq3FrameType::Predicted,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(hdr.precision, Svq3MvPrecision::Fullpel);
+        assert_eq!(hdr.mv_differences.len(), 1);
+        assert_eq!(hdr.mv_differences[0].dy, 2);
+        assert_eq!(hdr.mv_differences[0].dx, 1);
+    }
+
+    #[test]
+    fn inter_mb_header_p_frame_precision_bit_consumed_before_mvs() {
+        // has_halfpel only → one precision bit. Bit `1` (!= has_thirdpel
+        // false) selects halfpel, then read one MV pair (0, 0).
+        let mut items = vec![(1u32, 1u32)];
+        items.push(ue(0));
+        items.push(ue(0));
+        let buf = pack(&items);
+        let mut br = BitReader::new(&buf);
+        let hdr = read_inter_macroblock_header(
+            &mut br,
+            Svq3MbType::PInter(PFrameInterMode::Inter16x16),
+            Svq3FrameType::Predicted,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(hdr.precision, Svq3MvPrecision::Halfpel);
+        assert_eq!(hdr.mv_differences.len(), 1);
+        assert_eq!(hdr.mv_differences[0], MotionVectorDifference::default());
+    }
+
+    #[test]
+    fn inter_mb_header_b_frame_is_implicit_halfpel_no_precision_bit() {
+        // B-frame forward block: no precision bit consumed, one MV pair.
+        let buf = pack(&[se(-1), se(3)]);
+        let mut br = BitReader::new(&buf);
+        let hdr = read_inter_macroblock_header(
+            &mut br,
+            Svq3MbType::BInter(BFrameInterMode::Forward),
+            Svq3FrameType::Bidirectional,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(hdr.precision, Svq3MvPrecision::Halfpel);
+        assert_eq!(hdr.mv_differences.len(), 1);
+        assert_eq!(hdr.mv_differences[0].dy, -1);
+        assert_eq!(hdr.mv_differences[0].dx, 3);
+    }
+
+    #[test]
+    fn inter_mb_header_8x8_reads_four_mvs() {
+        let zeros: Vec<(u32, u32)> = (0..8).map(|_| ue(0)).collect();
+        let buf = pack(&zeros);
+        let mut br = BitReader::new(&buf);
+        let hdr = read_inter_macroblock_header(
+            &mut br,
+            Svq3MbType::PInter(PFrameInterMode::Inter8x8),
+            Svq3FrameType::Predicted,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(hdr.mv_differences.len(), 4);
+    }
+
+    #[test]
+    fn inter_mb_header_skip_reads_precision_only() {
+        // SKIP carries zero MVs; with no precision flags it reads no bit.
+        let mut br = BitReader::new(&[]);
+        let hdr = read_inter_macroblock_header(
+            &mut br,
+            Svq3MbType::PInter(PFrameInterMode::Skip),
+            Svq3FrameType::Predicted,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(hdr.precision, Svq3MvPrecision::Fullpel);
+        assert!(hdr.mv_differences.is_empty());
+    }
+
+    #[test]
+    fn inter_mb_header_truncated_in_mvs_propagates() {
+        // Inter16x16 with fullpel (no precision bit) but only one
+        // codeword supplied → dx truncates.
+        let buf = pack(&[ue(0)]);
+        let mut br = BitReader::new(&buf);
+        assert!(matches!(
+            read_inter_macroblock_header(
+                &mut br,
+                Svq3MbType::PInter(PFrameInterMode::Inter16x16),
+                Svq3FrameType::Predicted,
+                false,
+                false,
+            ),
+            Err(crate::error::Error::Truncated)
+        ));
     }
 }

@@ -27,6 +27,20 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a DOCS-GAP: its codeword↔value mapping is the H.264 `me(v)` table,
   not reproduced under `docs/video/svq3/`.
 
+- **Round 353 — SVQ3 inter-macroblock motion-header composition
+  (`svq3_mv`).** Adds `Svq3InterMacroblockHeader` + the
+  `read_inter_macroblock_header` entry point composing the two staged
+  inter-MB wire fields in the wiki's documented order: the frame-type
+  aware precision selector (`svq3_mb::read_inter_mv_precision`, which
+  consumes a bit on P-frames and is implicit halfpel on B-frames) then
+  the per-partition MV-difference list. 6 further tests cover P-frame
+  fullpel/halfpel precision-bit consumption ordering, B-frame implicit
+  halfpel, the 8×8 four-MV case, SKIP (precision-only) parsing, and
+  mid-field truncation. This is the first end-to-end composition of the
+  SVQ3 inter-MB header from raw slice bits toward P-frame decode; the
+  CBP read + absolute-MV predictor reconstruction remain the open
+  gaps.
+
 - **Round 339 — SVQ3 macroblock-level intra predictor-selection loop
   (`svq3_recon`).** Assembles the leaf primitives into the
   macroblock-level reconstruction loop the README named as the open
