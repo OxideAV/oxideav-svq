@@ -97,27 +97,37 @@ full plane reconstruction is blocked on bitstream-driven field decode.
   fallback (`predict_dc_16x16`), and the chroma "DC mode only"
   predictor (`predict_chroma_dc_8x8`, per-quadrant availability
   averaging) land from Gap 4.
-* **Macroblock-level intra predictor-selection loop (`svq3_recon`).**
+* **Residual interleave per-element formula (spec/01 Gap 2).**
+  `dequantize_transform_luma_block` (and its `_with_dc` separate-DC
+  variant) compose the now-pinned per-element formula
+  `out = (coeff·DEQUANT_COEFF_TABLE[Q] + dc + 0x80000) >> 20`: a
+  per-coefficient dequant-scale, the two-sided `M·X·Mᵀ` transform
+  (`apply_luma_transform_2d`), then the fused `+0x80000 >>20` — the
+  single post-transform shift (no extra H.264 `>>6`).
+* **Macroblock-level reconstruction composition (`svq3_recon`).**
   `reconstruct_intra_luma_macroblock` drives the 16 luma 4×4
   sub-blocks of a `LumaMacroblock` in the wiki's documented processing
   order (`INTRA_4X4_SCAN_ORDER` / `LUMA_BLOCK_GRID_POS`), assembling
   each sub-block's neighbours from the running reconstructed plane
   (including the out-of-MB above/left rows), selecting + applying the
-  predictor, and composing the caller-supplied residual block via
-  Gap 5's `Clip1(pred + residual)` writeback.
+  predictor, and composing the residual via Gap 5's
+  `Clip1(pred + residual)` writeback.
+  `reconstruct_intra_luma_macroblock_from_coeffs` is the
+  residual-owning end-to-end form: it takes the placed coefficient
+  grids + slice quantiser and runs the Gap 2 interleave internally.
 * The predicted+residual writeback composition (`reconstruct_sample` /
   `reconstruct_4x4`): the 8-bit saturating `Clip1(pred + residual)` sum
   with no extra rounding on the add, pinned by spec/01 Gap 5.
 
-The remaining SVQ3 gaps are the **residual pipeline interleave** (the
-dequant-multiply / `M·X·Mᵀ` transform / fused `>>20` ordering of
-spec/01 Gap 2, given prose-level but not as an unambiguous per-element
-formula), the **motion-vector-component VLC**, and **CBP coding** (both
-back-referenced to H.264, not enumerated bit-for-bit). The intra
-predictor-selection loop is residual-provider-driven until the residual
-interleave is pinned. The 4×4 scan-order arrays (spec/01 Gap 1), the
-writeback clamp (spec/01 Gap 5), and now the full intra
-predictor-selection loop (spec/01 Gap 3/4 + the wiki scan order) are
+The remaining SVQ3 gaps are the **motion-vector-component VLC** and
+**CBP coding** — both back-referenced to H.264 by the wiki ("CBP is
+coded the same way as in H.264" / "motion vector differences are coded
+as signed variable-length codes") but **not enumerated bit-for-bit**
+under `docs/video/svq3/`, so the wire-format decode that *feeds* the
+reconstruction stays gated. The 4×4 scan-order arrays (Gap 1), the
+two-sided transform + residual interleave (Gap 2), the intra-mode
+binding + predictors (Gap 3/4), the writeback clamp (Gap 5), and the
+full intra predictor-selection / reconstruction-composition loop are
 landed.
 
 ## Cargo features
