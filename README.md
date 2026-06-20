@@ -118,17 +118,34 @@ full plane reconstruction is blocked on bitstream-driven field decode.
 * The predicted+residual writeback composition (`reconstruct_sample` /
   `reconstruct_4x4`): the 8-bit saturating `Clip1(pred + residual)` sum
   with no extra rounding on the add, pinned by spec/01 Gap 5.
+* **Signed-Golomb entropy layer + inter-macroblock motion header
+  (`svq3_mv`).** The signed variable-length codes the wiki §"Inter
+  macroblock information decoding" names: `read_se_golomb` (signed
+  Exp-Golomb `se(v)`, the canonical signed pairing of the existing
+  `read_ue_golomb`), `read_mv_difference` (one MV difference, **Y
+  component first** then X, into `MotionVectorDifference`),
+  `read_mb_mv_differences` (the exact per-partition count from
+  `Svq3MbType::num_motion_vectors`), and `read_quantiser_delta`. The
+  `read_inter_macroblock_header` composer joins the frame-type aware
+  precision selector (`read_inter_mv_precision`) and the MV-difference
+  list into an `Svq3InterMacroblockHeader` — the first end-to-end
+  parse of the SVQ3 inter-MB header from raw slice bits.
 
-The remaining SVQ3 gaps are the **motion-vector-component VLC** and
-**CBP coding** — both back-referenced to H.264 by the wiki ("CBP is
-coded the same way as in H.264" / "motion vector differences are coded
-as signed variable-length codes") but **not enumerated bit-for-bit**
-under `docs/video/svq3/`, so the wire-format decode that *feeds* the
-reconstruction stays gated. The 4×4 scan-order arrays (Gap 1), the
-two-sided transform + residual interleave (Gap 2), the intra-mode
-binding + predictors (Gap 3/4), the writeback clamp (Gap 5), and the
-full intra predictor-selection / reconstruction-composition loop are
-landed.
+The remaining SVQ3 gap toward a full P-frame pixel decode is the
+**CBP coded-block-pattern read**, which the wiki defers wholesale to
+H.264 ("CBP is coded the same way as in H.264"). Its codeword↔value
+mapping is the H.264 `me(v)` mapped-Exp-Golomb table (ITU-T Table 9-4,
+intra/inter × chroma-format), which is **not reproduced** under
+`docs/video/svq3/`, so the CBP wire decode — and therefore which
+residual blocks are present — stays gated on a docs trace. The
+intra-4×4 prediction-mode VLC bit patterns (the 25-pair table is
+staged in `INTRA_PRED_PAIRS`, but its codeword→pair-index mapping is
+not) are blocked on the same kind of trace. The 4×4 scan-order arrays
+(Gap 1), the two-sided transform + residual interleave (Gap 2), the
+intra-mode binding + predictors (Gap 3/4), the writeback clamp
+(Gap 5), the full intra reconstruction-composition loop, and now the
+signed-Golomb MV-difference / quant-delta / inter-MB-header wire
+decode are landed.
 
 ## Cargo features
 
