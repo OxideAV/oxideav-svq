@@ -34,23 +34,29 @@
 //!
 //! ## What this loop does NOT do (genuine docs gaps)
 //!
-//! The loop is **residual-provider-driven**: the caller supplies each
-//! sub-block's already-dequantised + inverse-transformed residual
-//! `[i32; 16]` block. The residual pipeline itself (place → dequant ·
-//! `svq3_dequant_coeff[Q]` → the two-sided `M·X·Mᵀ` transform → the
-//! fused `+0x80000 >> 20`) is described prose-level by
-//! `docs/video/svq3/spec/01` Gap 2 but the *exact interleave* of the
-//! per-coefficient dequant multiply with the two transform passes (and
-//! the DC-fold ordering) is not given as an unambiguous per-element
-//! formula, so the residual composition stays a deferred docs-gap. The
-//! predictor-selection + neighbour-sequencing + writeback loop — the
-//! named lacks-tail item — is what this module delivers.
+//! ## Two reconstruction entry points
+//!
+//! [`reconstruct_intra_luma_macroblock`] is **residual-provider-driven**:
+//! the caller supplies each sub-block's already-dequantised +
+//! inverse-transformed residual `[i32; 16]` block. As of spec/01 Gap 2
+//! the residual pipeline (place → dequant · `svq3_dequant_coeff[Q]` →
+//! two-sided `M·X·Mᵀ` transform → fused `+0x80000 >> 20`) is now pinned
+//! as an unambiguous per-element formula
+//! ([`crate::svq3_dequant::dequantize_transform_luma_block`]), so
+//! [`reconstruct_intra_luma_macroblock_from_coeffs`] now owns the
+//! **full** per-block composition: it takes the placed coefficient grids
+//! plus the slice quantiser, runs the residual interleave internally,
+//! then drives the same predictor-selection / neighbour-sequencing /
+//! writeback loop.
 //!
 //! Inter (motion-compensated) macroblocks, CBP-driven residual
-//! presence, and the intra-mode VLC wire decode are likewise still
-//! gated on their own docs gaps (CBP "same as H.264" / MV-component VLC
-//! not enumerated bit-for-bit) and are not driven here.
+//! presence, and the intra-mode VLC wire decode are still gated on their
+//! own docs gaps (the wiki states only "CBP is coded the same way as in
+//! H.264" / "motion vector differences are coded as signed
+//! variable-length codes" without enumerating the H.264 CBP code-number
+//! mapping or the MV-VLC bit layout) and are not driven here.
 
+use crate::svq3_dequant::dequantize_transform_luma_block;
 use crate::svq3_pred::{
     predict_intra_4x4, reconstruct_4x4, Intra4x4Neighbours, Svq3IntraMode, PRED_4X4_DIM,
     PRED_4X4_SAMPLES,
@@ -299,6 +305,61 @@ pub fn reconstruct_intra_luma_macroblock(
     }
 }
 
+/// Reconstruct one 16×16 luma macroblock's 4×4-intra sub-blocks
+/// **end-to-end from placed coefficient grids** — the full per-block
+/// reconstruction composition.
+///
+/// This is the residual-owning counterpart to
+/// [`reconstruct_intra_luma_macroblock`]: rather than the caller
+/// supplying pre-computed `[i32; 16]` residuals, each sub-block's
+/// **placed coefficient grid** (`coeff_blocks[index]`, the row-major
+/// dezigzagged output of [`crate::svq3_scan::place_4x4`]) is run through
+/// the spec/01 Gap 2 residual interleave
+/// [`crate::svq3_dequant::dequantize_transform_luma_block`] (per-element
+/// `out = (coeff·DEQUANT_COEFF_TABLE[Q] + 0x80000) >> 20` with the
+/// two-sided `M·X·Mᵀ` transform folded in) at the slice quantiser `q`,
+/// then the same predictor-selection / neighbour-sequencing / writeback
+/// loop runs.
+///
+/// `modes[index]` / `coeff_blocks[index]` are indexed by the **block
+/// index** (raster `0..=15`, the index space the wiki picture and
+/// [`LUMA_BLOCK_GRID_POS`] use). The `q` argument is the slice
+/// quantiser; it must satisfy `q < DEQUANT_COEFF_TABLE_LEN`. On return
+/// `mb.samples` holds the fully reconstructed 16×16 luma plane.
+///
+/// This entry point covers the no-separate-DC luma case (`dc = 0`); the
+/// separate-DC-block branch (where `dc = INTRA_LUMA_DC_SCALE · dc_block[i]`
+/// is folded in per sub-block) layers on top of
+/// [`crate::svq3_dequant::dequantize_transform_luma_block_with_dc`] once
+/// the separate-DC presence is decoded from the (still-deferred) CBP /
+/// MB-type wire format.
+///
+/// # Panics
+///
+/// Panics if `q >= DEQUANT_COEFF_TABLE_LEN`.
+pub fn reconstruct_intra_luma_macroblock_from_coeffs(
+    mb: &mut LumaMacroblock,
+    modes: &[Svq3IntraMode; MB_LUMA_BLOCKS],
+    coeff_blocks: &[[i32; PRED_4X4_SAMPLES]; MB_LUMA_BLOCKS],
+    q: u32,
+) {
+    for &scan_index in crate::svq3_mb::INTRA_4X4_SCAN_ORDER.iter() {
+        let index = scan_index as usize;
+        let (gr, gc) = LUMA_BLOCK_GRID_POS[index];
+        let by = gr * PRED_4X4_DIM;
+        let bx = gc * PRED_4X4_DIM;
+
+        // Spec/01 Gap 2 residual interleave: place → dequant·scale →
+        // two-sided transform → fused +0x80000 >>20.
+        let residual = dequantize_transform_luma_block(q, coeff_blocks[index]);
+
+        let nb = mb.neighbours_at(bx, by);
+        let predicted = predict_intra_4x4(modes[index], nb);
+        let recon = reconstruct_4x4(predicted, residual);
+        mb.write_block(bx, by, recon);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +518,98 @@ mod tests {
         assert_eq!(mb.sample(0, 0), 138);
         // Neighbouring sample untouched.
         assert_eq!(mb.sample(1, 0), 128);
+    }
+
+    // ---- End-to-end from coefficient grids (spec/01 Gap 2 + loop) ------
+
+    #[test]
+    fn from_coeffs_zero_coefficients_matches_zero_residual_path() {
+        // All-zero coefficient grids ⇒ all-zero residuals ⇒ identical to
+        // the residual-provider path with zero residuals: flat-128 DC MB.
+        let modes = [Svq3IntraMode::Dc; MB_LUMA_BLOCKS];
+        let coeffs = [[0i32; 16]; MB_LUMA_BLOCKS];
+
+        let mut mb_a = LumaMacroblock::new();
+        reconstruct_intra_luma_macroblock_from_coeffs(&mut mb_a, &modes, &coeffs, 12);
+
+        let mut mb_b = LumaMacroblock::new();
+        let residuals = [[0i32; 16]; MB_LUMA_BLOCKS];
+        reconstruct_intra_luma_macroblock(&mut mb_b, &modes, &residuals);
+
+        assert_eq!(mb_a.samples, mb_b.samples);
+        assert!(mb_a.samples.iter().all(|&s| s == 128));
+    }
+
+    #[test]
+    fn from_coeffs_equals_manual_residual_interleave_then_loop() {
+        // Drive the end-to-end path and the explicit
+        // (per-block residual interleave → residual-provider loop) path
+        // on the same coefficient grids; they must agree exactly.
+        use crate::svq3_dequant::dequantize_transform_luma_block;
+
+        let q = 9;
+        let modes = [Svq3IntraMode::Dc; MB_LUMA_BLOCKS];
+        let mut coeffs = [[0i32; 16]; MB_LUMA_BLOCKS];
+        // Seed a few blocks with structured coefficients.
+        for (bi, blk) in coeffs.iter_mut().enumerate() {
+            for (ci, c) in blk.iter_mut().enumerate() {
+                *c = ((bi as i32) * 2 + (ci as i32) - 8) % 5;
+            }
+        }
+
+        let mut mb_e2e = LumaMacroblock::new();
+        reconstruct_intra_luma_macroblock_from_coeffs(&mut mb_e2e, &modes, &coeffs, q);
+
+        let mut residuals = [[0i32; 16]; MB_LUMA_BLOCKS];
+        for (i, r) in residuals.iter_mut().enumerate() {
+            *r = dequantize_transform_luma_block(q, coeffs[i]);
+        }
+        let mut mb_manual = LumaMacroblock::new();
+        reconstruct_intra_luma_macroblock(&mut mb_manual, &modes, &residuals);
+
+        assert_eq!(mb_e2e.samples, mb_manual.samples);
+    }
+
+    #[test]
+    fn from_coeffs_pure_dc_block_shifts_flat_prediction() {
+        // A single pure-DC coefficient in block 0 produces a flat
+        // residual across that block, lifting the DC-predicted 128 plane
+        // uniformly over block 0's 4×4 footprint.
+        use crate::svq3_dequant::dequantize_transform_luma_block;
+        let q = 14;
+        let modes = [Svq3IntraMode::Dc; MB_LUMA_BLOCKS];
+        let mut coeffs = [[0i32; 16]; MB_LUMA_BLOCKS];
+        coeffs[0][0] = 1; // pure DC in block 0 (grid (0,0) → pixel (0,0))
+
+        let mut mb = LumaMacroblock::new();
+        reconstruct_intra_luma_macroblock_from_coeffs(&mut mb, &modes, &coeffs, q);
+
+        let residual = dequantize_transform_luma_block(q, coeffs[0]);
+        let expected = (128 + residual[0]).clamp(0, 255) as u8;
+        // Block 0 footprint is pixels (0..4, 0..4); all flat == expected.
+        for y in 0..4 {
+            for x in 0..4 {
+                assert_eq!(mb.sample(x, y), expected, "({x},{y})");
+            }
+        }
+        // The single non-zero coefficient was in block 0, so block 0's
+        // reconstruction differs from the bare flat-128 DC prediction.
+        assert_ne!(expected, 128, "pure-DC residual must move the plane");
+    }
+
+    #[test]
+    #[should_panic]
+    fn from_coeffs_panics_on_out_of_range_quantiser() {
+        use crate::svq3_dequant::DEQUANT_COEFF_TABLE_LEN;
+        let mut mb = LumaMacroblock::new();
+        let modes = [Svq3IntraMode::Dc; MB_LUMA_BLOCKS];
+        let coeffs = [[0i32; 16]; MB_LUMA_BLOCKS];
+        reconstruct_intra_luma_macroblock_from_coeffs(
+            &mut mb,
+            &modes,
+            &coeffs,
+            DEQUANT_COEFF_TABLE_LEN as u32,
+        );
     }
 
     #[test]
