@@ -58,8 +58,8 @@
 
 use crate::svq3_dequant::dequantize_transform_luma_block;
 use crate::svq3_pred::{
-    predict_intra_4x4, reconstruct_4x4, Intra4x4Neighbours, Svq3IntraMode, PRED_4X4_DIM,
-    PRED_4X4_SAMPLES,
+    predict_dc_16x16, predict_intra_4x4, predict_plane_16x16, reconstruct_4x4, reconstruct_sample,
+    Intra4x4Neighbours, Svq3IntraMode, PRED_16X16_DIM, PRED_4X4_DIM, PRED_4X4_SAMPLES,
 };
 
 /// Side length of a luma macroblock in pixels.
@@ -360,6 +360,129 @@ pub fn reconstruct_intra_luma_macroblock_from_coeffs(
     }
 }
 
+/// The macroblock-wide intra-16×16 luma predictor selection.
+///
+/// Per `docs/video/svq3/spec/01-reconstruction-composition.md` Gap 4 the
+/// SVQ3 16×16 luma intra path uses **one** predictor for the whole
+/// macroblock (there is no per-4×4 mode selection — that is the distinct
+/// 4×4-intra path driven by [`reconstruct_intra_luma_macroblock_from_coeffs`]).
+/// Gap 4 pins the SVQ3 16×16 **plane** predictor (the H.264 plane "but
+/// transposed"); the standard H.264 16×16 **DC** predictor is the
+/// edge-macroblock fallback used when the plane predictor's neighbours
+/// are not both available.
+///
+/// This enum is the resolved predictor choice the caller supplies; the
+/// wire decode that *selects* it (the 16×16 intra-mode signalling inside
+/// the predefined-CBP MB-type code) is a deferred docs gap, so the
+/// reconstruction entry point takes the resolved mode directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Svq3Luma16x16Mode {
+    /// The SVQ3 transposed-plane predictor
+    /// ([`crate::svq3_pred::predict_plane_16x16`], Gap 4). Requires both
+    /// the above row and left column to be available.
+    Plane,
+    /// The H.264 16×16 DC predictor
+    /// ([`crate::svq3_pred::predict_dc_16x16`]) — the availability-driven
+    /// average used at macroblock edges where the plane predictor's
+    /// neighbours are not both present.
+    Dc,
+}
+
+impl LumaMacroblock {
+    /// Build the macroblock-wide 16×16 luma prediction plane for the
+    /// supplied [`Svq3Luma16x16Mode`].
+    ///
+    /// The plane predictor reads the full 16-sample above row + left
+    /// column ([`Self::above`] / [`Self::leftcol`]); the DC predictor
+    /// reads the same rows but with the availability-driven averaging.
+    /// The returned plane is row-major (`pred[y * 16 + x]`).
+    #[must_use]
+    fn predict_16x16(&self, mode: Svq3Luma16x16Mode) -> [u8; MB_LUMA_DIM * MB_LUMA_DIM] {
+        match mode {
+            Svq3Luma16x16Mode::Plane => predict_plane_16x16(self.above, self.leftcol),
+            Svq3Luma16x16Mode::Dc => predict_dc_16x16(
+                self.above,
+                self.leftcol,
+                self.above_available,
+                self.left_available,
+            ),
+        }
+    }
+}
+
+/// Reconstruct one 16×16 **intra-16×16** luma macroblock end-to-end from
+/// placed coefficient grids.
+///
+/// This is the 16×16-intra counterpart to
+/// [`reconstruct_intra_luma_macroblock_from_coeffs`]. The SVQ3 16×16
+/// intra path differs structurally from the 4×4-intra path
+/// (`docs/video/svq3/spec/01-reconstruction-composition.md` Gap 4):
+///
+/// 1. **One predictor for the whole macroblock.** The supplied
+///    [`Svq3Luma16x16Mode`] produces a single 16×16 prediction plane
+///    (transposed-plane or DC), rather than 16 independently-predicted
+///    4×4 sub-blocks. No neighbour sequencing within the macroblock is
+///    needed — the predictor reads only the out-of-MB above row + left
+///    column.
+/// 2. **Residual added per 4×4 sub-block in raster order.** Each of the
+///    16 luma 4×4 sub-blocks still carries its own residual coefficient
+///    grid; each grid is run through the Gap 2 residual interleave
+///    ([`crate::svq3_dequant::dequantize_transform_luma_block`]) at the
+///    slice quantiser `q` and added onto the matching 4×4 region of the
+///    prediction plane with the Gap 5 saturating
+///    `Clip1(pred + residual)` writeback.
+///
+/// `coeff_blocks[index]` is the row-major placed coefficient grid for
+/// luma 4×4 sub-block `index`; sub-blocks are indexed in **raster**
+/// order (`index = grid_row * 4 + grid_col`, pixel origin
+/// `(grid_col*4, grid_row*4)`) — the natural 16×16 raster, distinct from
+/// the 4×4-intra path's wiki scan order, because the 16×16 predictor has
+/// no intra-mode dependency to sequence. `q` is the slice quantiser; it
+/// must satisfy `q < DEQUANT_COEFF_TABLE_LEN`. On return `mb.samples`
+/// holds the fully reconstructed 16×16 luma plane.
+///
+/// Like its 4×4 counterpart this covers the no-separate-DC case
+/// (`dc = 0`); the separate-DC-block branch layers on top of
+/// [`crate::svq3_dequant::dequantize_transform_luma_block_with_dc`] once
+/// the separate-DC presence is decoded from the (still-deferred) MB-type
+/// wire format.
+///
+/// # Panics
+///
+/// Panics if `q >= DEQUANT_COEFF_TABLE_LEN`.
+pub fn reconstruct_intra_16x16_luma_macroblock_from_coeffs(
+    mb: &mut LumaMacroblock,
+    mode: Svq3Luma16x16Mode,
+    coeff_blocks: &[[i32; PRED_4X4_SAMPLES]; MB_LUMA_BLOCKS],
+    q: u32,
+) {
+    // One macroblock-wide prediction plane (Gap 4).
+    let plane = mb.predict_16x16(mode);
+
+    // Add each 4×4 sub-block's residual onto the matching plane region,
+    // in raster order (no intra-mode sequencing for the 16×16 path).
+    for (index, coeff_block) in coeff_blocks.iter().enumerate() {
+        let gr = index / MB_GRID_DIM;
+        let gc = index % MB_GRID_DIM;
+        let by = gr * PRED_4X4_DIM;
+        let bx = gc * PRED_4X4_DIM;
+
+        // Spec/01 Gap 2 residual interleave.
+        let residual = dequantize_transform_luma_block(q, *coeff_block);
+
+        // Gap 5 saturating writeback over the predicted plane.
+        for r in 0..PRED_4X4_DIM {
+            for c in 0..PRED_4X4_DIM {
+                let px = bx + c;
+                let py = by + r;
+                let pred = plane[py * PRED_16X16_DIM + px];
+                let recon = reconstruct_sample(pred, residual[r * PRED_4X4_DIM + c]);
+                mb.samples[py * MB_LUMA_DIM + px] = recon;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,5 +762,114 @@ mod tests {
                 assert_eq!(mb.sample(x, y), leftcol[y], "({x},{y})");
             }
         }
+    }
+
+    // ---- Intra-16×16 luma macroblock reconstruction -------------------
+
+    #[test]
+    fn intra_16x16_dc_no_neighbours_zero_residual_is_flat_128() {
+        // A top-left 16×16-intra MB with no neighbours, DC mode, zero
+        // residual: the whole plane is flat 128.
+        let mut mb = LumaMacroblock::new();
+        let coeffs = [[0i32; 16]; MB_LUMA_BLOCKS];
+        reconstruct_intra_16x16_luma_macroblock_from_coeffs(
+            &mut mb,
+            Svq3Luma16x16Mode::Dc,
+            &coeffs,
+            12,
+        );
+        assert!(mb.samples.iter().all(|&s| s == 128), "expected flat 128");
+    }
+
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn intra_16x16_dc_with_both_neighbours_averages() {
+        // Both neighbours available, all samples = 100 → DC = average =
+        // 100; zero residual ⇒ flat 100.
+        let mut mb = LumaMacroblock::new();
+        mb.above = [100; 16];
+        mb.leftcol = [100; 16];
+        mb.above_available = true;
+        mb.left_available = true;
+        let coeffs = [[0i32; 16]; MB_LUMA_BLOCKS];
+        reconstruct_intra_16x16_luma_macroblock_from_coeffs(
+            &mut mb,
+            Svq3Luma16x16Mode::Dc,
+            &coeffs,
+            12,
+        );
+        assert!(mb.samples.iter().all(|&s| s == 100), "expected flat 100");
+    }
+
+    #[test]
+    fn intra_16x16_plane_flat_neighbours_is_flat() {
+        // Plane prediction over flat neighbours (all 80, corner irrelevant
+        // to the plane formula): H = V = 0, a = 16*(80+80) = 2560,
+        // pred = (2560 + 16) >> 5 = 80 everywhere. Zero residual ⇒ flat 80.
+        let mut mb = LumaMacroblock::new();
+        mb.above = [80; 16];
+        mb.leftcol = [80; 16];
+        mb.above_available = true;
+        mb.left_available = true;
+        let coeffs = [[0i32; 16]; MB_LUMA_BLOCKS];
+        reconstruct_intra_16x16_luma_macroblock_from_coeffs(
+            &mut mb,
+            Svq3Luma16x16Mode::Plane,
+            &coeffs,
+            12,
+        );
+        assert!(mb.samples.iter().all(|&s| s == 80), "expected flat 80");
+    }
+
+    #[test]
+    fn intra_16x16_residual_in_block_zero_lifts_only_that_region() {
+        // DC MB (flat 128) with a single residual coefficient in raster
+        // sub-block 0 (pixel region (0..4, 0..4)). The residual lifts
+        // that footprint; the rest stays flat 128.
+        let mut mb = LumaMacroblock::new();
+        let mut coeffs = [[0i32; 16]; MB_LUMA_BLOCKS];
+        coeffs[0][0] = 1; // pure DC coefficient in sub-block 0.
+        let q = 14;
+        reconstruct_intra_16x16_luma_macroblock_from_coeffs(
+            &mut mb,
+            Svq3Luma16x16Mode::Dc,
+            &coeffs,
+            q,
+        );
+        let residual = dequantize_transform_luma_block(q, coeffs[0]);
+        let expected = (128 + residual[0]).clamp(0, 255) as u8;
+        assert_ne!(expected, 128, "pure-DC residual must move the plane");
+        for y in 0..4 {
+            for x in 0..4 {
+                assert_eq!(mb.sample(x, y), expected, "block-0 ({x},{y})");
+            }
+        }
+        // A pixel outside block 0's footprint is untouched.
+        assert_eq!(mb.sample(8, 8), 128);
+    }
+
+    #[test]
+    fn intra_16x16_residual_maps_to_raster_subblock_position() {
+        // Raster sub-block index 5 is at grid (1, 1) → pixel origin
+        // (4, 4). A DC coefficient there must lift the (4..8, 4..8)
+        // region, confirming the raster index → pixel-origin mapping.
+        let mut mb = LumaMacroblock::new();
+        let mut coeffs = [[0i32; 16]; MB_LUMA_BLOCKS];
+        coeffs[5][0] = 2;
+        let q = 10;
+        reconstruct_intra_16x16_luma_macroblock_from_coeffs(
+            &mut mb,
+            Svq3Luma16x16Mode::Dc,
+            &coeffs,
+            q,
+        );
+        let residual = dequantize_transform_luma_block(q, coeffs[5]);
+        let expected = (128 + residual[0]).clamp(0, 255) as u8;
+        for y in 4..8 {
+            for x in 4..8 {
+                assert_eq!(mb.sample(x, y), expected, "block-5 ({x},{y})");
+            }
+        }
+        assert_eq!(mb.sample(0, 0), 128, "block-0 untouched");
     }
 }

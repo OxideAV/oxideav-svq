@@ -8,6 +8,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 356 — SVQ3 intra-16×16 luma macroblock reconstruction
+  (`svq3_recon`).** Lands the second whole-macroblock intra
+  reconstruction path beside the existing 4×4-intra loop, composing the
+  staged `docs/video/svq3/spec/01-reconstruction-composition.md` Gap 4
+  (16×16 predictors) + Gap 2 (residual interleave) + Gap 5 (saturating
+  writeback). New `Svq3Luma16x16Mode` enum (`Plane` / `Dc`) selects the
+  SVQ3 transposed-plane predictor (`predict_plane_16x16`) or the H.264
+  16×16 DC predictor (`predict_dc_16x16`) for the **whole** macroblock —
+  unlike the 4×4 path there is no per-sub-block intra-mode sequencing.
+  `reconstruct_intra_16x16_luma_macroblock_from_coeffs` builds the single
+  16×16 prediction plane, then adds each of the 16 luma 4×4 sub-blocks'
+  residual (Gap 2 dequant·scale → two-sided `M·X·Mᵀ` → fused
+  `+0x80000 >>20`) in raster order with the Gap 5 `Clip1(pred+residual)`
+  writeback. 5 unit tests cover flat-128 DC, both the DC and plane
+  predictor over flat neighbours, and the raster index→pixel-origin
+  residual mapping.
+
 - **Round 353 — SVQ3 signed-Golomb entropy layer: motion-vector
   difference + quantiser-delta wire decode (`svq3_mv`).** Lands the
   signed variable-length codes the wiki §"Inter macroblock information
