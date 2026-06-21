@@ -56,10 +56,14 @@
 //! variable-length codes" without enumerating the H.264 CBP code-number
 //! mapping or the MV-VLC bit layout) and are not driven here.
 
-use crate::svq3_dequant::dequantize_transform_luma_block;
+use crate::svq3_dequant::{
+    apply_chroma_dc_2x2_2d, dequantize_chroma_dc, dequantize_transform_luma_block,
+    dequantize_transform_luma_block_with_dc,
+};
 use crate::svq3_pred::{
-    predict_dc_16x16, predict_intra_4x4, predict_plane_16x16, reconstruct_4x4, reconstruct_sample,
-    Intra4x4Neighbours, Svq3IntraMode, PRED_16X16_DIM, PRED_4X4_DIM, PRED_4X4_SAMPLES,
+    predict_chroma_dc_8x8, predict_dc_16x16, predict_intra_4x4, predict_plane_16x16,
+    reconstruct_4x4, reconstruct_sample, Intra4x4Neighbours, Svq3IntraMode, PRED_16X16_DIM,
+    PRED_4X4_DIM, PRED_4X4_SAMPLES, PRED_CHROMA_DIM, PRED_CHROMA_SAMPLES,
 };
 
 /// Side length of a luma macroblock in pixels.
@@ -483,6 +487,164 @@ pub fn reconstruct_intra_16x16_luma_macroblock_from_coeffs(
     }
 }
 
+/// Side length of one 8×8 chroma plane (Cb or Cr) of a macroblock.
+pub const CHROMA_PLANE_DIM: usize = PRED_CHROMA_DIM;
+
+/// Side length of the chroma plane measured in 4×4 sub-blocks
+/// (`8 / 4 = 2`).
+pub const CHROMA_GRID_DIM: usize = CHROMA_PLANE_DIM / PRED_4X4_DIM;
+
+/// Number of chroma AC 4×4 sub-blocks in one 8×8 chroma plane
+/// (`2 × 2 = 4`).
+pub const CHROMA_PLANE_BLOCKS: usize = CHROMA_GRID_DIM * CHROMA_GRID_DIM;
+
+/// One 8×8 chroma plane (Cb or Cr) being reconstructed, plus the
+/// out-of-plane neighbour samples the DC predictor reads.
+///
+/// The plane is stored row-major (`samples[y * 8 + x]`). SVQ3 forces
+/// chroma to **DC-only** prediction
+/// (`docs/video/svq3/spec/01-reconstruction-composition.md` Gap 4 — "SVQ3
+/// forces chroma to DC mode only"), so the only neighbours read are the
+/// 8-sample above row + left column (no corner / plane fit). Their
+/// availability mirrors whether a neighbour macroblock exists in the
+/// slice, exactly as for [`LumaMacroblock`].
+#[derive(Debug, Clone)]
+pub struct ChromaPlane {
+    /// Reconstructed chroma samples, row-major, `8 × 8`.
+    pub samples: [u8; PRED_CHROMA_SAMPLES],
+    /// The 8 reconstructed samples directly above the plane
+    /// (`above[x]` = pixel at `(x, -1)`). Read only when
+    /// [`Self::above_available`] is set.
+    pub above: [u8; CHROMA_PLANE_DIM],
+    /// The 8 reconstructed samples directly to the left of the plane
+    /// (`leftcol[y]` = pixel at `(-1, y)`). Read only when
+    /// [`Self::left_available`] is set.
+    pub leftcol: [u8; CHROMA_PLANE_DIM],
+    /// Whether a neighbour macroblock exists above this plane.
+    pub above_available: bool,
+    /// Whether a neighbour macroblock exists to the left of this plane.
+    pub left_available: bool,
+}
+
+impl ChromaPlane {
+    /// A chroma plane with all samples / neighbours zeroed and both
+    /// neighbours marked unavailable (a top-left macroblock's plane).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            samples: [0u8; PRED_CHROMA_SAMPLES],
+            above: [0u8; CHROMA_PLANE_DIM],
+            leftcol: [0u8; CHROMA_PLANE_DIM],
+            above_available: false,
+            left_available: false,
+        }
+    }
+
+    /// Read the reconstructed sample at plane-relative pixel `(x, y)`
+    /// (both `0..=7`).
+    #[inline]
+    #[must_use]
+    pub const fn sample(&self, x: usize, y: usize) -> u8 {
+        self.samples[y * CHROMA_PLANE_DIM + x]
+    }
+}
+
+impl Default for ChromaPlane {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Reconstruct one 8×8 chroma plane (Cb or Cr) of an intra macroblock,
+/// end-to-end from the 2×2 chroma DC block plus the four chroma AC 4×4
+/// coefficient grids.
+///
+/// SVQ3 chroma reconstruction composes three staged facts from
+/// `docs/video/svq3/spec/01-reconstruction-composition.md`:
+///
+/// 1. **DC-only prediction (Gap 4).** The whole 8×8 plane is predicted by
+///    the chroma DC predictor ([`crate::svq3_pred::predict_chroma_dc_8x8`]),
+///    averaging the available 8-sample above row + left column per the
+///    four 4×4 quadrants. There is no plane / vertical / horizontal
+///    chroma mode in SVQ3.
+/// 2. **Separate 2×2 chroma DC block (Gap 2).** The four chroma DC
+///    coefficients (`dc_block`, row-major 2×2 placed grid) are first run
+///    through the `[[8,8],[8,−8]]` Hadamard
+///    ([`crate::svq3_dequant::apply_chroma_dc_2x2_2d`]) then the chroma DC
+///    dequant `(svq3_dequant_coeff[Q]·(block[0]>>3))>>1`
+///    ([`crate::svq3_dequant::dequantize_chroma_dc`]) — yielding one
+///    **pre-finalisation** DC term per chroma 4×4 quadrant. The
+///    `+ 0x80000 >> 20` finalisation is deliberately *not* applied here:
+///    Gap 2 places `dc` inside the fused per-coefficient store
+///    `out = (coeff·scale + dc + 0x80000) >> 20`, so the finalisation
+///    happens once, in step 3. The 2×2 → quadrant mapping is row-major:
+///    DC index `qr*2 + qc` feeds quadrant `(qr, qc)`.
+/// 3. **Chroma AC residual interleave (Gap 2).** Each chroma 4×4
+///    quadrant's AC coefficient grid (`ac_blocks[index]`, raster
+///    `index = qr*2 + qc`) is run through the same dequant·scale →
+///    two-sided `M·X·Mᵀ` transform → fused `+ dc + 0x80000 >> 20` store
+///    as luma, with the per-block `dc` override set to that quadrant's
+///    pre-finalisation chroma DC term from step 2
+///    ([`crate::svq3_dequant::dequantize_transform_luma_block_with_dc`]).
+///
+/// The Gap 5 saturating `Clip1(pred + residual)` writeback then composes
+/// the predicted plane with each quadrant's residual. On return
+/// `plane.samples` holds the fully reconstructed 8×8 chroma plane.
+///
+/// `q` is the slice quantiser; it must satisfy `q < DEQUANT_COEFF_TABLE_LEN`.
+///
+/// # Panics
+///
+/// Panics if `q >= DEQUANT_COEFF_TABLE_LEN`.
+pub fn reconstruct_intra_chroma_plane_from_coeffs(
+    plane: &mut ChromaPlane,
+    dc_block: [i32; CHROMA_PLANE_BLOCKS],
+    ac_blocks: &[[i32; PRED_4X4_SAMPLES]; CHROMA_PLANE_BLOCKS],
+    q: u32,
+) {
+    // Gap 4: DC-only prediction over the whole 8×8 plane.
+    let predicted = predict_chroma_dc_8x8(
+        plane.above,
+        plane.leftcol,
+        plane.above_available,
+        plane.left_available,
+    );
+
+    // Gap 2: Hadamard-transform + chroma-dequant the separate 2×2 chroma
+    // DC block into four **pre-finalisation** DC terms, one per chroma
+    // quadrant. The +0x80000 >>20 finalisation is folded into the fused
+    // per-coefficient store below (via `_with_dc`), not applied here.
+    let transformed_dc = apply_chroma_dc_2x2_2d(dc_block);
+    let chroma_dc = [
+        dequantize_chroma_dc(q, transformed_dc[0]),
+        dequantize_chroma_dc(q, transformed_dc[1]),
+        dequantize_chroma_dc(q, transformed_dc[2]),
+        dequantize_chroma_dc(q, transformed_dc[3]),
+    ];
+
+    // For each chroma 4×4 quadrant (raster index qr*2 + qc): interleave
+    // the AC residual with the quadrant's chroma DC override, then add
+    // onto the predicted plane with the Gap 5 saturating writeback.
+    for (index, ac_block) in ac_blocks.iter().enumerate() {
+        let qr = index / CHROMA_GRID_DIM;
+        let qc = index % CHROMA_GRID_DIM;
+        let by = qr * PRED_4X4_DIM;
+        let bx = qc * PRED_4X4_DIM;
+
+        let residual = dequantize_transform_luma_block_with_dc(q, *ac_block, chroma_dc[index]);
+
+        for r in 0..PRED_4X4_DIM {
+            for c in 0..PRED_4X4_DIM {
+                let px = bx + c;
+                let py = by + r;
+                let pred = predicted[py * CHROMA_PLANE_DIM + px];
+                let recon = reconstruct_sample(pred, residual[r * PRED_4X4_DIM + c]);
+                plane.samples[py * CHROMA_PLANE_DIM + px] = recon;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -871,5 +1033,121 @@ mod tests {
             }
         }
         assert_eq!(mb.sample(0, 0), 128, "block-0 untouched");
+    }
+
+    // ---- Intra chroma 8×8 plane reconstruction ------------------------
+
+    #[test]
+    fn chroma_constants() {
+        assert_eq!(CHROMA_PLANE_DIM, 8);
+        assert_eq!(CHROMA_GRID_DIM, 2);
+        assert_eq!(CHROMA_PLANE_BLOCKS, 4);
+    }
+
+    #[test]
+    fn chroma_no_neighbours_zero_residual_is_flat_128() {
+        // Top-left plane: DC predicts 128 everywhere; zero DC block + zero
+        // AC ⇒ flat 128.
+        let mut plane = ChromaPlane::new();
+        let dc_block = [0i32; CHROMA_PLANE_BLOCKS];
+        let ac = [[0i32; 16]; CHROMA_PLANE_BLOCKS];
+        reconstruct_intra_chroma_plane_from_coeffs(&mut plane, dc_block, &ac, 12);
+        assert!(plane.samples.iter().all(|&s| s == 128), "expected flat 128");
+    }
+
+    #[test]
+    fn chroma_both_neighbours_dc_averages() {
+        // Both neighbours = 90 everywhere → each quadrant DC =
+        // (Σ4top + Σ4left + 4) >> 3 = (360 + 360 + 4) >> 3 = 90. Zero
+        // residual ⇒ flat 90.
+        let mut plane = ChromaPlane::new();
+        plane.above = [90; 8];
+        plane.leftcol = [90; 8];
+        plane.above_available = true;
+        plane.left_available = true;
+        let dc_block = [0i32; CHROMA_PLANE_BLOCKS];
+        let ac = [[0i32; 16]; CHROMA_PLANE_BLOCKS];
+        reconstruct_intra_chroma_plane_from_coeffs(&mut plane, dc_block, &ac, 12);
+        assert!(plane.samples.iter().all(|&s| s == 90), "expected flat 90");
+    }
+
+    #[test]
+    fn chroma_dc_block_lifts_quadrants_uniformly() {
+        // A single chroma DC coefficient at 2×2 index 0 feeds quadrant
+        // (0,0) (pixels (0..4, 0..4)). The chroma DC residual for that
+        // quadrant lifts the DC-128 prediction uniformly over its
+        // footprint; the other quadrants stay at the flat DC prediction.
+        let mut plane = ChromaPlane::new();
+        let mut dc_block = [0i32; CHROMA_PLANE_BLOCKS];
+        dc_block[0] = 2; // 2×2 DC index 0 → quadrant (0,0).
+        let ac = [[0i32; 16]; CHROMA_PLANE_BLOCKS];
+        let q = 14;
+        reconstruct_intra_chroma_plane_from_coeffs(&mut plane, dc_block, &ac, q);
+
+        // Recompute the expected quadrant-0 DC residual independently:
+        // Hadamard → pre-finalise chroma dequant → fused store with the
+        // DC override (no double finalisation).
+        let transformed = apply_chroma_dc_2x2_2d(dc_block);
+        let pre_dc = dequantize_chroma_dc(q, transformed[0]);
+        let residual = dequantize_transform_luma_block_with_dc(q, [0i32; 16], pre_dc);
+        let expected = (128 + residual[0]).clamp(0, 255) as u8;
+        for y in 0..4 {
+            for x in 0..4 {
+                assert_eq!(plane.sample(x, y), expected, "quadrant-0 ({x},{y})");
+            }
+        }
+        // Quadrant (1,1) (pixels (4..8, 4..8)) carried DC index 3 = 0, so
+        // it stays at the flat DC prediction of 128.
+        assert_eq!(plane.sample(6, 6), 128, "quadrant-3 untouched");
+    }
+
+    #[test]
+    fn chroma_dc_index_maps_to_raster_quadrant() {
+        // 2×2 DC index 3 = quadrant (1,1) → pixels (4..8, 4..8). A DC
+        // coefficient there must lift that quadrant only.
+        let mut plane = ChromaPlane::new();
+        let mut dc_block = [0i32; CHROMA_PLANE_BLOCKS];
+        dc_block[3] = 3;
+        let ac = [[0i32; 16]; CHROMA_PLANE_BLOCKS];
+        let q = 10;
+        reconstruct_intra_chroma_plane_from_coeffs(&mut plane, dc_block, &ac, q);
+
+        let transformed = apply_chroma_dc_2x2_2d(dc_block);
+        let pre_dc = dequantize_chroma_dc(q, transformed[3]);
+        let residual = dequantize_transform_luma_block_with_dc(q, [0i32; 16], pre_dc);
+        let expected = (128 + residual[0]).clamp(0, 255) as u8;
+        for y in 4..8 {
+            for x in 4..8 {
+                assert_eq!(plane.sample(x, y), expected, "quadrant-3 ({x},{y})");
+            }
+        }
+        assert_eq!(plane.sample(0, 0), 128, "quadrant-0 untouched");
+    }
+
+    #[test]
+    fn chroma_ac_residual_composes_with_prediction() {
+        // An AC coefficient in quadrant 0 produces a non-flat residual
+        // over that quadrant; verify the reconstruction differs from the
+        // bare flat DC prediction inside quadrant 0 and the result is a
+        // valid clamped plane.
+        let mut plane = ChromaPlane::new();
+        let dc_block = [0i32; CHROMA_PLANE_BLOCKS];
+        let mut ac = [[0i32; 16]; CHROMA_PLANE_BLOCKS];
+        ac[0][5] = 4; // a non-DC AC coefficient in quadrant 0.
+        let q = 9;
+        reconstruct_intra_chroma_plane_from_coeffs(&mut plane, dc_block, &ac, q);
+
+        let residual = dequantize_transform_luma_block_with_dc(q, ac[0], 0);
+        let mut differs = false;
+        for r in 0..4 {
+            for c in 0..4 {
+                let expected = (128 + residual[r * 4 + c]).clamp(0, 255) as u8;
+                assert_eq!(plane.sample(c, r), expected, "quadrant-0 ({c},{r})");
+                if expected != 128 {
+                    differs = true;
+                }
+            }
+        }
+        assert!(differs, "AC residual must move at least one sample");
     }
 }

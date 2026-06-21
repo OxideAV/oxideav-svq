@@ -8,6 +8,25 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 356 — SVQ3 intra chroma 8×8 plane reconstruction
+  (`svq3_recon`).** Lands the chroma-plane reconstruction path,
+  composing the staged
+  `docs/video/svq3/spec/01-reconstruction-composition.md` Gap 4
+  (chroma DC-only prediction), Gap 2 (separate 2×2 chroma DC block +
+  chroma AC residual interleave), and Gap 5 (saturating writeback). New
+  `ChromaPlane` carrier (8×8 samples + 8-sample above/left neighbours +
+  availability) and `reconstruct_intra_chroma_plane_from_coeffs`: the
+  whole 8×8 plane is DC-predicted (`predict_chroma_dc_8x8`, no plane /
+  vertical / horizontal chroma mode in SVQ3); the separate 2×2 chroma DC
+  block is `[[8,8],[8,−8]]` Hadamard-transformed then chroma-dequant'd
+  `(svq3_dequant_coeff[Q]·(block[0]>>3))>>1` into four **pre-finalisation**
+  DC terms (one per chroma 4×4 quadrant, row-major 2×2 index → quadrant);
+  each quadrant's chroma AC grid is then dequant·scaled → two-sided
+  `M·X·Mᵀ` → fused `+ dc + 0x80000 >>20` with that quadrant's DC as the
+  override, so the single `>>20` finalisation applies exactly once. 6
+  unit tests cover flat-128 DC, the both-neighbours average, the 2×2 DC
+  index→quadrant raster mapping, and AC residual composition.
+
 - **Round 356 — SVQ3 intra-16×16 luma macroblock reconstruction
   (`svq3_recon`).** Lands the second whole-macroblock intra
   reconstruction path beside the existing 4×4-intra loop, composing the
