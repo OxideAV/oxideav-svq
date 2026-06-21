@@ -645,6 +645,149 @@ pub fn reconstruct_intra_chroma_plane_from_coeffs(
     }
 }
 
+/// The luma intra-prediction regime for a whole intra macroblock.
+///
+/// Per `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock layer"
+/// an intra macroblock's luma plane is reconstructed either as 16
+/// independently-mode-predicted 4×4 sub-blocks (the 4×4-intra regime) or
+/// as a single 16×16 predictor (the 16×16-intra regime). The two regimes
+/// drive different reconstruction loops
+/// ([`reconstruct_intra_luma_macroblock_from_coeffs`] vs
+/// [`reconstruct_intra_16x16_luma_macroblock_from_coeffs`]); this enum
+/// carries the already-resolved choice plus its per-regime parameters.
+///
+/// The wire decode that *selects* the regime (the MB-type Golomb code +
+/// its predefined-CBP / intra-mode-pair sub-streams) is a deferred docs
+/// gap — the wiki names the MB-type codes but the CBP code-number
+/// mapping is "the same way as in H.264" without the table being staged.
+/// So this enum is supplied by the caller with the resolved modes /
+/// coefficient grids already in hand.
+#[derive(Debug, Clone)]
+pub enum Svq3LumaIntra {
+    /// 4×4-intra luma: 16 per-sub-block intra modes (indexed by raster
+    /// block index) + 16 placed coefficient grids.
+    Blocks4x4 {
+        /// Per-sub-block intra modes, indexed by raster block index.
+        modes: [Svq3IntraMode; MB_LUMA_BLOCKS],
+        /// Per-sub-block placed coefficient grids.
+        coeff_blocks: [[i32; PRED_4X4_SAMPLES]; MB_LUMA_BLOCKS],
+    },
+    /// 16×16-intra luma: one macroblock-wide predictor + 16 placed
+    /// coefficient grids (added in raster order).
+    Whole16x16 {
+        /// The macroblock-wide 16×16 predictor choice.
+        mode: Svq3Luma16x16Mode,
+        /// Per-sub-block placed coefficient grids (raster order).
+        coeff_blocks: [[i32; PRED_4X4_SAMPLES]; MB_LUMA_BLOCKS],
+    },
+}
+
+/// One fully-reconstructed intra macroblock: the 16×16 luma plane plus
+/// the two 8×8 chroma planes (Cb, Cr).
+///
+/// This is the assembly unit a frame walk emits per intra macroblock. It
+/// composes the three per-plane reconstruction paths this module owns
+/// (the 4×4-intra / 16×16-intra luma loop and the chroma 8×8 plane loop)
+/// behind a single carrier so the (deferred) frame walk can drive one MB
+/// at a time and read back all three reconstructed planes.
+#[derive(Debug, Clone)]
+pub struct Svq3IntraMacroblock {
+    /// The 16×16 luma plane (+ its out-of-MB neighbours).
+    pub luma: LumaMacroblock,
+    /// The 8×8 Cb chroma plane (+ its out-of-MB neighbours).
+    pub cb: ChromaPlane,
+    /// The 8×8 Cr chroma plane (+ its out-of-MB neighbours).
+    pub cr: ChromaPlane,
+}
+
+impl Svq3IntraMacroblock {
+    /// A macroblock with all three planes zeroed and every out-of-MB
+    /// neighbour marked unavailable (a top-left macroblock).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            luma: LumaMacroblock::new(),
+            cb: ChromaPlane::new(),
+            cr: ChromaPlane::new(),
+        }
+    }
+}
+
+impl Default for Svq3IntraMacroblock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The placed coefficient inputs for one chroma plane: the 2×2 chroma DC
+/// block plus the four chroma AC 4×4 grids.
+///
+/// Grouped so [`reconstruct_intra_macroblock`] can take both chroma
+/// planes' coefficients without a six-argument signature.
+#[derive(Debug, Clone)]
+pub struct ChromaPlaneCoeffs {
+    /// The placed 2×2 chroma DC block (row-major, 4 entries).
+    pub dc_block: [i32; CHROMA_PLANE_BLOCKS],
+    /// The four chroma AC 4×4 placed coefficient grids (raster
+    /// quadrant order).
+    pub ac_blocks: [[i32; PRED_4X4_SAMPLES]; CHROMA_PLANE_BLOCKS],
+}
+
+/// Reconstruct one whole intra macroblock — all three planes — from its
+/// resolved per-plane intra modes + placed coefficient grids.
+///
+/// Composes the three per-plane reconstruction entry points this module
+/// owns into the single-macroblock unit a frame walk consumes:
+///
+/// * **Luma** — dispatched on `luma` ([`Svq3LumaIntra`]): the 4×4-intra
+///   per-sub-block mode loop
+///   ([`reconstruct_intra_luma_macroblock_from_coeffs`]) or the
+///   16×16-intra whole-macroblock loop
+///   ([`reconstruct_intra_16x16_luma_macroblock_from_coeffs`]).
+/// * **Cb / Cr chroma** — each via
+///   [`reconstruct_intra_chroma_plane_from_coeffs`] (DC-only prediction +
+///   2×2 chroma DC + chroma AC interleave).
+///
+/// All three planes share the slice quantiser `q`. The macroblock's
+/// out-of-MB neighbour rows/columns (above / left / corner +
+/// availability flags) must already be populated on `mb.luma` / `mb.cb` /
+/// `mb.cr` before this call (the frame walk fills them from the
+/// previously-reconstructed neighbour macroblocks). On return all three
+/// planes' `samples` hold the fully reconstructed pixels.
+///
+/// This is the deepest composition spec/01 pins end-to-end for an intra
+/// macroblock; the wire decode that *produces* the modes / coefficient
+/// grids / quantiser (intra-mode VLC, CBP, MB-type Golomb) remains a
+/// deferred docs gap, so the inputs are supplied directly.
+///
+/// # Panics
+///
+/// Panics if `q >= DEQUANT_COEFF_TABLE_LEN`.
+pub fn reconstruct_intra_macroblock(
+    mb: &mut Svq3IntraMacroblock,
+    luma: &Svq3LumaIntra,
+    cb: &ChromaPlaneCoeffs,
+    cr: &ChromaPlaneCoeffs,
+    q: u32,
+) {
+    match luma {
+        Svq3LumaIntra::Blocks4x4 {
+            modes,
+            coeff_blocks,
+        } => reconstruct_intra_luma_macroblock_from_coeffs(&mut mb.luma, modes, coeff_blocks, q),
+        Svq3LumaIntra::Whole16x16 { mode, coeff_blocks } => {
+            reconstruct_intra_16x16_luma_macroblock_from_coeffs(
+                &mut mb.luma,
+                *mode,
+                coeff_blocks,
+                q,
+            )
+        }
+    }
+    reconstruct_intra_chroma_plane_from_coeffs(&mut mb.cb, cb.dc_block, &cb.ac_blocks, q);
+    reconstruct_intra_chroma_plane_from_coeffs(&mut mb.cr, cr.dc_block, &cr.ac_blocks, q);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1149,5 +1292,96 @@ mod tests {
             }
         }
         assert!(differs, "AC residual must move at least one sample");
+    }
+
+    // ---- Whole intra macroblock composition ---------------------------
+
+    #[test]
+    fn whole_mb_4x4_all_dc_no_neighbours_is_flat_128() {
+        // A top-left intra MB, luma all-DC 4×4, chroma DC-only, every
+        // coefficient zero ⇒ all three planes flat 128.
+        let mut mb = Svq3IntraMacroblock::new();
+        let luma = Svq3LumaIntra::Blocks4x4 {
+            modes: [Svq3IntraMode::Dc; MB_LUMA_BLOCKS],
+            coeff_blocks: [[0i32; 16]; MB_LUMA_BLOCKS],
+        };
+        let chroma = ChromaPlaneCoeffs {
+            dc_block: [0i32; CHROMA_PLANE_BLOCKS],
+            ac_blocks: [[0i32; 16]; CHROMA_PLANE_BLOCKS],
+        };
+        reconstruct_intra_macroblock(&mut mb, &luma, &chroma, &chroma, 12);
+        assert!(mb.luma.samples.iter().all(|&s| s == 128), "luma flat 128");
+        assert!(mb.cb.samples.iter().all(|&s| s == 128), "cb flat 128");
+        assert!(mb.cr.samples.iter().all(|&s| s == 128), "cr flat 128");
+    }
+
+    #[test]
+    fn whole_mb_16x16_matches_standalone_luma_path() {
+        // The dispatched 16×16 luma reconstruction must equal the direct
+        // 16×16 entry point on the same inputs.
+        let mut coeffs = [[0i32; 16]; MB_LUMA_BLOCKS];
+        coeffs[3][0] = 2;
+        coeffs[10][1] = -1;
+        let q = 11;
+
+        let mut mb = Svq3IntraMacroblock::new();
+        mb.luma.above = [70; 16];
+        mb.luma.leftcol = [70; 16];
+        mb.luma.above_available = true;
+        mb.luma.left_available = true;
+        let luma = Svq3LumaIntra::Whole16x16 {
+            mode: Svq3Luma16x16Mode::Plane,
+            coeff_blocks: coeffs,
+        };
+        let chroma = ChromaPlaneCoeffs {
+            dc_block: [0i32; CHROMA_PLANE_BLOCKS],
+            ac_blocks: [[0i32; 16]; CHROMA_PLANE_BLOCKS],
+        };
+        reconstruct_intra_macroblock(&mut mb, &luma, &chroma, &chroma, q);
+
+        let mut direct = LumaMacroblock::new();
+        direct.above = [70; 16];
+        direct.leftcol = [70; 16];
+        direct.above_available = true;
+        direct.left_available = true;
+        reconstruct_intra_16x16_luma_macroblock_from_coeffs(
+            &mut direct,
+            Svq3Luma16x16Mode::Plane,
+            &coeffs,
+            q,
+        );
+        assert_eq!(mb.luma.samples, direct.samples);
+    }
+
+    #[test]
+    fn whole_mb_chroma_planes_are_independent() {
+        // Distinct Cb / Cr coefficient inputs must produce distinct
+        // chroma planes (the dispatcher must not cross-wire them).
+        let mut mb = Svq3IntraMacroblock::new();
+        let luma = Svq3LumaIntra::Blocks4x4 {
+            modes: [Svq3IntraMode::Dc; MB_LUMA_BLOCKS],
+            coeff_blocks: [[0i32; 16]; MB_LUMA_BLOCKS],
+        };
+        let mut cb = ChromaPlaneCoeffs {
+            dc_block: [0i32; CHROMA_PLANE_BLOCKS],
+            ac_blocks: [[0i32; 16]; CHROMA_PLANE_BLOCKS],
+        };
+        // Lift Cb quadrant 0 only. The chroma DC residual is tiny in
+        // magnitude (the pre-finalise term is heavily scaled down by the
+        // >>3 / >>1 / >>20 shifts), so a large coefficient + high
+        // quantiser is needed to clear a residual of 1.
+        cb.dc_block[0] = 16;
+        let cr = ChromaPlaneCoeffs {
+            dc_block: [0i32; CHROMA_PLANE_BLOCKS],
+            ac_blocks: [[0i32; 16]; CHROMA_PLANE_BLOCKS],
+        };
+        reconstruct_intra_macroblock(&mut mb, &luma, &cb, &cr, 30);
+        // A DC-only 2×2 input spreads through the [[8,8],[8,−8]] Hadamard
+        // to all four chroma DC terms equally, so the whole Cb plane is
+        // lifted off the flat-128 DC prediction; Cr (all-zero input) stays
+        // flat 128. The point under test is the dispatcher keeping the two
+        // chroma planes independent.
+        assert!(mb.cb.samples.iter().all(|&s| s != 128), "cb plane lifted");
+        assert!(mb.cr.samples.iter().all(|&s| s == 128), "cr flat 128");
     }
 }

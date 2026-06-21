@@ -115,6 +115,18 @@ full plane reconstruction is blocked on bitstream-driven field decode.
   `reconstruct_intra_luma_macroblock_from_coeffs` is the
   residual-owning end-to-end form: it takes the placed coefficient
   grids + slice quantiser and runs the Gap 2 interleave internally.
+  `reconstruct_intra_16x16_luma_macroblock_from_coeffs` is the
+  16×16-intra counterpart (`Svq3Luma16x16Mode::{Plane, Dc}` — one
+  macroblock-wide predictor, residuals added in raster order, no
+  per-sub-block mode sequencing). `reconstruct_intra_chroma_plane_from_coeffs`
+  reconstructs an 8×8 `ChromaPlane`: DC-only prediction (Gap 4), the
+  separate 2×2 chroma-DC block Hadamard + chroma-dequant into
+  pre-finalisation per-quadrant DC terms, and the chroma-AC interleave
+  with each quadrant's DC folded into the fused `+ dc + 0x80000 >>20`
+  store. `reconstruct_intra_macroblock` ties all three planes together:
+  an `Svq3IntraMacroblock` (luma + Cb + Cr) reconstructed in one call,
+  dispatching the luma regime on `Svq3LumaIntra::{Blocks4x4, Whole16x16}`
+  — the per-macroblock assembly unit a frame walk emits.
 * The predicted+residual writeback composition (`reconstruct_sample` /
   `reconstruct_4x4`): the 8-bit saturating `Clip1(pred + residual)` sum
   with no extra rounding on the add, pinned by spec/01 Gap 5.
@@ -143,9 +155,13 @@ staged in `INTRA_PRED_PAIRS`, but its codeword→pair-index mapping is
 not) are blocked on the same kind of trace. The 4×4 scan-order arrays
 (Gap 1), the two-sided transform + residual interleave (Gap 2), the
 intra-mode binding + predictors (Gap 3/4), the writeback clamp
-(Gap 5), the full intra reconstruction-composition loop, and now the
-signed-Golomb MV-difference / quant-delta / inter-MB-header wire
-decode are landed.
+(Gap 5), the signed-Golomb MV-difference / quant-delta / inter-MB-header
+wire decode, and now the **whole intra-macroblock reconstruction
+composition** — the 4×4-intra *and* 16×16-intra luma paths, the chroma
+8×8 DC-only plane path, and the three-plane `reconstruct_intra_macroblock`
+assembly unit — are landed. What remains between here and a decoded
+intra frame is the slice-level frame walk driving these per-MB units
+(and the CBP / intra-mode VLC wire decode above that feeds them).
 
 ## Cargo features
 

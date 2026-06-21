@@ -8,6 +8,20 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 356 — SVQ3 whole intra-macroblock reconstruction composition
+  (`svq3_recon`).** Ties the three per-plane reconstruction paths into
+  the per-macroblock assembly unit a frame walk emits. New
+  `Svq3IntraMacroblock` carrier (one `LumaMacroblock` + two
+  `ChromaPlane`s, Cb/Cr), `Svq3LumaIntra` enum (`Blocks4x4` / `Whole16x16`
+  selecting the 4×4-intra mode loop or the 16×16-intra whole-MB loop),
+  `ChromaPlaneCoeffs` (2×2 DC block + four AC grids), and
+  `reconstruct_intra_macroblock` which dispatches the luma regime and
+  reconstructs both chroma planes at the shared slice quantiser. 3 unit
+  tests cover the all-DC flat-128 macroblock, dispatcher↔standalone
+  16×16 luma equivalence, and Cb/Cr plane independence. The slice-level
+  frame walk driving these per-MB units (and the CBP / intra-mode VLC
+  decode feeding them) remains a deferred docs gap.
+
 - **Round 356 — SVQ3 intra chroma 8×8 plane reconstruction
   (`svq3_recon`).** Lands the chroma-plane reconstruction path,
   composing the staged
