@@ -218,9 +218,77 @@ impl Svq3SliceHeader {
 /// this helper derives that count from a parsed
 /// [`Svq3SequenceHeader`].
 pub fn num_macroblocks(seqh: &Svq3SequenceHeader) -> u32 {
+    let (mb_w, mb_h) = mb_grid_dims(seqh);
+    mb_w * mb_h
+}
+
+/// The macroblock grid dimensions `(mb_cols, mb_rows)` implied by the
+/// sequence-header width/height, rounding up at the right/bottom edges
+/// (the standard 16×16-macroblock tiling: a partial edge macroblock
+/// still occupies a full grid cell).
+///
+/// `mb_cols * mb_rows == num_macroblocks(seqh)`.
+pub fn mb_grid_dims(seqh: &Svq3SequenceHeader) -> (u32, u32) {
     let mb_w = (seqh.width as u32).div_ceil(16);
     let mb_h = (seqh.height as u32).div_ceil(16);
-    mb_w * mb_h
+    (mb_w, mb_h)
+}
+
+/// Raster position of one macroblock within the picture's macroblock
+/// grid, plus the intra-prediction neighbour availability the
+/// per-macroblock intra-mode decode + reconstruction needs.
+///
+/// Produced by [`macroblock_position`] from a macroblock raster index
+/// and the grid dimensions. The neighbour-availability flags say whether
+/// a macroblock exists immediately above / to the left in the **same
+/// picture** — `mb_y > 0` / `mb_x > 0` respectively. (SVQ3 intra
+/// prediction reads only the above and left neighbours; per
+/// `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Intra macroblock
+/// information decoding" an out-of-slice predictor is treated as `-1`.)
+/// Slice boundaries may further restrict availability — that is the
+/// caller's concern once the slice-level walk threads slice membership;
+/// this helper provides the picture-grid geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Svq3MacroblockPosition {
+    /// Macroblock column (`0..mb_cols`).
+    pub mb_x: u32,
+    /// Macroblock row (`0..mb_rows`).
+    pub mb_y: u32,
+    /// `true` iff a macroblock exists immediately above (`mb_y > 0`).
+    pub top_available: bool,
+    /// `true` iff a macroblock exists immediately to the left
+    /// (`mb_x > 0`).
+    pub left_available: bool,
+}
+
+impl Svq3MacroblockPosition {
+    /// Pixel origin `(x, y)` of this macroblock's top-left luma sample
+    /// (`mb_x * 16`, `mb_y * 16`).
+    pub fn luma_origin(&self) -> (u32, u32) {
+        (self.mb_x * 16, self.mb_y * 16)
+    }
+}
+
+/// Compute the [`Svq3MacroblockPosition`] of the macroblock at raster
+/// index `mb_index` (`0..mb_cols * mb_rows`) in a `mb_cols`-wide
+/// macroblock grid.
+///
+/// Macroblocks are decoded in raster order (left-to-right, top-to-
+/// bottom). Returns [`Error::BadBitWidth`] (re-used as a generic
+/// argument-domain error) when `mb_cols == 0`; the caller is
+/// responsible for keeping `mb_index < mb_cols * mb_rows`.
+pub fn macroblock_position(mb_index: u32, mb_cols: u32) -> Result<Svq3MacroblockPosition> {
+    if mb_cols == 0 {
+        return Err(Error::BadBitWidth(0));
+    }
+    let mb_x = mb_index % mb_cols;
+    let mb_y = mb_index / mb_cols;
+    Ok(Svq3MacroblockPosition {
+        mb_x,
+        mb_y,
+        top_available: mb_y > 0,
+        left_available: mb_x > 0,
+    })
 }
 
 /// `ceil(log2(value))` for `value >= 1`. Used by [`parse_slice_header`]
@@ -839,6 +907,58 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(num_macroblocks(&h2), 1900);
+    }
+
+    #[test]
+    fn mb_grid_dims_matches_num_macroblocks() {
+        // 176×144 → 11×9.
+        let h = parse_sequence_header(&pack(&[
+            (3, 2),
+            (1, 0),
+            (1, 0),
+            (4, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+        ]))
+        .unwrap();
+        let (cols, rows) = mb_grid_dims(&h);
+        assert_eq!((cols, rows), (11, 9));
+        assert_eq!(cols * rows, num_macroblocks(&h));
+    }
+
+    #[test]
+    fn macroblock_position_raster_and_availability() {
+        // 4-wide grid. Index 0 = top-left corner (no top, no left).
+        let p0 = macroblock_position(0, 4).unwrap();
+        assert_eq!((p0.mb_x, p0.mb_y), (0, 0));
+        assert!(!p0.top_available && !p0.left_available);
+        assert_eq!(p0.luma_origin(), (0, 0));
+
+        // Index 1 = top row, col 1: left available, no top.
+        let p1 = macroblock_position(1, 4).unwrap();
+        assert_eq!((p1.mb_x, p1.mb_y), (1, 0));
+        assert!(!p1.top_available && p1.left_available);
+
+        // Index 4 = row 1, col 0: top available, no left.
+        let p4 = macroblock_position(4, 4).unwrap();
+        assert_eq!((p4.mb_x, p4.mb_y), (0, 1));
+        assert!(p4.top_available && !p4.left_available);
+        assert_eq!(p4.luma_origin(), (0, 16));
+
+        // Index 5 = row 1, col 1: both available.
+        let p5 = macroblock_position(5, 4).unwrap();
+        assert_eq!((p5.mb_x, p5.mb_y), (1, 1));
+        assert!(p5.top_available && p5.left_available);
+        assert_eq!(p5.luma_origin(), (16, 16));
+    }
+
+    #[test]
+    fn macroblock_position_rejects_zero_cols() {
+        assert!(matches!(
+            macroblock_position(0, 0),
+            Err(Error::BadBitWidth(0))
+        ));
     }
 
     /// Slice-payload permutation: `slice_size_size = 1` ⇒ no

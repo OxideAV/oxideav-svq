@@ -8,6 +8,25 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 365 — SVQ3 macroblock-grid geometry + per-MB neighbour
+  availability (`svq3`).** The pure-geometry prerequisite the slice-level
+  intra-frame walk needs to drive the per-macroblock units, independent
+  of the (still-gated) CBP wire decode. New surface:
+  - `mb_grid_dims(seqh) -> (mb_cols, mb_rows)` — the 16×16-macroblock
+    tiling dimensions (right/bottom edges rounded up);
+    `mb_cols * mb_rows == num_macroblocks(seqh)` (now implemented in
+    terms of this helper).
+  - `Svq3MacroblockPosition { mb_x, mb_y, top_available, left_available }`
+    with `luma_origin()` → `(mb_x*16, mb_y*16)`, and
+    `macroblock_position(mb_index, mb_cols)` deriving the raster column /
+    row and the intra-prediction above/left neighbour availability
+    (`mb_y > 0` / `mb_x > 0`) — the `top_avail` / `left_avail` inputs
+    `decode_intra_4x4_modes` / `decode_and_reconstruct_intra_luma_macroblock`
+    consume. Rejects `mb_cols == 0`.
+  - 4 new lib tests: grid-dims vs `num_macroblocks` agreement, the
+    raster + availability mapping for the corner / top-row / left-column /
+    interior cases with pixel-origin checks, and the zero-cols guard.
+
 - **Round 365 — SVQ3 intra-luma DC scale residual path (`svq3_dequant`
   / `svq3_recon`).** Wires the SVQ3-specific intra-luma DC handling the
   wiki §"Macroblock transform and dequantization" pins — "For intra
