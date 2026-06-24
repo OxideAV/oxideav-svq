@@ -729,6 +729,224 @@ pub fn read_inter_mv_precision(
 /// spec block.
 pub const INTRA_4X4_SCAN_ORDER: [u8; 16] = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15];
 
+/// The eight `(first_block, second_block)` 4×4 sub-block index pairs
+/// that share one intra-mode VLC codeword.
+///
+/// Per `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Intra macroblock
+/// information decoding" the 4×4 intra prediction modes are decoded in
+/// the order
+///
+/// ```text
+///   ( 0,  1)  ( 4,  5)
+///   ( 2,  3)  ( 6,  7)
+///   ( 8,  9)  (12, 13)
+///   (10, 11)  (14, 15)
+/// ```
+///
+/// where the parenthesised groupings are exactly the
+/// `( first_block_index, second_block_index )` pairs read together:
+/// "Prediction is performed by reading a variable-length code which
+/// corresponds to one of the following pairs" — one VLC codeword
+/// resolves the two `(idx_a, idx_b)` table indices of the two blocks of
+/// the pair. The eight pairs are taken row-major from the picture:
+/// `(0,1) (4,5) (2,3) (6,7) (8,9) (12,13) (10,11) (14,15)`.
+///
+/// [`INTRA_4X4_SCAN_ORDER`] is the flattened single-block view of this
+/// same picture; this table is the paired view the VLC-driven decode
+/// consumes (one codeword per pair).
+pub const INTRA_4X4_PRED_BLOCK_PAIRS: [(u8, u8); 8] = [
+    (0, 1),
+    (4, 5),
+    (2, 3),
+    (6, 7),
+    (8, 9),
+    (12, 13),
+    (10, 11),
+    (14, 15),
+];
+
+/// Number of `INTRA_PRED_PAIRS` entries the intra-mode VLC selects
+/// between (`0..=24`). The wiki §"Intra macroblock information
+/// decoding" lists exactly 25 pairs.
+pub const INTRA_PRED_PAIRS_LEN: u32 = INTRA_PRED_PAIRS.len() as u32;
+
+/// Read one intra-4×4 prediction-mode VLC codeword and resolve it to
+/// its `(idx_a, idx_b)` table-index pair.
+///
+/// Per `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Decoding Process"
+/// the codec "extensively uses Golomb coding", and §"Intra macroblock
+/// information decoding" states the intra-mode pair is selected by
+/// "reading a variable-length code which corresponds to one of the
+/// following pairs". The 25 pairs are listed in a single contiguous
+/// `0..=24` enumeration (`{0,0}; {1,0},{0,1}; {0,2},{1,1},{2,0}; …;
+/// {4,4}`), i.e. the listing order is the code-number ordering an
+/// unsigned exp-Golomb `ue(v)` code produces. This is the same
+/// Golomb-indexed-listing convention the macroblock-type code uses
+/// ([`read_mb_type`] reads `ue(v)` then indexes the per-frame MB-type
+/// enumeration). The decoded code number indexes [`INTRA_PRED_PAIRS`]
+/// directly.
+///
+/// Returns the `(idx_a, idx_b)` pair on success. Returns
+/// [`Error::InvalidFrameCode`] when the decoded code number is `>= 25`
+/// (outside the 25-pair alphabet) and propagates [`Error::Truncated`]
+/// from the underlying bit-reader.
+pub fn read_intra_4x4_pred_pair(br: &mut BitReader<'_>) -> Result<(u8, u8)> {
+    let code = read_ue_golomb(br)?;
+    if code >= INTRA_PRED_PAIRS_LEN {
+        return Err(Error::InvalidFrameCode(code));
+    }
+    Ok(INTRA_PRED_PAIRS[code as usize])
+}
+
+/// The 16 per-sub-block resolved intra-prediction modes of one
+/// 4×4-intra macroblock, in **block-index** order (`modes[index]` is
+/// the resolved mode of the 4×4 sub-block at raster index `index`,
+/// `0..=15`, laid out row-major within the 16×16 macroblock).
+///
+/// Each entry is one of `0..=4` (the SVQ3 5-mode intra-4×4 subset, per
+/// `docs/video/svq3/spec/01-reconstruction-composition.md` Gap 3). This
+/// is the per-macroblock output of [`decode_intra_4x4_modes`]: the
+/// sequence of modes feeding the per-sub-block intra predictors in
+/// [`crate::svq3_recon`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Intra4x4ModeGrid {
+    modes: [u8; 16],
+}
+
+impl Intra4x4ModeGrid {
+    /// The resolved intra-prediction mode (`0..=4`) of the 4×4 sub-block
+    /// at raster index `index` (`0..=15`, row-major within the 16×16
+    /// macroblock). Returns `None` for `index >= 16`.
+    pub fn mode(&self, index: usize) -> Option<u8> {
+        self.modes.get(index).copied()
+    }
+
+    /// Borrow the full 16-entry block-index-ordered mode array.
+    pub fn modes(&self) -> &[u8; 16] {
+        &self.modes
+    }
+}
+
+/// Resolve the top / left intra-neighbour classification of the 4×4
+/// sub-block at raster `index` (`0..=15`) within a macroblock, given
+/// the running per-block mode grid `decoded[0..16]` (entries for blocks
+/// not yet decoded are ignored because the scan order guarantees a
+/// block's in-MB top / left neighbours are decoded first).
+///
+/// `top_avail` / `left_avail` say whether the macroblock has a
+/// neighbour macroblock above / to the left in the slice. When a 4×4
+/// sub-block sits on the top (resp. left) edge of the macroblock its
+/// top (resp. left) neighbour is in the macroblock above (resp. left).
+/// Per `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Intra macroblock
+/// information decoding": "When predictors lie outside of slice, -1 is
+/// used instead" — an unavailable out-of-MB neighbour is
+/// [`IntraNeighbour::Outside`]. The out-of-MB neighbour macroblock's
+/// own per-block mode is not threaded here (it is treated as
+/// [`IntraNeighbour::Intra16x16OrInter`] = the spec's "value 2"
+/// fallback when present); only the in-MB 4×4 neighbours carry a
+/// resolved [`IntraNeighbour::Mode4x4`].
+fn intra_neighbours_for_block(
+    index: usize,
+    decoded: &[Option<u8>; 16],
+    top_avail: bool,
+    left_avail: bool,
+) -> (IntraNeighbour, IntraNeighbour) {
+    // Raster row / col of the 4×4 sub-block inside the 4×4 grid.
+    let row = index / 4;
+    let col = index % 4;
+
+    let top = if row == 0 {
+        // Top edge of the macroblock: neighbour is in the MB above.
+        if top_avail {
+            IntraNeighbour::Intra16x16OrInter
+        } else {
+            IntraNeighbour::Outside
+        }
+    } else {
+        match decoded[index - 4] {
+            Some(m) => IntraNeighbour::Mode4x4(m),
+            None => IntraNeighbour::Outside,
+        }
+    };
+
+    let left = if col == 0 {
+        // Left edge of the macroblock: neighbour is in the MB to the
+        // left.
+        if left_avail {
+            IntraNeighbour::Intra16x16OrInter
+        } else {
+            IntraNeighbour::Outside
+        }
+    } else {
+        match decoded[index - 1] {
+            Some(m) => IntraNeighbour::Mode4x4(m),
+            None => IntraNeighbour::Outside,
+        }
+    };
+
+    (top, left)
+}
+
+/// Decode the 16 intra-prediction modes of one 4×4-intra macroblock
+/// from the slice bitstream.
+///
+/// Composes the intra-mode VLC read ([`read_intra_4x4_pred_pair`]) with
+/// the per-block predictor table lookup ([`resolve_intra_4x4_predictor`])
+/// over the pair-grouped processing order
+/// ([`INTRA_4X4_PRED_BLOCK_PAIRS`]) the wiki §"Intra macroblock
+/// information decoding" pins. For each of the eight block pairs:
+///
+/// 1. read one intra-mode VLC codeword → `(idx_a, idx_b)`;
+/// 2. resolve block `a`'s mode = `pred_table[top_a+1][left_a+1][idx_a]`
+///    against `a`'s already-decoded top / left neighbour modes;
+/// 3. resolve block `b`'s mode likewise against `b`'s neighbours
+///    (which may include block `a` if `b` is `a`'s right / lower
+///    neighbour, since the scan order decodes `a` first).
+///
+/// `top_avail` / `left_avail` say whether a neighbour macroblock exists
+/// above / to the left in the slice (governing the edge sub-blocks'
+/// out-of-MB neighbour availability).
+///
+/// Returns the populated [`Intra4x4ModeGrid`] (modes in block-index
+/// order). Propagates [`Error::Truncated`] from the bit-reader,
+/// [`Error::InvalidFrameCode`] for an out-of-alphabet VLC code, and
+/// [`Error::InvalidIntraPrediction`] when a `pred_table` lookup lands
+/// on the `-1` sentinel (a malformed / mispredicted intra stream per
+/// the wiki spec).
+pub fn decode_intra_4x4_modes(
+    br: &mut BitReader<'_>,
+    top_avail: bool,
+    left_avail: bool,
+) -> Result<Intra4x4ModeGrid> {
+    let mut decoded: [Option<u8>; 16] = [None; 16];
+
+    for &(block_a, block_b) in INTRA_4X4_PRED_BLOCK_PAIRS.iter() {
+        let (idx_a, idx_b) = read_intra_4x4_pred_pair(br)?;
+
+        let ia = block_a as usize;
+        let (top_a, left_a) = intra_neighbours_for_block(ia, &decoded, top_avail, left_avail);
+        let mode_a = resolve_intra_4x4_predictor(top_a, left_a, idx_a)?;
+        decoded[ia] = Some(mode_a);
+
+        let ib = block_b as usize;
+        // Block `b`'s neighbours are resolved AFTER `a` is recorded, so
+        // if `b` is below / right of `a` it sees `a`'s mode.
+        let (top_b, left_b) = intra_neighbours_for_block(ib, &decoded, top_avail, left_avail);
+        let mode_b = resolve_intra_4x4_predictor(top_b, left_b, idx_b)?;
+        decoded[ib] = Some(mode_b);
+    }
+
+    // Every block is decoded exactly once (the eight pairs cover all 16
+    // indices); unwrap the running options into the final grid.
+    let mut modes = [0u8; 16];
+    for (i, slot) in decoded.iter().enumerate() {
+        // SAFETY of the unwrap: INTRA_4X4_PRED_BLOCK_PAIRS is a
+        // permutation of 0..16 (asserted in tests), so each slot is set.
+        modes[i] = slot.expect("every 4x4 block index is covered by the pair table");
+    }
+    Ok(Intra4x4ModeGrid { modes })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1524,6 +1742,183 @@ mod tests {
                     assert!(resolved_b < 5);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn intra_4x4_pred_block_pairs_is_permutation_of_0_to_15() {
+        // The eight pairs must cover every 4×4 sub-block index 0..16
+        // exactly once (one VLC codeword per pair, 8 pairs × 2 = 16).
+        let mut seen = [false; 16];
+        for &(a, b) in INTRA_4X4_PRED_BLOCK_PAIRS.iter() {
+            for v in [a, b] {
+                assert!((v as usize) < 16);
+                assert!(!seen[v as usize], "block {v} covered twice");
+                seen[v as usize] = true;
+            }
+        }
+        assert!(seen.iter().all(|&s| s), "not every block index covered");
+        assert_eq!(INTRA_4X4_PRED_BLOCK_PAIRS.len(), 8);
+    }
+
+    #[test]
+    fn intra_4x4_pred_block_pairs_match_scan_order_grouping() {
+        // The paired view must equal the flat scan order taken two at a
+        // time: scan = [0,1, 4,5, 2,3, 6,7, 8,9, 12,13, 10,11, 14,15].
+        for (pair_idx, &(a, b)) in INTRA_4X4_PRED_BLOCK_PAIRS.iter().enumerate() {
+            assert_eq!(a, INTRA_4X4_SCAN_ORDER[pair_idx * 2]);
+            assert_eq!(b, INTRA_4X4_SCAN_ORDER[pair_idx * 2 + 1]);
+        }
+    }
+
+    #[test]
+    fn intra_pred_pairs_len_constant() {
+        assert_eq!(INTRA_PRED_PAIRS_LEN, 25);
+        assert_eq!(INTRA_PRED_PAIRS_LEN as usize, INTRA_PRED_PAIRS.len());
+    }
+
+    #[test]
+    fn read_intra_4x4_pred_pair_indexes_pairs_table() {
+        // ue(code) for each of the 25 valid codes must decode to the
+        // matching INTRA_PRED_PAIRS entry.
+        for code in 0..25u32 {
+            let bytes = pack(&[ue(code)]);
+            let mut br = BitReader::new(&bytes);
+            let got = read_intra_4x4_pred_pair(&mut br).unwrap();
+            assert_eq!(got, INTRA_PRED_PAIRS[code as usize], "code {code}");
+        }
+    }
+
+    #[test]
+    fn read_intra_4x4_pred_pair_rejects_out_of_alphabet_code() {
+        // code 25 is just past the 25-pair alphabet (0..=24).
+        let bytes = pack(&[ue(25)]);
+        let mut br = BitReader::new(&bytes);
+        let err = read_intra_4x4_pred_pair(&mut br).unwrap_err();
+        assert!(matches!(err, Error::InvalidFrameCode(25)));
+    }
+
+    #[test]
+    fn read_intra_4x4_pred_pair_truncated() {
+        // Empty input → Truncated on the first leading-zero read.
+        let bytes: [u8; 0] = [];
+        let mut br = BitReader::new(&bytes);
+        assert!(matches!(
+            read_intra_4x4_pred_pair(&mut br),
+            Err(Error::Truncated)
+        ));
+    }
+
+    #[test]
+    fn read_intra_4x4_pred_pair_consumes_exact_bits() {
+        // Two back-to-back codes must decode independently with no
+        // bit-slip between them. code 0 = single '1' bit, code 3 has
+        // ue width 5.
+        let bytes = pack(&[ue(0), ue(3)]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(read_intra_4x4_pred_pair(&mut br).unwrap(), (0, 0));
+        assert_eq!(read_intra_4x4_pred_pair(&mut br).unwrap(), (0, 2));
+    }
+
+    #[test]
+    fn decode_intra_4x4_modes_all_code_zero_top_left_unavailable() {
+        // Eight codeword-0 reads → every pair is (0, 0), i.e. idx_a =
+        // idx_b = 0. With no neighbour MBs available, every edge
+        // neighbour is Outside. pred_table[0][0][0] = 2 and once a
+        // block decodes to mode 2 the in-MB neighbours become
+        // Mode4x4(2): pred_table[3][?]/[?][3] still resolves at idx 0.
+        // We just assert the call succeeds and yields modes in 0..=4.
+        let bytes = pack(&[ue(0); 8]);
+        let mut br = BitReader::new(&bytes);
+        let grid = decode_intra_4x4_modes(&mut br, false, false).unwrap();
+        for &m in grid.modes() {
+            assert!(m < 5);
+        }
+        // Block 0 sits at the top-left corner: both neighbours Outside,
+        // idx 0 → pred_table[0][0][0] = 2.
+        assert_eq!(grid.mode(0), Some(2));
+    }
+
+    #[test]
+    fn decode_intra_4x4_modes_threads_in_mb_neighbours() {
+        // Verify that block 1 (top-right of the first pair) sees block
+        // 0's decoded mode as its LEFT neighbour. With top/left MB
+        // unavailable: block 0 = pred_table[0][0][idx_a]; block 1's
+        // left neighbour is block 0 (col 1, row 0), its top neighbour
+        // is Outside (row 0). So block 1 = pred_table[0][mode0+1][idx_b].
+        //
+        // Use the first pair code = 4 → INTRA_PRED_PAIRS[4] = (1,1):
+        // idx_a = idx_b = 1.
+        //   block 0: pred_table[0][0][1] = -1 → would error. Use code 1
+        //   instead: INTRA_PRED_PAIRS[1] = (1, 0).
+        //   block 0: top=Outside(0) left=Outside(0) idx=1 →
+        //            pred_table[0][0][1] = -1 → error. So pick a pair
+        //   whose first idx is 0. code 0 = (0,0): block0 idx 0 →
+        //   pred_table[0][0][0] = 2. block1: top=Outside left=Mode4x4(2)
+        //   idx 0 → pred_table[0][3][0]. INTRA_PRED_TABLE[0][3] =
+        //   [2,1,-1,-1,-1] → idx 0 = 2.
+        let bytes = pack(&[ue(0); 8]);
+        let mut br = BitReader::new(&bytes);
+        let grid = decode_intra_4x4_modes(&mut br, false, false).unwrap();
+        // Block 1: top = Outside (row 0), left = block 0 = Mode4x4(2).
+        // pred_table[top+1=0][left+1=3][idx=0] = INTRA_PRED_TABLE[0][3][0] = 2.
+        assert_eq!(grid.mode(1), Some(2));
+        // Block 2 sits at row 1, col 0: top = block 0 (index 2-4 ... wait
+        // index 2 is row 0 col 2). Use the grid contract: index/4 = row,
+        // index%4 = col. index 4 = row 1 col 0; its top neighbour is
+        // index 0. Verify index 4's top is block 0's mode (2):
+        // pred_table[mode0+1=3][left=Outside+1=0][idx]. For the second
+        // pair (4,5) code 0 → idx_a=idx_b=0. INTRA_PRED_TABLE[3][0][0] = 2.
+        assert_eq!(grid.mode(4), Some(2));
+    }
+
+    #[test]
+    fn decode_intra_4x4_modes_propagates_sentinel_error() {
+        // First pair code = 1 → INTRA_PRED_PAIRS[1] = (1, 0). Block 0
+        // top/left Outside, idx_a = 1 → pred_table[0][0][1] = -1 →
+        // InvalidIntraPrediction.
+        let bytes = pack(&[ue(1)]);
+        let mut br = BitReader::new(&bytes);
+        let err = decode_intra_4x4_modes(&mut br, false, false).unwrap_err();
+        assert!(matches!(err, Error::InvalidIntraPrediction(0, 0, 1)));
+    }
+
+    #[test]
+    fn decode_intra_4x4_modes_truncated_midway() {
+        // Only one valid codeword present (code 0); the loop needs 8.
+        let bytes = pack(&[ue(0)]);
+        let mut br = BitReader::new(&bytes);
+        assert!(matches!(
+            decode_intra_4x4_modes(&mut br, false, false),
+            Err(Error::Truncated)
+        ));
+    }
+
+    #[test]
+    fn decode_intra_4x4_modes_with_available_neighbour_mbs() {
+        // With top/left MBs available, edge neighbours are
+        // Intra16x16OrInter (index 3). Block 0: top=3, left=3, idx 0 →
+        // pred_table[3][3][0]. INTRA_PRED_TABLE[3][3] = [2,1,0,4,3] →
+        // idx 0 = 2. Decode must still succeed and yield 0..=4 modes.
+        let bytes = pack(&[ue(0); 8]);
+        let mut br = BitReader::new(&bytes);
+        let grid = decode_intra_4x4_modes(&mut br, true, true).unwrap();
+        assert_eq!(grid.mode(0), Some(2));
+        for &m in grid.modes() {
+            assert!(m < 5);
+        }
+    }
+
+    #[test]
+    fn intra_4x4_mode_grid_accessors() {
+        let bytes = pack(&[ue(0); 8]);
+        let mut br = BitReader::new(&bytes);
+        let grid = decode_intra_4x4_modes(&mut br, false, false).unwrap();
+        assert_eq!(grid.mode(16), None);
+        assert_eq!(grid.modes().len(), 16);
+        // mode() and modes() must agree for every in-range index.
+        for i in 0..16 {
+            assert_eq!(grid.mode(i), Some(grid.modes()[i]));
         }
     }
 }

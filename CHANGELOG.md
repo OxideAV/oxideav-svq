@@ -8,6 +8,53 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 365 — SVQ3 intra-4×4 prediction-mode VLC wire decode +
+  per-macroblock mode-decode driver (`svq3_mb`).** Closes the
+  intra-4×4 prediction-mode VLC gap the README named as a lacks-tail
+  blocker. The wiki §"Intra macroblock information decoding" lists the
+  25 intra-mode pairs in a single contiguous `0..=24` enumeration and
+  §"Decoding Process" states the codec "extensively uses Golomb
+  coding" — so the selecting VLC is the unsigned exp-Golomb `ue(v)`
+  code whose code-number indexes `INTRA_PRED_PAIRS` directly (the same
+  Golomb-indexed-listing convention `read_mb_type` already uses). New
+  surface:
+  - `read_intra_4x4_pred_pair(br) -> (u8, u8)` reads one `ue(v)`
+    codeword and resolves it to the `(idx_a, idx_b)` table-index pair,
+    rejecting out-of-alphabet codes (`>= 25`) with `InvalidFrameCode`
+    and propagating `Truncated`.
+  - `INTRA_4X4_PRED_BLOCK_PAIRS: [(u8, u8); 8]` — the eight
+    `(first_block, second_block)` 4×4 sub-block index pairs that share
+    one codeword, taken row-major from the wiki picture
+    (`(0,1) (4,5) (2,3) (6,7) (8,9) (12,13) (10,11) (14,15)`); the
+    paired view of `INTRA_4X4_SCAN_ORDER`.
+  - `decode_intra_4x4_modes(br, top_avail, left_avail) ->
+    Intra4x4ModeGrid` — the per-macroblock driver: for each of the
+    eight pairs it reads one codeword, then resolves each of the two
+    blocks' mode via `resolve_intra_4x4_predictor` against that
+    block's own already-decoded top / left neighbour modes (in-MB 4×4
+    neighbours as `Mode4x4`, out-of-MB edges as `Intra16x16OrInter`
+    when the neighbour MB exists else `Outside` per the wiki's "-1
+    when outside slice" rule). The strictly-serial scan order
+    guarantees a block's in-MB neighbours are decoded first; block `b`
+    of a pair sees block `a`'s freshly-decoded mode. `Intra4x4ModeGrid`
+    carries the 16 resolved modes in raster block-index order with
+    `mode(index)` / `modes()` accessors — the per-block intra-mode
+    sequence feeding the `svq3_recon` predictors.
+  - `INTRA_PRED_PAIRS_LEN = 25` alphabet-size constant.
+  - 13 new lib tests: the pair table is a permutation of `0..16` and
+    matches the scan-order grouping; the VLC reader indexes all 25
+    pairs, rejects code 25, handles truncation, and consumes exact
+    bits across back-to-back codes; the per-MB driver succeeds on the
+    all-code-0 stream with/without neighbour MBs, threads in-MB
+    neighbour modes (block 1 sees block 0 as its left neighbour, block
+    4 sees block 0 as its top), propagates the `-1` `pred_table`
+    sentinel as `InvalidIntraPrediction`, and propagates mid-stream
+    truncation; plus `Intra4x4ModeGrid` accessor coverage. The CBP
+    `me(v)` coded-block-pattern table remains a DOCS-GAP (the wiki
+    defers it wholesale to H.264 and the H.264 `me(v)` mapping is not
+    reproduced under `docs/video/svq3/`), so the slice-level frame
+    walk above these per-MB units stays gated on that one trace.
+
 - **Round 356 — SVQ3 whole intra-macroblock reconstruction composition
   (`svq3_recon`).** Ties the three per-plane reconstruction paths into
   the per-macroblock assembly unit a frame walk emits. New
