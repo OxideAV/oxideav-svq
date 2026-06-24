@@ -57,8 +57,8 @@
 //! mapping or the MV-VLC bit layout) and are not driven here.
 
 use crate::svq3_dequant::{
-    apply_chroma_dc_2x2_2d, dequantize_chroma_dc, dequantize_transform_luma_block,
-    dequantize_transform_luma_block_with_dc,
+    apply_chroma_dc_2x2_2d, dequantize_chroma_dc, dequantize_transform_intra_luma_block,
+    dequantize_transform_luma_block, dequantize_transform_luma_block_with_dc,
 };
 use crate::svq3_pred::{
     predict_chroma_dc_8x8, predict_dc_16x16, predict_intra_4x4, predict_plane_16x16,
@@ -356,6 +356,55 @@ pub fn reconstruct_intra_luma_macroblock_from_coeffs(
         // Spec/01 Gap 2 residual interleave: place → dequant·scale →
         // two-sided transform → fused +0x80000 >>20.
         let residual = dequantize_transform_luma_block(q, coeff_blocks[index]);
+
+        let nb = mb.neighbours_at(bx, by);
+        let predicted = predict_intra_4x4(modes[index], nb);
+        let recon = reconstruct_4x4(predicted, residual);
+        mb.write_block(bx, by, recon);
+    }
+}
+
+/// Reconstruct one 16×16 luma macroblock's 4×4-intra sub-blocks
+/// end-to-end from placed coefficient grids, applying the
+/// **SVQ3-specific intra-luma DC scale** to each sub-block's inline DC
+/// coefficient.
+///
+/// Identical to [`reconstruct_intra_luma_macroblock_from_coeffs`] except
+/// the per-sub-block residual interleave runs
+/// [`crate::svq3_dequant::dequantize_transform_intra_luma_block`] instead
+/// of the general [`crate::svq3_dequant::dequantize_transform_luma_block`].
+/// Per `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock
+/// transform and dequantization", an intra luma block whose DC is
+/// carried inline uses `dc = 13 · 13 · 1538 · block[0]` for the DC term
+/// (the additive override in the dequant formula) rather than running
+/// `block[0]` through the general `coeff · svq3_dequant_coeff[Q]` AC
+/// scale. This is the correct path for a 4×4-intra macroblock that does
+/// **not** carry its luma DCs in a separate block (MB types `1..=24`);
+/// the separate-DC-block branch (MB types `0` / `25`) requires the
+/// separate luma-DC block transform + distribution, which is not pinned
+/// under `docs/video/svq3/` and remains a deferred docs gap.
+///
+/// `modes` / `coeff_blocks` / `q` follow
+/// [`reconstruct_intra_luma_macroblock_from_coeffs`].
+///
+/// # Panics
+///
+/// Panics if `q >= DEQUANT_COEFF_TABLE_LEN`.
+pub fn reconstruct_intra_luma_macroblock_from_coeffs_intra_dc(
+    mb: &mut LumaMacroblock,
+    modes: &[Svq3IntraMode; MB_LUMA_BLOCKS],
+    coeff_blocks: &[[i32; PRED_4X4_SAMPLES]; MB_LUMA_BLOCKS],
+    q: u32,
+) {
+    for &scan_index in crate::svq3_mb::INTRA_4X4_SCAN_ORDER.iter() {
+        let index = scan_index as usize;
+        let (gr, gc) = LUMA_BLOCK_GRID_POS[index];
+        let by = gr * PRED_4X4_DIM;
+        let bx = gc * PRED_4X4_DIM;
+
+        // SVQ3 intra-luma DC scale (13·13·1538·block[0]) for the DC term,
+        // general AC dequant + two-sided transform for the rest.
+        let residual = dequantize_transform_intra_luma_block(q, coeff_blocks[index]);
 
         let nb = mb.neighbours_at(bx, by);
         let predicted = predict_intra_4x4(modes[index], nb);
@@ -1537,6 +1586,55 @@ mod tests {
         reconstruct_intra_luma_macroblock_from_coeffs(&mut mb_b, &modes, &coeffs, 18);
 
         assert_eq!(mb_a.samples, mb_b.samples);
+    }
+
+    #[test]
+    fn intra_dc_recon_differs_from_general_when_dc_present() {
+        // With a non-zero inline DC coefficient the intra-DC recon path
+        // (special INTRA_LUMA_DC_SCALE) must differ from the general AC
+        // path. Use DC modes over flat-128 neighbours so the only
+        // difference is the residual interleave.
+        let modes = [Svq3IntraMode::Dc; MB_LUMA_BLOCKS];
+        let mut coeffs = [[0i32; PRED_4X4_SAMPLES]; MB_LUMA_BLOCKS];
+        for c in coeffs.iter_mut() {
+            c[0] = 2;
+        }
+
+        let mut mb_intra = LumaMacroblock::new();
+        reconstruct_intra_luma_macroblock_from_coeffs_intra_dc(&mut mb_intra, &modes, &coeffs, 14);
+
+        let mut mb_general = LumaMacroblock::new();
+        reconstruct_intra_luma_macroblock_from_coeffs(&mut mb_general, &modes, &coeffs, 14);
+
+        assert_ne!(mb_intra.samples, mb_general.samples);
+    }
+
+    #[test]
+    fn intra_dc_recon_matches_general_when_no_dc() {
+        // With block[0] == 0 everywhere the intra-DC path reduces to the
+        // general path.
+        let modes = [Svq3IntraMode::Dc; MB_LUMA_BLOCKS];
+        let mut coeffs = [[0i32; PRED_4X4_SAMPLES]; MB_LUMA_BLOCKS];
+        coeffs[3][6] = 5;
+
+        let mut mb_intra = LumaMacroblock::new();
+        reconstruct_intra_luma_macroblock_from_coeffs_intra_dc(&mut mb_intra, &modes, &coeffs, 22);
+
+        let mut mb_general = LumaMacroblock::new();
+        reconstruct_intra_luma_macroblock_from_coeffs(&mut mb_general, &modes, &coeffs, 22);
+
+        assert_eq!(mb_intra.samples, mb_general.samples);
+    }
+
+    #[test]
+    fn intra_dc_recon_flat_dc_zero_coeffs_is_128() {
+        // Zero coefficients + DC modes + no neighbours → flat 128 plane
+        // (the intra-DC scale of a zero DC coefficient is zero).
+        let modes = [Svq3IntraMode::Dc; MB_LUMA_BLOCKS];
+        let coeffs = [[0i32; PRED_4X4_SAMPLES]; MB_LUMA_BLOCKS];
+        let mut mb = LumaMacroblock::new();
+        reconstruct_intra_luma_macroblock_from_coeffs_intra_dc(&mut mb, &modes, &coeffs, 20);
+        assert!(mb.samples.iter().all(|&s| s == 128));
     }
 
     #[test]

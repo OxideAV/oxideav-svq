@@ -948,6 +948,49 @@ pub const fn dequantize_transform_luma_block(q: u32, block: [i32; 16]) -> [i32; 
     dequantize_transform_luma_block_with_dc(q, block, 0)
 }
 
+/// Run the luma residual interleave for an **intra** luma 4×4 block
+/// whose DC coefficient is carried inline (no separate DC block), using
+/// the SVQ3-specific intra-luma DC scale rather than the general
+/// per-coefficient dequant for the DC term.
+///
+/// Per `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock
+/// transform and dequantization": "For intra luma blocks without
+/// separate DC coefficients block: `dc = 13 * 13 * 1538 * block[0]`".
+/// The wiki's general dequant formula
+/// `out = (coeff · svq3_dequant_coeff[Q] + dc + 0x80000) >> 20` then
+/// uses this `dc` as the additive override term. So for an intra luma
+/// block the DC contribution comes from [`INTRA_LUMA_DC_SCALE`] applied
+/// to `block[0]` (via [`dequantize_intra_luma_dc`]), **not** from
+/// `block[0]` running through the `coeff · svq3_dequant_coeff[Q]` AC
+/// scale. This helper therefore:
+///
+/// 1. computes the DC override `dc = INTRA_LUMA_DC_SCALE · block[0]`;
+/// 2. zeroes `block[0]` so the inline DC coefficient does not *also*
+///    contribute through the general AC dequant + transform; and
+/// 3. runs [`dequantize_transform_luma_block_with_dc`] with that `dc`.
+///
+/// The `dc` override is added to **every** transformed sample (it is the
+/// post-transform additive term, exactly as the wiki formula writes),
+/// which is the separable-transform's DC basis (`block[0]` projected
+/// through the column-0 = `13` basis on both passes — the `13 · 13`
+/// inside [`INTRA_LUMA_DC_SCALE`]).
+///
+/// The `block` argument is the row-major placed coefficient grid from
+/// [`crate::svq3_scan::place_4x4`]. The returned `[i32; 16]` is the
+/// dequantised, inverse-transformed residual.
+///
+/// # Panics
+///
+/// Panics if `q >= DEQUANT_COEFF_TABLE_LEN`.
+#[inline]
+#[must_use]
+pub const fn dequantize_transform_intra_luma_block(q: u32, block: [i32; 16]) -> [i32; 16] {
+    let dc = dequantize_intra_luma_dc(block[0]);
+    let mut ac = block;
+    ac[0] = 0;
+    dequantize_transform_luma_block_with_dc(q, ac, dc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2203,5 +2246,62 @@ mod tests {
     #[should_panic]
     fn luma_residual_panics_on_out_of_range_quantiser() {
         let _ = dequantize_transform_luma_block(DEQUANT_COEFF_TABLE_LEN as u32, [1i32; 16]);
+    }
+
+    #[test]
+    fn intra_luma_dc_only_block_lifts_uniformly() {
+        // An intra luma block with only block[0] non-zero: the DC term
+        // is INTRA_LUMA_DC_SCALE * block[0] added to every transformed
+        // sample (which is zero since AC is zeroed). Result is uniformly
+        // (INTRA_LUMA_DC_SCALE*block0 + 0x80000) >> 20.
+        let q = 12;
+        let block0 = 4;
+        let mut block = [0i32; 16];
+        block[0] = block0;
+        let out = dequantize_transform_intra_luma_block(q, block);
+        let dc = INTRA_LUMA_DC_SCALE * block0;
+        let expected = (dc + DEQUANT_ROUND) >> DEQUANT_SHIFT;
+        for w in out.iter() {
+            assert_eq!(*w, expected);
+        }
+    }
+
+    #[test]
+    fn intra_luma_block_uses_special_dc_scale_not_ac_scale() {
+        // The intra-luma path must differ from the general AC path when
+        // block[0] is non-zero (the DC uses INTRA_LUMA_DC_SCALE, the AC
+        // path uses DEQUANT_COEFF_TABLE[Q]). Pick a Q where the two
+        // scales differ.
+        let q = 5;
+        let mut block = [0i32; 16];
+        block[0] = 3;
+        let intra = dequantize_transform_intra_luma_block(q, block);
+        let general = dequantize_transform_luma_block(q, block);
+        assert_ne!(intra, general);
+    }
+
+    #[test]
+    fn intra_luma_ac_only_block_matches_general_path() {
+        // With block[0] == 0 the special DC term is zero, so the intra
+        // path reduces exactly to the general (dc = 0) path.
+        let q = 18;
+        let mut block = [0i32; 16];
+        block[5] = 7;
+        block[11] = -3;
+        assert_eq!(
+            dequantize_transform_intra_luma_block(q, block),
+            dequantize_transform_luma_block(q, block),
+        );
+    }
+
+    #[test]
+    fn intra_luma_block_const_evaluable() {
+        const OUT: [i32; 16] = dequantize_transform_intra_luma_block(10, {
+            let mut b = [0i32; 16];
+            b[0] = 2;
+            b
+        });
+        // Pure intra-DC → flat block.
+        assert_eq!(OUT[0], OUT[15]);
     }
 }

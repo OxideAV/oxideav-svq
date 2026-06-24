@@ -8,6 +8,34 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 365 — SVQ3 intra-luma DC scale residual path (`svq3_dequant`
+  / `svq3_recon`).** Wires the SVQ3-specific intra-luma DC handling the
+  wiki §"Macroblock transform and dequantization" pins — "For intra
+  luma blocks without separate DC coefficients block:
+  `dc = 13 * 13 * 1538 * block[0]`" — which the existing
+  `reconstruct_intra_luma_macroblock_from_coeffs` did not apply (it ran
+  `block[0]` through the general `coeff · svq3_dequant_coeff[Q]` AC
+  scale). New surface:
+  - `dequantize_transform_intra_luma_block(q, block)` computes the DC
+    override `dc = INTRA_LUMA_DC_SCALE · block[0]`, zeroes the inline DC
+    coefficient so it does not also contribute through the AC dequant,
+    then runs `dequantize_transform_luma_block_with_dc` with that `dc`
+    (the post-transform additive term per the wiki formula).
+  - `reconstruct_intra_luma_macroblock_from_coeffs_intra_dc` — the
+    intra-DC counterpart to the general from-coeffs luma recon, using
+    the new per-block dequant for each of the 16 sub-blocks. This is the
+    correct residual path for a 4×4-intra MB (types `1..=24`) whose luma
+    DCs are carried inline. The separate-DC-block branch (MB types `0` /
+    `25`, "luma DCs coded in a separate 4×4 block") needs the separate
+    luma-DC block transform + distribution, which is **not pinned** under
+    `docs/video/svq3/` and remains a deferred DOCS-GAP.
+  - 7 new lib tests: the intra-DC dequant lifts a DC-only block
+    uniformly, differs from the general AC path when DC is present,
+    reduces to the general path when DC is zero, and is `const`-
+    evaluable; the recon variant differs from / matches the general
+    recon for DC-present / DC-absent inputs and produces a flat-128
+    plane for zero coefficients.
+
 - **Round 365 — SVQ3 bitstream-driven intra-4×4 luma macroblock
   reconstruction (`svq3_recon`).** Ties the round-365 intra-mode VLC
   decode into the existing reconstruction loop, producing the first
