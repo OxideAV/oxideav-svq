@@ -8,6 +8,32 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 365 — SVQ3 bitstream-driven intra-4×4 luma macroblock
+  reconstruction (`svq3_recon`).** Ties the round-365 intra-mode VLC
+  decode into the existing reconstruction loop, producing the first
+  end-to-end *bitstream → reconstructed 16×16 luma plane* path for a
+  4×4-intra macroblock. New surface:
+  - `intra_modes_from_grid(grid) -> [Svq3IntraMode; 16]` converts the
+    `Intra4x4ModeGrid` of block-index-ordered `u8` modes into the
+    `Svq3IntraMode` array the reconstruction loops consume (via
+    `Svq3IntraMode::from_value`, infallible for the validated `0..=4`
+    grid values).
+  - `decode_and_reconstruct_intra_luma_macroblock(br, mb, coeff_blocks,
+    q, top_avail, left_avail) -> Intra4x4ModeGrid` reads the 16 modes
+    from the slice bits (`decode_intra_4x4_modes`), converts them, then
+    runs `reconstruct_intra_luma_macroblock_from_coeffs` (spec/01 Gap 2
+    residual interleave + Gap 3/4 predictors + Gap 5 writeback). The
+    decoded grid is returned so the caller can thread the per-block
+    modes into neighbouring macroblocks' intra prediction.
+  - 4 new lib tests: grid→mode conversion round-trip, flat-128 DC
+    reconstruction from the all-code-0 / zero-coefficient stream, exact
+    agreement of the fused entry with the separate decode-then-
+    reconstruct path over a non-trivial coefficient block, and
+    truncation propagation. This entry point still takes the placed
+    coefficient grids as an argument (the CBP-driven residual presence
+    is the remaining DOCS-GAP); the slice-level frame walk that calls
+    it per macroblock is gated on the same CBP `me(v)` trace.
+
 - **Round 365 — SVQ3 intra-4×4 prediction-mode VLC wire decode +
   per-macroblock mode-decode driver (`svq3_mb`).** Closes the
   intra-4×4 prediction-mode VLC gap the README named as a lacks-tail

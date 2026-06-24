@@ -364,6 +364,70 @@ pub fn reconstruct_intra_luma_macroblock_from_coeffs(
     }
 }
 
+/// Convert an [`crate::svq3_mb::Intra4x4ModeGrid`] (the block-index-ordered
+/// `u8` modes the intra-mode VLC decode produces) into the
+/// `[Svq3IntraMode; MB_LUMA_BLOCKS]` array the reconstruction loops
+/// consume.
+///
+/// The grid's modes are already validated to lie in `0..=4` by
+/// [`crate::svq3_mb::decode_intra_4x4_modes`] (every value is the result
+/// of an `INTRA_PRED_TABLE` lookup whose non-sentinel entries are in
+/// `0..=4`), so [`Svq3IntraMode::from_value`] cannot fail here; the
+/// `Result` is propagated only as a defensive guard.
+pub fn intra_modes_from_grid(
+    grid: &crate::svq3_mb::Intra4x4ModeGrid,
+) -> crate::Result<[Svq3IntraMode; MB_LUMA_BLOCKS]> {
+    let mut out = [Svq3IntraMode::DEFAULT; MB_LUMA_BLOCKS];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = Svq3IntraMode::from_value(grid.modes()[i])?;
+    }
+    Ok(out)
+}
+
+/// Decode the 16 4×4-intra prediction modes of one macroblock directly
+/// from the slice bitstream, then reconstruct the 16×16 luma plane
+/// end-to-end from placed coefficient grids.
+///
+/// This is the **bitstream-driven** intra-4×4 luma entry point: it
+/// composes the intra-mode VLC wire decode
+/// ([`crate::svq3_mb::decode_intra_4x4_modes`], spec/01 Gap 3 binding +
+/// the wiki §"Intra macroblock information decoding" Golomb-indexed pair
+/// VLC) with the per-block residual interleave + predictor-selection +
+/// writeback loop of [`reconstruct_intra_luma_macroblock_from_coeffs`].
+/// Where that function takes the resolved modes as an argument, this one
+/// reads them from the slice bits first.
+///
+/// `top_avail` / `left_avail` are passed through to the mode decode to
+/// govern the out-of-macroblock edge-neighbour availability (whether a
+/// neighbour macroblock exists above / to the left in the slice).
+/// `coeff_blocks[index]` / `q` are exactly as in
+/// [`reconstruct_intra_luma_macroblock_from_coeffs`]. On success
+/// `mb.samples` holds the reconstructed 16×16 luma plane and the decoded
+/// [`crate::svq3_mb::Intra4x4ModeGrid`] is returned so the caller can
+/// thread the per-block modes into the neighbouring macroblocks' intra
+/// prediction.
+///
+/// Propagates the mode-decode errors (`Truncated`, `InvalidFrameCode`,
+/// `InvalidIntraPrediction`).
+///
+/// # Panics
+///
+/// Panics if `q >= DEQUANT_COEFF_TABLE_LEN` (same contract as
+/// [`reconstruct_intra_luma_macroblock_from_coeffs`]).
+pub fn decode_and_reconstruct_intra_luma_macroblock(
+    br: &mut crate::bitreader::BitReader<'_>,
+    mb: &mut LumaMacroblock,
+    coeff_blocks: &[[i32; PRED_4X4_SAMPLES]; MB_LUMA_BLOCKS],
+    q: u32,
+    top_avail: bool,
+    left_avail: bool,
+) -> crate::Result<crate::svq3_mb::Intra4x4ModeGrid> {
+    let grid = crate::svq3_mb::decode_intra_4x4_modes(br, top_avail, left_avail)?;
+    let modes = intra_modes_from_grid(&grid)?;
+    reconstruct_intra_luma_macroblock_from_coeffs(mb, &modes, coeff_blocks, q);
+    Ok(grid)
+}
+
 /// The macroblock-wide intra-16×16 luma predictor selection.
 ///
 /// Per `docs/video/svq3/spec/01-reconstruction-composition.md` Gap 4 the
@@ -1383,5 +1447,109 @@ mod tests {
         // chroma planes independent.
         assert!(mb.cb.samples.iter().all(|&s| s != 128), "cb plane lifted");
         assert!(mb.cr.samples.iter().all(|&s| s == 128), "cr flat 128");
+    }
+
+    /// Pack `(width, value)` items MSB-first into bytes (mirrors the
+    /// `svq3_mb` test helper).
+    fn pack(items: &[(u32, u32)]) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        let mut bit_cursor: usize = 0;
+        for &(width, value) in items {
+            for i in (0..width).rev() {
+                let bit = ((value >> i) & 1) as u8;
+                let byte_idx = bit_cursor / 8;
+                if byte_idx >= out.len() {
+                    out.push(0);
+                }
+                let shift = 7 - (bit_cursor % 8);
+                out[byte_idx] |= bit << shift;
+                bit_cursor += 1;
+            }
+        }
+        out
+    }
+
+    /// `(width, value)` for the unsigned exp-Golomb code of `n`.
+    fn ue(n: u32) -> (u32, u32) {
+        let p = n + 1;
+        let leading = 31 - p.leading_zeros();
+        (2 * leading + 1, p)
+    }
+
+    #[test]
+    fn intra_modes_from_grid_maps_every_block() {
+        // Decode the all-code-0 stream (no neighbour MBs) into a grid,
+        // then convert it. Every entry must be a valid Svq3IntraMode and
+        // round-trip back to the grid's u8 value.
+        let bytes = pack(&[ue(0); 8]);
+        let mut br = crate::bitreader::BitReader::new(&bytes);
+        let grid = crate::svq3_mb::decode_intra_4x4_modes(&mut br, false, false).unwrap();
+        let modes = intra_modes_from_grid(&grid).unwrap();
+        for (i, m) in modes.iter().enumerate() {
+            assert_eq!(m.value(), grid.modes()[i]);
+        }
+        // Block 0 decoded to mode 2 (DC) for the all-code-0 corner case.
+        assert_eq!(modes[0], Svq3IntraMode::Dc);
+    }
+
+    #[test]
+    fn decode_and_reconstruct_intra_luma_macroblock_flat_dc() {
+        // All-code-0 intra modes (block 0 = DC), zero coefficients. With
+        // no neighbours available the DC predictor yields 128 for every
+        // sub-block, and a zero residual leaves the plane flat 128.
+        let bytes = pack(&[ue(0); 8]);
+        let mut br = crate::bitreader::BitReader::new(&bytes);
+        let mut mb = LumaMacroblock::new();
+        let coeffs = [[0i32; PRED_4X4_SAMPLES]; MB_LUMA_BLOCKS];
+        let grid = decode_and_reconstruct_intra_luma_macroblock(
+            &mut br, &mut mb, &coeffs, 20, false, false,
+        )
+        .unwrap();
+        // The returned grid's block 0 is DC (mode 2).
+        assert_eq!(grid.mode(0), Some(2));
+        // Flat-128 reconstruction (DC over unavailable neighbours = 128,
+        // zero residual).
+        assert!(mb.samples.iter().all(|&s| s == 128), "flat 128 plane");
+    }
+
+    #[test]
+    fn decode_and_reconstruct_matches_two_step_path() {
+        // The end-to-end entry must agree with decode-then-reconstruct
+        // run separately, for a non-trivial coefficient block.
+        let bytes = pack(&[ue(0); 8]);
+        let mut coeffs = [[0i32; PRED_4X4_SAMPLES]; MB_LUMA_BLOCKS];
+        coeffs[0][0] = 5;
+        coeffs[7][3] = -2;
+
+        // Path A: fused entry.
+        let mut br_a = crate::bitreader::BitReader::new(&bytes);
+        let mut mb_a = LumaMacroblock::new();
+        decode_and_reconstruct_intra_luma_macroblock(
+            &mut br_a, &mut mb_a, &coeffs, 18, false, false,
+        )
+        .unwrap();
+
+        // Path B: decode modes, convert, reconstruct — separately.
+        let mut br_b = crate::bitreader::BitReader::new(&bytes);
+        let grid = crate::svq3_mb::decode_intra_4x4_modes(&mut br_b, false, false).unwrap();
+        let modes = intra_modes_from_grid(&grid).unwrap();
+        let mut mb_b = LumaMacroblock::new();
+        reconstruct_intra_luma_macroblock_from_coeffs(&mut mb_b, &modes, &coeffs, 18);
+
+        assert_eq!(mb_a.samples, mb_b.samples);
+    }
+
+    #[test]
+    fn decode_and_reconstruct_propagates_truncation() {
+        // Only one codeword present; the mode decode needs eight.
+        let bytes = pack(&[ue(0)]);
+        let mut br = crate::bitreader::BitReader::new(&bytes);
+        let mut mb = LumaMacroblock::new();
+        let coeffs = [[0i32; PRED_4X4_SAMPLES]; MB_LUMA_BLOCKS];
+        let err = decode_and_reconstruct_intra_luma_macroblock(
+            &mut br, &mut mb, &coeffs, 20, false, false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::Error::Truncated));
     }
 }
