@@ -8,10 +8,16 @@ Implemented from the clean-room specifications staged under
 
 ## Status
 
-**Structural scaffold — no pixel output yet.** Both decoders parse
-their bitstreams into typed structures and stage the required tables,
-but `receive_frame` returns `oxideav_core::Error::Unsupported` until
-the full reconstruction pipelines are wired. What is implemented:
+**Decode pipelines wired up to the per-macroblock unit; the
+frame-level entry point is not yet exposed.** Both decoders parse their
+bitstreams into typed structures and stage the required tables. For
+SVQ3, a single 4×4-intra macroblock now reconstructs **end-to-end from
+slice bits to a 16×16 luma plane** (intra-mode VLC → predictor →
+residual → writeback). `receive_frame` still returns
+`oxideav_core::Error::Unsupported`: the slice-level frame walk that
+drives the per-macroblock units across a whole picture is gated on the
+one remaining CBP `me(v)` docs trace (see the SVQ3 gap note below).
+What is implemented:
 
 ### SVQ1
 
@@ -143,25 +149,55 @@ full plane reconstruction is blocked on bitstream-driven field decode.
   list into an `Svq3InterMacroblockHeader` — the first end-to-end
   parse of the SVQ3 inter-MB header from raw slice bits.
 
-The remaining SVQ3 gap toward a full P-frame pixel decode is the
+* **Intra-4×4 prediction-mode VLC wire decode + per-MB mode driver
+  (`svq3_mb`).** `read_intra_4x4_pred_pair` reads one unsigned
+  exp-Golomb `ue(v)` codeword (the wiki §"Intra macroblock information
+  decoding" pairs are listed in a contiguous `0..=24` enumeration and
+  §"Decoding Process" states the codec "extensively uses Golomb
+  coding", so the code-number indexes `INTRA_PRED_PAIRS` directly — the
+  same convention `read_mb_type` uses). `INTRA_4X4_PRED_BLOCK_PAIRS`
+  groups the 16 sub-blocks into the eight `(first, second)` index pairs
+  the wiki picture parenthesises (one codeword per pair).
+  `decode_intra_4x4_modes` is the per-macroblock driver: for each pair
+  it reads one codeword then resolves both blocks' modes via the
+  `INTRA_PRED_TABLE` lookup against each block's own running top/left
+  neighbour modes (in-MB 4×4 neighbours as `Mode4x4`, out-of-MB edges
+  per the wiki's "-1 when outside slice" / "value 2 for 16×16-intra or
+  inter" rules), returning an `Intra4x4ModeGrid`.
+* **Bitstream-driven intra-4×4 luma reconstruction (`svq3_recon`).**
+  `decode_and_reconstruct_intra_luma_macroblock` composes the mode VLC
+  decode with the residual interleave + predictor + writeback loop into
+  the first end-to-end *slice bits → reconstructed 16×16 luma plane*
+  path for a 4×4-intra macroblock (modes read from the wire, no longer
+  caller-supplied). `intra_modes_from_grid` bridges the decoded grid to
+  the `Svq3IntraMode` array.
+* **Intra-luma DC scale residual path (`svq3_dequant` / `svq3_recon`).**
+  `dequantize_transform_intra_luma_block` applies the wiki's intra-luma
+  DC handling (`dc = 13·13·1538·block[0]` as the post-transform additive
+  override, the inline DC coefficient zeroed out of the AC dequant) and
+  `reconstruct_intra_luma_macroblock_from_coeffs_intra_dc` drives it per
+  macroblock — the correct DC path for the inline-DC 4×4-intra MB types
+  (`1..=24`).
+* **Macroblock-grid geometry (`svq3`).** `mb_grid_dims` /
+  `Svq3MacroblockPosition` / `macroblock_position` give the raster
+  column/row + intra above/left neighbour availability the frame walk
+  threads into the per-MB intra decode.
+
+The remaining SVQ3 gap toward a decoded intra frame is now the
 **CBP coded-block-pattern read**, which the wiki defers wholesale to
 H.264 ("CBP is coded the same way as in H.264"). Its codeword↔value
 mapping is the H.264 `me(v)` mapped-Exp-Golomb table (ITU-T Table 9-4,
 intra/inter × chroma-format), which is **not reproduced** under
 `docs/video/svq3/`, so the CBP wire decode — and therefore which
-residual blocks are present — stays gated on a docs trace. The
-intra-4×4 prediction-mode VLC bit patterns (the 25-pair table is
-staged in `INTRA_PRED_PAIRS`, but its codeword→pair-index mapping is
-not) are blocked on the same kind of trace. The 4×4 scan-order arrays
-(Gap 1), the two-sided transform + residual interleave (Gap 2), the
-intra-mode binding + predictors (Gap 3/4), the writeback clamp
-(Gap 5), the signed-Golomb MV-difference / quant-delta / inter-MB-header
-wire decode, and now the **whole intra-macroblock reconstruction
-composition** — the 4×4-intra *and* 16×16-intra luma paths, the chroma
-8×8 DC-only plane path, and the three-plane `reconstruct_intra_macroblock`
-assembly unit — are landed. What remains between here and a decoded
-intra frame is the slice-level frame walk driving these per-MB units
-(and the CBP / intra-mode VLC wire decode above that feeds them).
+residual blocks are present, hence how to parse the per-MB coefficient
+stream — stays gated on a docs trace. The **separate-DC luma block**
+branch (MB types `0` / `25`, "luma DCs coded in a separate 4×4 block")
+likewise needs the separate luma-DC block transform + distribution,
+also unpinned under `docs/video/svq3/`. With the intra-mode VLC, the
+inline-DC intra-luma residual path, and the per-MB grid geometry now
+landed, the only thing between here and a decoded intra frame is the
+slice-level frame walk — and the one CBP `me(v)` trace that walk needs
+to know which residual blocks each macroblock carries.
 
 ## Cargo features
 
