@@ -56,12 +56,25 @@
 //! spec text leaves the rounding direction (toward zero / away from
 //! zero / round-half-up / round-half-even) unspecified.
 //!
+//! ## Reference-frame fetch
+//!
+//! The full-pel reference copy that the sub-pel filters refine lands as
+//! [`ReferencePlane`] (a borrowed row-major picture-plane view with
+//! H.264 edge-replication clamping for unrestricted motion vectors) plus
+//! [`fetch_fullpel_block`] (a `block_w × block_h` clamped integer-pel
+//! copy). When a motion vector lands exactly on the integer grid this
+//! copy *is* the macroblock predictor; for sub-pel vectors it is the
+//! pre-filter window the thirdpel interpolators sharpen.
+//!
 //! ## Open work
 //!
-//! The reference-frame-fetch + filter-application stage that consumes
-//! these primitives is not yet wired — `Svq3DecoderHandle::receive_frame`
-//! continues to return `oxideav_core::Error::Unsupported`. Round 224
-//! lands the arithmetic only.
+//! The full sub-pel filter-application stage (selecting 1-D vs 2-D
+//! thirdpel per fractional grid position) and the precision rounding of
+//! the stored sixths grid into a fetch offset are not yet wired — the
+//! wiki leaves the rounding direction and the per-position filter
+//! selection unpinned (a deferred DOCS-GAP).
+//! `Svq3DecoderHandle::receive_frame` continues to return
+//! `oxideav_core::Error::Unsupported`.
 
 use crate::svq3_mb::Svq3MvPrecision;
 
@@ -203,6 +216,110 @@ pub const fn stored_sixths_base(precision: Svq3MvPrecision) -> u32 {
 pub const fn is_aligned_to_precision_base(stored_sixths: i32, precision: Svq3MvPrecision) -> bool {
     let base = stored_sixths_base(precision) as i32;
     stored_sixths.rem_euclid(base) == 0
+}
+
+/// A borrowed read-only view of a reference picture plane (luma or one
+/// chroma component) used as the source for motion compensation.
+///
+/// The plane is row-major, `width × height` samples, indexed
+/// `samples[y * width + x]`. Motion compensation reads a rectangular
+/// window out of this plane at an integer-pel offset that may fall
+/// partly (or wholly) outside the plane bounds; out-of-bounds
+/// coordinates are resolved by **edge replication** (clamping each
+/// coordinate to the nearest in-bounds sample), the standard H.264
+/// reference-sample border extension that
+/// `docs/video/svq3/spec/01-reconstruction-composition.md` Gap 5 refers
+/// to as the surrounding `Clip1` / saturation idiom for the
+/// reconstruction path. SVQ3 inherits H.264's unrestricted motion
+/// vectors, so the reference window is never bounds-checked against the
+/// frame — it is clamped.
+#[derive(Debug, Clone, Copy)]
+pub struct ReferencePlane<'a> {
+    samples: &'a [u8],
+    width: usize,
+    height: usize,
+}
+
+impl<'a> ReferencePlane<'a> {
+    /// Wrap a row-major sample slice as a `width × height` reference
+    /// plane.
+    ///
+    /// Returns `None` if `samples.len() != width * height` or if either
+    /// dimension is zero (an empty plane has no sample to clamp to).
+    #[must_use]
+    pub fn new(samples: &'a [u8], width: usize, height: usize) -> Option<Self> {
+        if width == 0 || height == 0 || samples.len() != width * height {
+            return None;
+        }
+        Some(Self {
+            samples,
+            width,
+            height,
+        })
+    }
+
+    /// Plane width in samples.
+    #[inline]
+    #[must_use]
+    pub const fn width(&self) -> usize {
+        self.width
+    }
+
+    /// Plane height in samples.
+    #[inline]
+    #[must_use]
+    pub const fn height(&self) -> usize {
+        self.height
+    }
+
+    /// Fetch the sample at `(x, y)` with edge-replication clamping.
+    ///
+    /// `x` and `y` are signed integer-pel coordinates that may be
+    /// negative or beyond the plane extent; each is clamped to
+    /// `[0, width-1]` / `[0, height-1]` before the row-major lookup, so
+    /// this never panics and never returns out-of-band data. This is the
+    /// standard H.264 border extension for unrestricted motion vectors.
+    #[inline]
+    #[must_use]
+    pub fn sample_clamped(&self, x: i32, y: i32) -> u8 {
+        let cx = x.clamp(0, self.width as i32 - 1) as usize;
+        let cy = y.clamp(0, self.height as i32 - 1) as usize;
+        self.samples[cy * self.width + cx]
+    }
+}
+
+/// Fetch a `block_w × block_h` integer-pel block from `plane` whose
+/// top-left sample is at plane coordinate `(origin_x, origin_y)`, with
+/// out-of-bounds samples resolved by edge replication.
+///
+/// This is the **full-pel** motion-compensation copy: when a motion
+/// vector lands exactly on the integer-pel grid (no sub-pel fraction),
+/// the predictor for the block is just this clamped reference copy. The
+/// output is row-major (`out[row * block_w + col]`), matching the layout
+/// the 4×4 / 16×16 reconstruction loops consume so the residual can be
+/// added element-wise.
+///
+/// `origin_x` / `origin_y` are signed (they incorporate the block's
+/// pixel position plus the integer-pel part of its motion vector and may
+/// be negative); each fetched sample is clamped per
+/// [`ReferencePlane::sample_clamped`].
+#[must_use]
+pub fn fetch_fullpel_block(
+    plane: &ReferencePlane<'_>,
+    origin_x: i32,
+    origin_y: i32,
+    block_w: usize,
+    block_h: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(block_w * block_h);
+    for row in 0..block_h {
+        let sy = origin_y + row as i32;
+        for col in 0..block_w {
+            let sx = origin_x + col as i32;
+            out.push(plane.sample_clamped(sx, sy));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -512,5 +629,129 @@ mod tests {
         assert!(!is_aligned_to_precision_base(-5, Svq3MvPrecision::Fullpel));
         assert!(!is_aligned_to_precision_base(-7, Svq3MvPrecision::Halfpel));
         assert!(!is_aligned_to_precision_base(-3, Svq3MvPrecision::Thirdpel));
+    }
+
+    // ------------------------------------------------------------------
+    // Reference-plane integer-pel block fetch (Milestone 1)
+    // ------------------------------------------------------------------
+
+    /// Build a `width × height` ramp plane where `samples[y*w+x] =
+    /// (y*w + x) % 256`, useful for verifying coordinate addressing.
+    fn ramp_plane(width: usize, height: usize) -> Vec<u8> {
+        (0..width * height).map(|i| (i % 256) as u8).collect()
+    }
+
+    #[test]
+    fn reference_plane_rejects_mismatched_length() {
+        assert!(ReferencePlane::new(&[0u8; 5], 2, 3).is_none());
+        assert!(ReferencePlane::new(&[0u8; 6], 2, 3).is_some());
+    }
+
+    #[test]
+    fn reference_plane_rejects_zero_dimension() {
+        assert!(ReferencePlane::new(&[], 0, 3).is_none());
+        assert!(ReferencePlane::new(&[], 2, 0).is_none());
+    }
+
+    #[test]
+    fn reference_plane_reports_dimensions() {
+        let buf = ramp_plane(4, 5);
+        let plane = ReferencePlane::new(&buf, 4, 5).unwrap();
+        assert_eq!(plane.width(), 4);
+        assert_eq!(plane.height(), 5);
+    }
+
+    #[test]
+    fn sample_clamped_in_bounds_is_row_major() {
+        let buf = ramp_plane(4, 3);
+        let plane = ReferencePlane::new(&buf, 4, 3).unwrap();
+        // samples[y*4 + x]
+        assert_eq!(plane.sample_clamped(0, 0), 0);
+        assert_eq!(plane.sample_clamped(3, 0), 3);
+        assert_eq!(plane.sample_clamped(0, 1), 4);
+        assert_eq!(plane.sample_clamped(2, 2), 10);
+    }
+
+    #[test]
+    fn sample_clamped_clamps_negative_coordinates_to_edge() {
+        let buf = ramp_plane(4, 3);
+        let plane = ReferencePlane::new(&buf, 4, 3).unwrap();
+        // x<0 → column 0; y<0 → row 0.
+        assert_eq!(plane.sample_clamped(-5, 0), plane.sample_clamped(0, 0));
+        assert_eq!(plane.sample_clamped(2, -9), plane.sample_clamped(2, 0));
+        assert_eq!(plane.sample_clamped(-1, -1), plane.sample_clamped(0, 0));
+    }
+
+    #[test]
+    fn sample_clamped_clamps_beyond_extent_to_edge() {
+        let buf = ramp_plane(4, 3);
+        let plane = ReferencePlane::new(&buf, 4, 3).unwrap();
+        // x>=w → last column; y>=h → last row.
+        assert_eq!(plane.sample_clamped(99, 1), plane.sample_clamped(3, 1));
+        assert_eq!(plane.sample_clamped(2, 99), plane.sample_clamped(2, 2));
+        assert_eq!(plane.sample_clamped(99, 99), plane.sample_clamped(3, 2));
+    }
+
+    #[test]
+    fn fetch_fullpel_block_copies_interior_window() {
+        let buf = ramp_plane(8, 8);
+        let plane = ReferencePlane::new(&buf, 8, 8).unwrap();
+        let block = fetch_fullpel_block(&plane, 2, 3, 4, 4);
+        assert_eq!(block.len(), 16);
+        // Each output sample equals the clamped reference sample.
+        for row in 0..4 {
+            for col in 0..4 {
+                let got = block[row * 4 + col];
+                let want = plane.sample_clamped(2 + col as i32, 3 + row as i32);
+                assert_eq!(got, want, "row={row} col={col}");
+            }
+        }
+        // The interior window is unclamped: top-left = samples[3*8+2] = 26.
+        assert_eq!(block[0], 26);
+    }
+
+    #[test]
+    fn fetch_fullpel_block_replicates_top_left_corner() {
+        let buf = ramp_plane(8, 8);
+        let plane = ReferencePlane::new(&buf, 8, 8).unwrap();
+        // Origin entirely above-left of the plane: the whole 4×4 block
+        // replicates the single corner sample samples[0] = 0.
+        let block = fetch_fullpel_block(&plane, -10, -10, 4, 4);
+        assert!(block.iter().all(|&s| s == 0), "{block:?}");
+    }
+
+    #[test]
+    fn fetch_fullpel_block_replicates_bottom_right_corner() {
+        let buf = ramp_plane(8, 8);
+        let plane = ReferencePlane::new(&buf, 8, 8).unwrap();
+        let corner = plane.sample_clamped(7, 7);
+        // Origin entirely below-right: every sample replicates the
+        // bottom-right corner.
+        let block = fetch_fullpel_block(&plane, 20, 20, 4, 4);
+        assert!(block.iter().all(|&s| s == corner), "{block:?}");
+    }
+
+    #[test]
+    fn fetch_fullpel_block_handles_partial_overlap() {
+        let buf = ramp_plane(8, 8);
+        let plane = ReferencePlane::new(&buf, 8, 8).unwrap();
+        // Origin straddling the left edge: columns left of 0 replicate
+        // column 0, in-bounds columns copy verbatim.
+        let block = fetch_fullpel_block(&plane, -2, 1, 4, 1);
+        // col 0,1 → x clamps to 0; col 2 → x=0; col 3 → x=1.
+        assert_eq!(block[0], plane.sample_clamped(0, 1));
+        assert_eq!(block[1], plane.sample_clamped(0, 1));
+        assert_eq!(block[2], plane.sample_clamped(0, 1));
+        assert_eq!(block[3], plane.sample_clamped(1, 1));
+    }
+
+    #[test]
+    fn fetch_fullpel_block_full_16x16_size() {
+        let buf = ramp_plane(32, 32);
+        let plane = ReferencePlane::new(&buf, 32, 32).unwrap();
+        let block = fetch_fullpel_block(&plane, 5, 7, 16, 16);
+        assert_eq!(block.len(), 256);
+        assert_eq!(block[0], plane.sample_clamped(5, 7));
+        assert_eq!(block[16 * 16 - 1], plane.sample_clamped(5 + 15, 7 + 15));
     }
 }

@@ -8,6 +8,27 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 374 — SVQ3 reference-plane integer-pel block fetch
+  (`svq3_mc`).** Lands the full-pel motion-compensation reference copy
+  the sub-pel thirdpel filters refine. New `ReferencePlane<'a>` — a
+  borrowed row-major picture-plane view (`width × height` u8 samples)
+  with `sample_clamped(x, y)` performing H.264 edge-replication
+  clamping for unrestricted motion vectors (each signed coordinate
+  clamped to `[0, w-1]` / `[0, h-1]` before the lookup), validated at
+  construction (`new` rejects length mismatch / zero dimension). New
+  `fetch_fullpel_block(plane, origin_x, origin_y, block_w, block_h)`
+  copies a `block_w × block_h` integer-pel window (row-major output
+  matching the reconstruction loops) with every out-of-bounds sample
+  resolved by edge replication — the macroblock predictor when a motion
+  vector lands exactly on the integer grid, and the pre-filter window
+  otherwise. The sub-pel filter-application stage + the sixths-grid
+  precision rounding remain deferred DOCS-GAPs (the wiki pins neither
+  the rounding direction nor the per-fractional-position 1-D/2-D filter
+  selection). 11 new lib tests: construction validation, the row-major
+  in-bounds lookup, negative / beyond-extent clamping, interior-window
+  copy, top-left / bottom-right corner replication, partial-overlap
+  straddle, and a full 16×16 fetch.
+
 - **Round 365 — SVQ3 macroblock-grid geometry + per-MB neighbour
   availability (`svq3`).** The pure-geometry prerequisite the slice-level
   intra-frame walk needs to drive the per-macroblock units, independent
