@@ -8,6 +8,22 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 374 — SVQ1 L=3 inter sub-block reconstruction (`svq1_mc`).**
+  Composes the §6.5.2 motion-compensation patch into the §4.6.2 inter
+  predictor role of `reconstruct_leaf`: the first end-to-end *reference
+  plane + MV → reconstructed inter sub-block* path.
+  `reconstruct_inter_l3_block(plane, base_col, base_row, mv, inter_half,
+  mean, stages)` motion-compensates the 8×8 (`L=3`) reference patch,
+  then runs the multistage-VQ leaf accumulation (inter mean step +
+  ascending codebook stages, each saturated to `[0, 255]`) with that
+  patch as the per-position predictor — the inter counterpart of the
+  zero-predictor intra leaf. The block is always `L=3` (64 samples), so
+  the MC patch is exactly the predictor length the leaf reconstruction
+  requires; smaller leaf sizes need the block-tree subdivision geometry
+  (deferred). 6 new lib tests: mean-only = MC + mean, zero-mean = MC
+  patch verbatim, negative-mean saturation to 0, single-stage codebook
+  addition, and propagation of codebook-lookup / stage-overflow errors.
+
 - **Round 374 — SVQ1 half-pel motion-compensation reference sampling
   (`svq1_mc`).** New `svq1_mc` module implementing
   `docs/video/svq1/spec/06-motion-vectors.md` §6.5 (the half-pel

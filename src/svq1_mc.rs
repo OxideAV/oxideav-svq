@@ -37,7 +37,9 @@
 //! (`docs/video/svq1/spec/06-motion-vectors.md` §6.2.3 Reading A/B
 //! ambiguity); this module takes an already-resolved [`Svq1Mv`].
 
+use crate::svq1_blocktree::Svq1Level;
 use crate::svq1_motion_predictor::Svq1Mv;
+use crate::svq1_reconstruct::{reconstruct_leaf, LeafStage, ReconstructError};
 
 /// A borrowed read-only view of an SVQ1 reference picture plane (Y, U,
 /// or V component) for half-pel motion compensation.
@@ -174,6 +176,45 @@ pub fn motion_compensate_block(
         }
     }
     out
+}
+
+/// Reconstruct a full 8×8 (`L=3`) inter sub-block: the motion-
+/// compensated reference patch becomes the per-sample predictor of the
+/// multistage-VQ leaf reconstruction.
+///
+/// Composes the §6.5.2 motion-compensation patch
+/// ([`motion_compensate_block`]) into the §4.6.2 inter predictor role of
+/// [`crate::svq1_reconstruct::reconstruct_leaf`]: the 8×8 reference
+/// samples are the leaf's per-position baseline, onto which the inter
+/// mean step and the codebook stages accumulate (each saturated to
+/// `[0, 255]`). This is the inter counterpart of the intra leaf
+/// reconstruction (which uses a zero predictor) and is the first
+/// end-to-end *reference plane + MV → reconstructed inter sub-block*
+/// path in the crate.
+///
+/// `(base_col, base_row)` is the sub-block's integer-pel position; `mv`
+/// is the resolved half-pel motion vector; `inter_half` is the inter
+/// codebook half for `L=3` (the §14.8 cross-half ordering the caller has
+/// isolated); `mean` is the decoded inter mean (`[-256, +255]`);
+/// `stages` are the decoded codebook stages in ascending order.
+///
+/// Returns the 8×8 reconstructed samples in row-major order, or a
+/// [`ReconstructError`] propagated from the leaf reconstruction (e.g. a
+/// codebook lookup failure or a stage overflow). The block is always
+/// `L=3` (64 samples), so the [`motion_compensate_block`] patch is
+/// exactly the predictor length the leaf reconstruction requires.
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_inter_l3_block(
+    plane: &Svq1ReferencePlane<'_>,
+    base_col: i32,
+    base_row: i32,
+    mv: Svq1Mv,
+    inter_half: &[i8],
+    mean: i16,
+    stages: &[LeafStage],
+) -> Result<Vec<u8>, ReconstructError> {
+    let predictor = motion_compensate_block(plane, base_col, base_row, mv);
+    reconstruct_leaf(Svq1Level::L3, inter_half, &predictor, mean, stages)
 }
 
 #[cfg(test)]
@@ -334,5 +375,97 @@ mod tests {
         assert_eq!(block[0], plane.sample_clamped(0, 0));
         assert_eq!(block[1], plane.sample_clamped(1, 0));
         assert_eq!(block[8], plane.sample_clamped(0, 1));
+    }
+
+    // ------------------------------------------------------------------
+    // L3 inter sub-block reconstruction (MC predictor + leaf accumulate)
+    // ------------------------------------------------------------------
+
+    /// An L=3 inter codebook half: 6 stages × 16 entries × 64 bytes.
+    const L3_HALF_BYTES: usize = 6 * 16 * 64;
+
+    #[test]
+    fn inter_l3_mean_only_is_mc_patch_plus_mean() {
+        let buf = ramp_plane(16, 16);
+        let plane = Svq1ReferencePlane::new(&buf, 16, 16).unwrap();
+        // Mean-only leaf (no stages): each sample = saturate(mc + mean).
+        let mean = 10i16;
+        let out = reconstruct_inter_l3_block(&plane, 1, 1, Svq1Mv::ZERO, &[], mean, &[]).unwrap();
+        let mc = motion_compensate_block(&plane, 1, 1, Svq1Mv::ZERO);
+        for (o, m) in out.iter().zip(mc.iter()) {
+            let want = (*m as i16 + mean).clamp(0, 255) as u8;
+            assert_eq!(*o, want);
+        }
+    }
+
+    #[test]
+    fn inter_l3_mean_only_zero_mean_is_mc_patch() {
+        let buf = ramp_plane(16, 16);
+        let plane = Svq1ReferencePlane::new(&buf, 16, 16).unwrap();
+        let out = reconstruct_inter_l3_block(&plane, 2, 3, Svq1Mv::new(2, 0), &[], 0, &[]).unwrap();
+        let mc = motion_compensate_block(&plane, 2, 3, Svq1Mv::new(2, 0));
+        assert_eq!(out, mc);
+    }
+
+    #[test]
+    fn inter_l3_negative_mean_saturates_to_zero() {
+        // A flat dark patch plus a very negative mean clamps to 0.
+        let buf = vec![5u8; 16 * 16];
+        let plane = Svq1ReferencePlane::new(&buf, 16, 16).unwrap();
+        let out = reconstruct_inter_l3_block(&plane, 0, 0, Svq1Mv::ZERO, &[], -200, &[]).unwrap();
+        assert!(out.iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn inter_l3_single_stage_adds_codebook_vector() {
+        let buf = vec![100u8; 16 * 16];
+        let plane = Svq1ReferencePlane::new(&buf, 16, 16).unwrap();
+        // Build a half where stage 1, vec 0 is the constant +7 vector
+        // (the first 64 bytes); everything else zero.
+        let mut half = vec![0i8; L3_HALF_BYTES];
+        for b in half.iter_mut().take(64) {
+            *b = 7;
+        }
+        let stages = [LeafStage {
+            stage: 1,
+            vec_idx: 0,
+        }];
+        let out =
+            reconstruct_inter_l3_block(&plane, 0, 0, Svq1Mv::ZERO, &half, 0, &stages).unwrap();
+        // predictor 100 + mean 0 + stage +7 = 107 everywhere.
+        assert!(out.iter().all(|&s| s == 107), "{:?}", &out[..4]);
+    }
+
+    #[test]
+    fn inter_l3_propagates_codebook_lookup_failure() {
+        let buf = ramp_plane(16, 16);
+        let plane = Svq1ReferencePlane::new(&buf, 16, 16).unwrap();
+        // A too-short half makes the stage-1 lookup fail.
+        let short_half = vec![0i8; 32];
+        let stages = [LeafStage {
+            stage: 1,
+            vec_idx: 0,
+        }];
+        assert!(matches!(
+            reconstruct_inter_l3_block(&plane, 0, 0, Svq1Mv::ZERO, &short_half, 0, &stages),
+            Err(ReconstructError::CodebookLookup { .. })
+        ));
+    }
+
+    #[test]
+    fn inter_l3_propagates_stage_overflow() {
+        let buf = ramp_plane(16, 16);
+        let plane = Svq1ReferencePlane::new(&buf, 16, 16).unwrap();
+        let half = vec![0i8; L3_HALF_BYTES];
+        let too_many: Vec<LeafStage> = (1..=7)
+            .map(|s| LeafStage {
+                stage: s,
+                vec_idx: 0,
+            })
+            .collect();
+        assert!(matches!(
+            reconstruct_inter_l3_block(&plane, 0, 0, Svq1Mv::ZERO, &half, 0, &too_many),
+            Err(ReconstructError::TooManyStages { .. })
+        ));
     }
 }
