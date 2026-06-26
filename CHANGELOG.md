@@ -8,6 +8,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 374 — SVQ3 motion-vector sixths-grid decomposition
+  (`svq3_mc`).** Splits a stored motion-vector component into the
+  integer-pel displacement (the `fetch_fullpel_block` window origin
+  offset) and the sub-pel remainder (the interpolation filter input).
+  Per `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Motion
+  Compensation" — *"motion vectors are stored and predicted as fraction
+  of six"* — the storage grid is sixths-of-a-sample. New
+  `MV_FRACTION_BASE = 6`, `MvComponentSplit { integer_pel, frac_sixths }`,
+  and `split_mv_component(stored_sixths)` computing
+  `integer_pel = ⌊v/6⌋` (Euclidean floor toward −∞) and
+  `frac_sixths = v mod 6 ∈ 0..6` (always non-negative), so a negative
+  component keeps the same sub-pel phase as its positive counterpart and
+  `integer_pel·6 + frac_sixths == v` reconstructs for every signed
+  input. 7 new lib tests: the base constant, the zero / exact-full-pel /
+  positive-fraction / negative-floor cases, the reconstruction identity
+  swept over `[-100, 100]`, and `const` evaluability.
+
 - **Round 374 — SVQ3 reference-plane integer-pel block fetch
   (`svq3_mc`).** Lands the full-pel motion-compensation reference copy
   the sub-pel thirdpel filters refine. New `ReferencePlane<'a>` — a

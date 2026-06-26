@@ -322,6 +322,55 @@ pub fn fetch_fullpel_block(
     out
 }
 
+/// The number of sub-sample subdivisions a stored motion-vector
+/// component is expressed in: sixths-of-a-sample.
+///
+/// Per `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Motion
+/// Compensation": *"motion vectors are stored and predicted as fraction
+/// of six"*. The common storage grid is sixths so each of the three
+/// supported precisions (whole = 6/6, half = 3/6, third = 2/6) lands on
+/// an integer sixths value.
+pub const MV_FRACTION_BASE: i32 = 6;
+
+/// A stored motion-vector component split into its integer-pel part and
+/// its sub-pel remainder on the sixths grid.
+///
+/// `integer_pel` is the whole-sample displacement (the offset added to a
+/// block's pixel position to locate the [`fetch_fullpel_block`] window
+/// origin); `frac_sixths` is the residual sub-sample offset in
+/// `0..MV_FRACTION_BASE` (always non-negative), the input to the sub-pel
+/// interpolation filters. When `frac_sixths == 0` the component lands
+/// exactly on the integer grid and needs no interpolation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MvComponentSplit {
+    /// Whole-sample displacement (signed, floored toward −∞).
+    pub integer_pel: i32,
+    /// Sub-sample remainder in sixths, `0..6` (always non-negative).
+    pub frac_sixths: u32,
+}
+
+/// Split one stored motion-vector component (in sixths-of-a-sample)
+/// into its integer-pel displacement and its non-negative sub-pel
+/// remainder.
+///
+/// The split is the Euclidean division of the stored sixths value by
+/// [`MV_FRACTION_BASE`]: `integer_pel = ⌊stored_sixths / 6⌋` (floored
+/// toward −∞ so a negative vector still has a non-negative fractional
+/// remainder) and `frac_sixths = stored_sixths mod 6 ∈ 0..6`. Flooring
+/// toward −∞ keeps the fractional position consistent regardless of
+/// sign: a component of `−1` sixths is `−1` whole pels plus `+5` sixths,
+/// i.e. one sample left then five-sixths right, the same sub-pel phase a
+/// `+5` component carries. This reconstructs the canonical
+/// `position = integer_pel + frac_sixths/6` for every signed input.
+#[inline]
+#[must_use]
+pub const fn split_mv_component(stored_sixths: i32) -> MvComponentSplit {
+    MvComponentSplit {
+        integer_pel: stored_sixths.div_euclid(MV_FRACTION_BASE),
+        frac_sixths: stored_sixths.rem_euclid(MV_FRACTION_BASE) as u32,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,5 +802,84 @@ mod tests {
         assert_eq!(block.len(), 256);
         assert_eq!(block[0], plane.sample_clamped(5, 7));
         assert_eq!(block[16 * 16 - 1], plane.sample_clamped(5 + 15, 7 + 15));
+    }
+
+    // ------------------------------------------------------------------
+    // MV sixths-grid decomposition (Milestone 2)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn mv_fraction_base_is_six() {
+        assert_eq!(MV_FRACTION_BASE, 6);
+    }
+
+    #[test]
+    fn split_mv_component_zero() {
+        let s = split_mv_component(0);
+        assert_eq!(s.integer_pel, 0);
+        assert_eq!(s.frac_sixths, 0);
+    }
+
+    #[test]
+    fn split_mv_component_exact_full_pels() {
+        // Multiples of six are whole pels with zero fraction.
+        for pel in -5..=5 {
+            let s = split_mv_component(pel * 6);
+            assert_eq!(s.integer_pel, pel, "pel={pel}");
+            assert_eq!(s.frac_sixths, 0, "pel={pel}");
+        }
+    }
+
+    #[test]
+    fn split_mv_component_positive_fractions() {
+        // 7 sixths = 1 whole pel + 1 sixth.
+        let s = split_mv_component(7);
+        assert_eq!(s.integer_pel, 1);
+        assert_eq!(s.frac_sixths, 1);
+        // 3 sixths = 0 whole + 3 sixths (a halfpel phase).
+        let h = split_mv_component(3);
+        assert_eq!(h.integer_pel, 0);
+        assert_eq!(h.frac_sixths, 3);
+        // 4 sixths = 0 whole + 4 sixths (a two-thirds phase).
+        let t = split_mv_component(4);
+        assert_eq!(t.integer_pel, 0);
+        assert_eq!(t.frac_sixths, 4);
+    }
+
+    #[test]
+    fn split_mv_component_negative_floors_toward_neg_inf() {
+        // -1 sixth = -1 whole pel + 5 sixths.
+        let s = split_mv_component(-1);
+        assert_eq!(s.integer_pel, -1);
+        assert_eq!(s.frac_sixths, 5);
+        // -6 sixths = -1 whole pel + 0.
+        let m = split_mv_component(-6);
+        assert_eq!(m.integer_pel, -1);
+        assert_eq!(m.frac_sixths, 0);
+        // -7 sixths = -2 whole pels + 5 sixths.
+        let n = split_mv_component(-7);
+        assert_eq!(n.integer_pel, -2);
+        assert_eq!(n.frac_sixths, 5);
+    }
+
+    #[test]
+    fn split_mv_component_reconstructs_position_for_every_input() {
+        // integer_pel * 6 + frac_sixths == stored_sixths for all inputs.
+        for v in -100i32..=100 {
+            let s = split_mv_component(v);
+            assert!(s.frac_sixths < MV_FRACTION_BASE as u32, "v={v}");
+            assert_eq!(
+                s.integer_pel * MV_FRACTION_BASE + s.frac_sixths as i32,
+                v,
+                "v={v}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_mv_component_is_const() {
+        const S: MvComponentSplit = split_mv_component(-7);
+        assert_eq!(S.integer_pel, -2);
+        assert_eq!(S.frac_sixths, 5);
     }
 }
