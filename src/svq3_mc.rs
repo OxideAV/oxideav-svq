@@ -490,6 +490,62 @@ pub fn interpolate_block_thirdpel_2d(
     out
 }
 
+/// A motion vector in stored-sixths units (the wiki's "fraction of six"
+/// grid), one component per axis.
+///
+/// `dx` / `dy` are signed sixths-of-a-sample displacements; the
+/// integer-pel part shifts the reference window origin and the
+/// remainder selects the sub-pel interpolation phase. See
+/// [`split_mv_component`] for the decomposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Svq3MotionVector {
+    /// Horizontal displacement in sixths-of-a-sample.
+    pub dx: i32,
+    /// Vertical displacement in sixths-of-a-sample.
+    pub dy: i32,
+}
+
+/// Predict a `block_w × block_h` block at pixel position
+/// `(block_x, block_y)` from `plane` using the stored motion vector
+/// `mv`, **for the integer-pel (zero-fraction) case only**.
+///
+/// The motion vector is decomposed per axis via [`split_mv_component`].
+/// When both components land exactly on the integer grid
+/// (`frac_sixths == 0`) the predictor is the clamped full-pel copy
+/// [`fetch_fullpel_block`] at origin
+/// `(block_x + dx_int, block_y + dy_int)`, and this returns
+/// `Some(block)`. When either component carries a sub-pel remainder the
+/// predictor needs the interpolation filters whose per-fractional-phase
+/// selection the wiki does not pin (a deferred DOCS-GAP), so this
+/// returns `None` rather than guessing the phase mapping — the caller
+/// must route the sub-pel case once that selection is staged.
+///
+/// This is the first end-to-end *motion vector → predicted block* path:
+/// it composes the sixths-grid split with the reference fetch into the
+/// full-pel inter predictor.
+#[must_use]
+pub fn predict_inter_block_fullpel(
+    plane: &ReferencePlane<'_>,
+    block_x: i32,
+    block_y: i32,
+    block_w: usize,
+    block_h: usize,
+    mv: Svq3MotionVector,
+) -> Option<Vec<u8>> {
+    let sx = split_mv_component(mv.dx);
+    let sy = split_mv_component(mv.dy);
+    if sx.frac_sixths != 0 || sy.frac_sixths != 0 {
+        return None;
+    }
+    Some(fetch_fullpel_block(
+        plane,
+        block_x + sx.integer_pel,
+        block_y + sy.integer_pel,
+        block_w,
+        block_h,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1116,5 +1172,68 @@ mod tests {
         assert_eq!(clip1_u8(128), 128);
         assert_eq!(clip1_u8(255), 255);
         assert_eq!(clip1_u8(300), 255);
+    }
+
+    // ------------------------------------------------------------------
+    // Full-pel inter block predictor (Milestone 4)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn predict_inter_fullpel_zero_mv_is_collocated_copy() {
+        let buf = ramp_plane(16, 16);
+        let plane = ReferencePlane::new(&buf, 16, 16).unwrap();
+        let block =
+            predict_inter_block_fullpel(&plane, 4, 4, 4, 4, Svq3MotionVector::default()).unwrap();
+        // Zero MV → copy the collocated block.
+        let want = fetch_fullpel_block(&plane, 4, 4, 4, 4);
+        assert_eq!(block, want);
+    }
+
+    #[test]
+    fn predict_inter_fullpel_integer_mv_shifts_origin() {
+        let buf = ramp_plane(16, 16);
+        let plane = ReferencePlane::new(&buf, 16, 16).unwrap();
+        // dx = 12 sixths = +2 full pels, dy = -6 sixths = -1 full pel.
+        let mv = Svq3MotionVector { dx: 12, dy: -6 };
+        let block = predict_inter_block_fullpel(&plane, 5, 5, 4, 4, mv).unwrap();
+        let want = fetch_fullpel_block(&plane, 5 + 2, 5 - 1, 4, 4);
+        assert_eq!(block, want);
+    }
+
+    #[test]
+    fn predict_inter_fullpel_returns_none_for_subpel_x() {
+        let buf = ramp_plane(16, 16);
+        let plane = ReferencePlane::new(&buf, 16, 16).unwrap();
+        // dx = 2 sixths is a thirdpel phase, not on the integer grid.
+        let mv = Svq3MotionVector { dx: 2, dy: 0 };
+        assert!(predict_inter_block_fullpel(&plane, 0, 0, 4, 4, mv).is_none());
+    }
+
+    #[test]
+    fn predict_inter_fullpel_returns_none_for_subpel_y() {
+        let buf = ramp_plane(16, 16);
+        let plane = ReferencePlane::new(&buf, 16, 16).unwrap();
+        let mv = Svq3MotionVector { dx: 0, dy: 3 };
+        assert!(predict_inter_block_fullpel(&plane, 0, 0, 4, 4, mv).is_none());
+    }
+
+    #[test]
+    fn predict_inter_fullpel_clamps_out_of_frame_mv() {
+        let buf = ramp_plane(8, 8);
+        let plane = ReferencePlane::new(&buf, 8, 8).unwrap();
+        // A large negative MV pushes the window above-left of the plane;
+        // the predictor edge-replicates rather than failing.
+        let mv = Svq3MotionVector { dx: -600, dy: -600 };
+        let block = predict_inter_block_fullpel(&plane, 0, 0, 4, 4, mv).unwrap();
+        assert!(block.iter().all(|&s| s == plane.sample_clamped(0, 0)));
+    }
+
+    #[test]
+    fn predict_inter_fullpel_negative_subpel_remainder_is_none() {
+        let buf = ramp_plane(8, 8);
+        let plane = ReferencePlane::new(&buf, 8, 8).unwrap();
+        // dx = -1 sixth → integer_pel -1 + frac 5 (non-zero) → None.
+        let mv = Svq3MotionVector { dx: -1, dy: 0 };
+        assert!(predict_inter_block_fullpel(&plane, 2, 2, 4, 4, mv).is_none());
     }
 }

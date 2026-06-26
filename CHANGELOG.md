@@ -8,6 +8,19 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 374 — SVQ3 full-pel inter block predictor (`svq3_mc`).** The
+  first end-to-end *motion vector → predicted block* path: ties the
+  sixths-grid split into the reference fetch. New `Svq3MotionVector { dx,
+  dy }` (stored-sixths components) and `predict_inter_block_fullpel`,
+  which decomposes each component via `split_mv_component` and, when
+  both land on the integer grid (`frac_sixths == 0`), returns the
+  clamped `fetch_fullpel_block` copy at the MV-shifted origin. When
+  either component carries a sub-pel remainder it returns `None` rather
+  than guessing the per-fractional-phase filter selection the wiki does
+  not pin (deferred DOCS-GAP). 6 new lib tests: zero-MV collocated copy,
+  integer-MV origin shift, sub-pel-x / sub-pel-y / negative-remainder
+  `None` cases, and out-of-frame edge-replication.
+
 - **Round 374 — SVQ3 whole-block thirdpel interpolation (`svq3_mc`).**
   Composes the pinned per-sample thirdpel formulas across a whole
   motion-compensation block. `interpolate_block_thirdpel_h` /
