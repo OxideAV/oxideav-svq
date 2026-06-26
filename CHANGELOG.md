@@ -8,6 +8,30 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 374 — SVQ1 half-pel motion-compensation reference sampling
+  (`svq1_mc`).** New `svq1_mc` module implementing
+  `docs/video/svq1/spec/06-motion-vectors.md` §6.5 (the half-pel
+  sampling grid + `(a + b + 1) >> 1` interpolator) and §6.7 (de-facto
+  edge-replication border extension). `Svq1ReferencePlane<'a>` is a
+  borrowed row-major plane view with `sample_clamped` (§6.7.2 clamp).
+  `sample_halfpel(plane, half_x, half_y)` splits each signed half-pel
+  coordinate into an integer-pel floor + parity bit and selects the
+  §6.5.1 case: integer-pel direct (both even), horizontal two-tap
+  (x odd), vertical two-tap (y odd), or bilinear four-tap (both odd),
+  each with the round-toward-+∞ bias (`+1` / `+2`).
+  `motion_compensate_block(plane, base_col, base_row, mv)` reconstructs
+  the 8×8 (`MC_BLOCK_DIM`) reference patch of §6.5.2: top-left half-pel
+  address `(base_col*2 + mv.x, base_row*2 + mv.y)`, each output step
+  advancing the half-pel address by 2 (one integer pel), row-major
+  output. Reuses the existing `Svq1Mv`. The §6.5.1/§6.7.2 conventions
+  are the spec's documented de-facto baseline (binary confirmation
+  deferred to a Validator round); the T02 differential MV decode that
+  produces the vector remains the separately-deferred §6.2.3 Reading
+  A/B gap. 14 new lib tests: plane validation / clamping, the four
+  parity cases against their closed forms, negative-coordinate phase
+  flooring, uniform-plane flatness, and block MC for zero / integer /
+  uniform / out-of-frame / per-step-addressing cases.
+
 - **Round 374 — SVQ3 full-pel inter block predictor (`svq3_mc`).** The
   first end-to-end *motion vector → predicted block* path: ties the
   sixths-grid split into the reference fetch. New `Svq3MotionVector { dx,
