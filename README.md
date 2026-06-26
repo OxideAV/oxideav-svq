@@ -66,11 +66,24 @@ of each `(level, half)` page the reconstructor reads), plus the
 stage-count / mean / index VLC wire-up, and the MV-component VLC
 (T02) whose Reading A/B disambiguation (spec/06 §6.2.3) awaits a
 Validator round. The inter MV path now has its predictor (§6.4),
-final-vector clip (§6.6), per-plane cache (§6.8) and INTER /
-INTER_4MV neighbour-selection geometry (§6.4.3 / §6.4.4) wired; only
-the T02 differential wire decode and the half-pel reference sampling
-(§6.5, de-facto only) remain. Until the deferred field decodes land,
-full plane reconstruction is blocked on bitstream-driven field decode.
+final-vector clip (§6.6), per-plane cache (§6.8), INTER /
+INTER_4MV neighbour-selection geometry (§6.4.3 / §6.4.4), and the
+**half-pel reference sampling** (`svq1_mc`, §6.5 / §6.7) wired; only
+the T02 differential wire decode remains on the MV path. Until the
+deferred field decodes land, full plane reconstruction is blocked on
+bitstream-driven field decode.
+
+* The **half-pel motion-compensation reference sampler** (`svq1_mc`):
+  `Svq1ReferencePlane` (row-major plane view with §6.7.2 edge-
+  replication clamping), `sample_halfpel` (the §6.5.1 parity-driven
+  interpolator: integer-pel direct / horizontal two-tap / vertical
+  two-tap / bilinear four-tap, each with the round-toward-+∞ bias),
+  `motion_compensate_block` (the §6.5.2 8×8 reference patch), and
+  `reconstruct_inter_l3_block` (the first end-to-end *reference plane +
+  MV → reconstructed inter sub-block*, composing the MC patch as the
+  §4.6.2 inter predictor of `reconstruct_leaf`). The §6.5.1 / §6.7.2
+  conventions are the spec's documented de-facto baseline (binary
+  confirmation deferred to a Validator round).
 
 ### SVQ3
 
@@ -91,6 +104,17 @@ full plane reconstruction is blocked on bitstream-driven field decode.
   the per-quantiser scale table, the dequant expressions), the
   two-sided `M·X·Mᵀ` transform composition, thirdpel motion-compensation
   interpolation, and the full set of intra predictors.
+* **Motion-compensation reference path (`svq3_mc`).** `ReferencePlane`
+  (row-major picture-plane view with H.264 edge-replication clamping for
+  unrestricted motion vectors) + `fetch_fullpel_block` (clamped
+  integer-pel block copy); `split_mv_component` decomposing a stored
+  sixths-grid MV component into integer-pel + sub-pel remainder
+  (wiki §"Motion Compensation" "fraction of six"); the whole-block
+  thirdpel interpolators (`interpolate_block_thirdpel_h` / `_v` / `_2d`
+  composing the pinned 1-D / 2-D per-sample formulas across a block with
+  `Clip1` saturation); and `predict_inter_block_fullpel`, the first
+  end-to-end *MV → predicted block* path (full-pel case; sub-pel-phase
+  filter selection is a deferred docs gap).
 * **Intra predictors + mode binding (spec/01 Gap 3/4).** The five 4×4
   intra modes are pinned: `Svq3IntraMode` (`0=Vertical / 1=Horizontal
   / 2=DC / 3=DiagonalDownLeft / 4=DiagonalDownRight`, default DC per
