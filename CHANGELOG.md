@@ -8,6 +8,26 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 374 — SVQ3 whole-block thirdpel interpolation (`svq3_mc`).**
+  Composes the pinned per-sample thirdpel formulas across a whole
+  motion-compensation block. `interpolate_block_thirdpel_h` /
+  `interpolate_block_thirdpel_v` apply the wiki's 1-D
+  `((2·A + B + 1)·0x2AB) >> 11` with the farther sample one full pel to
+  the right / below each position; `interpolate_block_thirdpel_2d`
+  applies the 2-D `((4·A + 3·B + 3·C + 2·D + 6)·0xAAB) >> 15` over the
+  2×2 integer-pel neighbourhood in `THIRDPEL_2D_WEIGHTS` order. All
+  three fetch neighbours through `ReferencePlane::sample_clamped`
+  (H.264 edge replication) and `Clip1`-saturate to `0..=255`
+  (`docs/video/svq3/spec/01-reconstruction-composition.md` Gap 5), with
+  row-major output matching the reconstruction loops. The caller
+  positions the origin so `A` is the nearer integer sample (via
+  `split_mv_component`); the wiki does not pin the per-fractional-phase
+  filter selection, so these cover the forward-neighbour 1-D/2-D cases
+  the formulas spell out. 9 new lib tests: uniform-plane identity for
+  all three filters, per-sample-formula agreement (H / V / 2-D), byte-
+  range output, the right-border edge-clamp reducing the 1-D filter to
+  `interp(A, A)`, and `Clip1` saturation.
+
 - **Round 374 — SVQ3 motion-vector sixths-grid decomposition
   (`svq3_mc`).** Splits a stored motion-vector component into the
   integer-pel displacement (the `fetch_fullpel_block` window origin

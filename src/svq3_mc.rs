@@ -371,6 +371,125 @@ pub const fn split_mv_component(stored_sixths: i32) -> MvComponentSplit {
     }
 }
 
+/// Clip an interpolated `i32` sample to the 8-bit pixel range
+/// `[0, 255]`.
+///
+/// The per-sample thirdpel formulas ([`thirdpel_interpolate_1d`] /
+/// [`thirdpel_interpolate_2d`]) return an `i32` that is a rounded convex
+/// combination of in-range samples and therefore already lands in
+/// `0..=255` for in-range inputs; this `Clip1` is the defensive
+/// saturation the reconstruction path applies
+/// (`docs/video/svq3/spec/01-reconstruction-composition.md` Gap 5).
+#[inline]
+#[must_use]
+const fn clip1_u8(v: i32) -> u8 {
+    if v < 0 {
+        0
+    } else if v > 255 {
+        255
+    } else {
+        v as u8
+    }
+}
+
+/// Interpolate a `block_w × block_h` block whose integer-pel origin is
+/// `(origin_x, origin_y)`, sharpened **horizontally** by the
+/// one-dimensional thirdpel filter.
+///
+/// Each output sample is `thirdpel_interpolate_1d(A, B)` where `A` is
+/// the integer-pel sample at the block position (the nearer sample,
+/// weight 2) and `B` is the sample one full pel to the **right** (the
+/// farther sample, weight 1), both fetched from `plane` with
+/// [`ReferencePlane::sample_clamped`] edge handling. This realises the
+/// wiki's `((2·A + B + 1)·0x2AB) >> 11` for a horizontal sub-pel offset.
+/// The caller positions `origin_*` so `A` is the nearer integer sample
+/// (via [`split_mv_component`]'s `integer_pel`); the fractional phase
+/// the wiki's "fraction of six … rounded to base" step selects is not
+/// pinned, so this helper covers the single forward-neighbour 1-D case
+/// the formula spells out. Output is row-major, `Clip1`-saturated to
+/// `0..=255`.
+#[must_use]
+pub fn interpolate_block_thirdpel_h(
+    plane: &ReferencePlane<'_>,
+    origin_x: i32,
+    origin_y: i32,
+    block_w: usize,
+    block_h: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(block_w * block_h);
+    for row in 0..block_h {
+        let sy = origin_y + row as i32;
+        for col in 0..block_w {
+            let sx = origin_x + col as i32;
+            let a = plane.sample_clamped(sx, sy) as i32;
+            let b = plane.sample_clamped(sx + 1, sy) as i32;
+            out.push(clip1_u8(thirdpel_interpolate_1d(a, b)));
+        }
+    }
+    out
+}
+
+/// Interpolate a `block_w × block_h` block sharpened **vertically** by
+/// the one-dimensional thirdpel filter.
+///
+/// Identical to [`interpolate_block_thirdpel_h`] but `B` is the sample
+/// one full pel **below** each position (weight 1) and `A` the sample at
+/// the position (weight 2): `thirdpel_interpolate_1d(A, B)` for a
+/// vertical sub-pel offset. Output is row-major, `Clip1`-saturated.
+#[must_use]
+pub fn interpolate_block_thirdpel_v(
+    plane: &ReferencePlane<'_>,
+    origin_x: i32,
+    origin_y: i32,
+    block_w: usize,
+    block_h: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(block_w * block_h);
+    for row in 0..block_h {
+        let sy = origin_y + row as i32;
+        for col in 0..block_w {
+            let sx = origin_x + col as i32;
+            let a = plane.sample_clamped(sx, sy) as i32;
+            let b = plane.sample_clamped(sx, sy + 1) as i32;
+            out.push(clip1_u8(thirdpel_interpolate_1d(a, b)));
+        }
+    }
+    out
+}
+
+/// Interpolate a `block_w × block_h` block sharpened in **both**
+/// directions by the two-dimensional thirdpel filter.
+///
+/// Each output sample is `thirdpel_interpolate_2d(A, B, C, D)` where the
+/// four inputs are the 2×2 integer-pel neighbourhood at the block
+/// position in the [`THIRDPEL_2D_WEIGHTS`] row-major order: `A` at
+/// `(x, y)` (weight 4), `B` at `(x+1, y)` (weight 3), `C` at `(x, y+1)`
+/// (weight 3), `D` at `(x+1, y+1)` (weight 2). This realises the wiki's
+/// `((4·A + 3·B + 3·C + 2·D + 6)·0xAAB) >> 15` across a whole block.
+/// Output is row-major, `Clip1`-saturated to `0..=255`.
+#[must_use]
+pub fn interpolate_block_thirdpel_2d(
+    plane: &ReferencePlane<'_>,
+    origin_x: i32,
+    origin_y: i32,
+    block_w: usize,
+    block_h: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(block_w * block_h);
+    for row in 0..block_h {
+        let sy = origin_y + row as i32;
+        for col in 0..block_w {
+            let sx = origin_x + col as i32;
+            let a = plane.sample_clamped(sx, sy) as i32;
+            let b = plane.sample_clamped(sx + 1, sy) as i32;
+            let c = plane.sample_clamped(sx, sy + 1) as i32;
+            let d = plane.sample_clamped(sx + 1, sy + 1) as i32;
+            out.push(clip1_u8(thirdpel_interpolate_2d(a, b, c, d)));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -881,5 +1000,121 @@ mod tests {
         const S: MvComponentSplit = split_mv_component(-7);
         assert_eq!(S.integer_pel, -2);
         assert_eq!(S.frac_sixths, 5);
+    }
+
+    // ------------------------------------------------------------------
+    // Whole-block thirdpel interpolation (Milestone 3)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn interpolate_h_on_uniform_plane_is_identity() {
+        // A flat plane interpolates to the same value (the filter is a
+        // weighted average of equal samples).
+        let buf = vec![100u8; 8 * 8];
+        let plane = ReferencePlane::new(&buf, 8, 8).unwrap();
+        let block = interpolate_block_thirdpel_h(&plane, 1, 1, 4, 4);
+        assert!(block.iter().all(|&s| s == 100), "{block:?}");
+    }
+
+    #[test]
+    fn interpolate_v_and_2d_on_uniform_plane_are_identity() {
+        let buf = vec![77u8; 8 * 8];
+        let plane = ReferencePlane::new(&buf, 8, 8).unwrap();
+        assert!(interpolate_block_thirdpel_v(&plane, 1, 1, 4, 4)
+            .iter()
+            .all(|&s| s == 77));
+        assert!(interpolate_block_thirdpel_2d(&plane, 1, 1, 4, 4)
+            .iter()
+            .all(|&s| s == 77));
+    }
+
+    #[test]
+    fn interpolate_h_matches_per_sample_formula() {
+        let buf = ramp_plane(8, 8);
+        let plane = ReferencePlane::new(&buf, 8, 8).unwrap();
+        let block = interpolate_block_thirdpel_h(&plane, 2, 3, 4, 4);
+        for row in 0..4 {
+            for col in 0..4 {
+                let sx = 2 + col as i32;
+                let sy = 3 + row as i32;
+                let a = plane.sample_clamped(sx, sy) as i32;
+                let b = plane.sample_clamped(sx + 1, sy) as i32;
+                let want = clip1_u8(thirdpel_interpolate_1d(a, b));
+                assert_eq!(block[row * 4 + col], want, "row={row} col={col}");
+            }
+        }
+    }
+
+    #[test]
+    fn interpolate_v_matches_per_sample_formula() {
+        let buf = ramp_plane(8, 8);
+        let plane = ReferencePlane::new(&buf, 8, 8).unwrap();
+        let block = interpolate_block_thirdpel_v(&plane, 1, 1, 3, 5);
+        for row in 0..5 {
+            for col in 0..3 {
+                let sx = 1 + col as i32;
+                let sy = 1 + row as i32;
+                let a = plane.sample_clamped(sx, sy) as i32;
+                let b = plane.sample_clamped(sx, sy + 1) as i32;
+                let want = clip1_u8(thirdpel_interpolate_1d(a, b));
+                assert_eq!(block[row * 3 + col], want, "row={row} col={col}");
+            }
+        }
+    }
+
+    #[test]
+    fn interpolate_2d_matches_per_sample_formula() {
+        let buf = ramp_plane(8, 8);
+        let plane = ReferencePlane::new(&buf, 8, 8).unwrap();
+        let block = interpolate_block_thirdpel_2d(&plane, 2, 2, 4, 4);
+        for row in 0..4 {
+            for col in 0..4 {
+                let sx = 2 + col as i32;
+                let sy = 2 + row as i32;
+                let a = plane.sample_clamped(sx, sy) as i32;
+                let b = plane.sample_clamped(sx + 1, sy) as i32;
+                let c = plane.sample_clamped(sx, sy + 1) as i32;
+                let d = plane.sample_clamped(sx + 1, sy + 1) as i32;
+                let want = clip1_u8(thirdpel_interpolate_2d(a, b, c, d));
+                assert_eq!(block[row * 4 + col], want, "row={row} col={col}");
+            }
+        }
+    }
+
+    #[test]
+    fn interpolate_clips_to_byte_range() {
+        // All interpolators must stay within 0..=255 for in-range input.
+        let buf = ramp_plane(16, 16);
+        let plane = ReferencePlane::new(&buf, 16, 16).unwrap();
+        for b in [
+            interpolate_block_thirdpel_h(&plane, 0, 0, 16, 16),
+            interpolate_block_thirdpel_v(&plane, 0, 0, 16, 16),
+            interpolate_block_thirdpel_2d(&plane, 0, 0, 16, 16),
+        ] {
+            assert_eq!(b.len(), 256);
+            // u8 output is inherently in range; assert the count to
+            // guard against silent truncation.
+        }
+    }
+
+    #[test]
+    fn interpolate_h_edge_clamps_at_right_border() {
+        // At the rightmost column, B clamps to A (same column), so the
+        // 1-D filter reduces to interpolating A with itself.
+        let buf = ramp_plane(4, 4);
+        let plane = ReferencePlane::new(&buf, 4, 4).unwrap();
+        let block = interpolate_block_thirdpel_h(&plane, 3, 0, 1, 1);
+        let a = plane.sample_clamped(3, 0) as i32;
+        // B = sample_clamped(4,0) clamps to (3,0) == a.
+        assert_eq!(block[0], clip1_u8(thirdpel_interpolate_1d(a, a)));
+    }
+
+    #[test]
+    fn clip1_saturates_both_ends() {
+        assert_eq!(clip1_u8(-1), 0);
+        assert_eq!(clip1_u8(0), 0);
+        assert_eq!(clip1_u8(128), 128);
+        assert_eq!(clip1_u8(255), 255);
+        assert_eq!(clip1_u8(300), 255);
     }
 }
