@@ -38,7 +38,10 @@
 //! picture.
 
 use crate::svq3::Svq3MacroblockPosition;
-use crate::svq3_recon::{ChromaPlane, LumaMacroblock, CHROMA_PLANE_DIM, MB_LUMA_DIM};
+use crate::svq3_recon::{
+    reconstruct_intra_macroblock, ChromaPlane, ChromaPlaneCoeffs, LumaMacroblock,
+    Svq3IntraMacroblock, Svq3LumaIntra, CHROMA_PLANE_DIM, MB_LUMA_DIM,
+};
 
 /// A full decoded SVQ3 picture: three row-major sample planes (luma + two
 /// chroma) sized to the macroblock grid.
@@ -369,6 +372,59 @@ impl Svq3Picture {
                 .copy_from_slice(&plane.samples[src_base..src_base + CHROMA_PLANE_DIM]);
         }
     }
+
+    /// Reconstruct one whole intra macroblock **directly into the picture
+    /// canvas** at raster position `pos`, end-to-end:
+    ///
+    /// 1. **Bind** the macroblock's three planes' out-of-MB neighbour
+    ///    context from the already-reconstructed canvas pixels
+    ///    ([`Self::bind_luma_neighbours`] for luma,
+    ///    [`Self::bind_chroma_neighbours`] for Cb and Cr).
+    /// 2. **Reconstruct** all three planes from the supplied per-plane
+    ///    intra modes + placed coefficient grids via
+    ///    [`crate::svq3_recon::reconstruct_intra_macroblock`] (the spec/01
+    ///    Gap 2-5 residual interleave + predictor + writeback).
+    /// 3. **Blit** the three reconstructed planes back into the canvas
+    ///    ([`Self::blit_luma`] / [`Self::blit_chroma`]) so later
+    ///    macroblocks read them as neighbours.
+    ///
+    /// This is the per-macroblock step a slice-level frame walk emits: the
+    /// caller supplies the resolved `luma` regime + chroma coefficient
+    /// inputs (still gated on the CBP / MB-type wire decode docs gap) and
+    /// the slice quantiser `q`, and the picture canvas accumulates the
+    /// reconstructed macroblock. Driving this in macroblock raster order
+    /// (`0..mb_cols·mb_rows`, mapped through
+    /// [`crate::svq3::macroblock_position`]) reconstructs an intra picture
+    /// region with correct cross-macroblock intra prediction — the above
+    /// row and left column of every macroblock are reconstructed before
+    /// the macroblock is reached.
+    ///
+    /// On return the canvas holds the reconstructed pixels of the
+    /// macroblock at `pos` across all three planes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `pos` lies outside this picture's macroblock grid or if
+    /// `q >= crate::svq3_dequant::DEQUANT_COEFF_TABLE_LEN`.
+    pub fn reconstruct_intra_macroblock_into(
+        &mut self,
+        pos: Svq3MacroblockPosition,
+        luma: &Svq3LumaIntra,
+        cb: &ChromaPlaneCoeffs,
+        cr: &ChromaPlaneCoeffs,
+        q: u32,
+    ) {
+        let mut mb = Svq3IntraMacroblock::new();
+        self.bind_luma_neighbours(pos, &mut mb.luma);
+        self.bind_chroma_neighbours(pos, ChromaSelect::Cb, &mut mb.cb);
+        self.bind_chroma_neighbours(pos, ChromaSelect::Cr, &mut mb.cr);
+
+        reconstruct_intra_macroblock(&mut mb, luma, cb, cr, q);
+
+        self.blit_luma(pos, &mb.luma);
+        self.blit_chroma(pos, ChromaSelect::Cb, &mb.cb);
+        self.blit_chroma(pos, ChromaSelect::Cr, &mb.cr);
+    }
 }
 
 /// Selects which chroma plane (Cb or Cr) a [`Svq3Picture`] neighbour-bind
@@ -385,6 +441,27 @@ pub enum ChromaSelect {
 mod tests {
     use super::*;
     use crate::svq3::macroblock_position;
+    use crate::svq3_pred::Svq3IntraMode;
+
+    /// A 4×4-intra luma regime with every sub-block set to `mode` and all
+    /// coefficient grids zero (zero residual).
+    fn zero_residual_luma(mode: Svq3IntraMode) -> Svq3LumaIntra {
+        Svq3LumaIntra::Blocks4x4 {
+            modes: [mode; crate::svq3_recon::MB_LUMA_BLOCKS],
+            coeff_blocks: [[0i32; crate::svq3_pred::PRED_4X4_SAMPLES];
+                crate::svq3_recon::MB_LUMA_BLOCKS],
+        }
+    }
+
+    /// Chroma coefficients that are all zero (DC-only prediction, no
+    /// residual).
+    fn zero_chroma() -> ChromaPlaneCoeffs {
+        ChromaPlaneCoeffs {
+            dc_block: [0i32; crate::svq3_recon::CHROMA_PLANE_BLOCKS],
+            ac_blocks: [[0i32; crate::svq3_pred::PRED_4X4_SAMPLES];
+                crate::svq3_recon::CHROMA_PLANE_BLOCKS],
+        }
+    }
 
     #[test]
     fn dimensions_follow_mb_grid() {
@@ -546,5 +623,83 @@ mod tests {
         pic.bind_chroma_neighbours(pos1, ChromaSelect::Cr, &mut right_cr);
         assert!(right_cr.left_available);
         assert!(right_cr.leftcol.iter().all(|&p| p == 0));
+    }
+
+    #[test]
+    fn into_driver_reconstructs_single_dc_macroblock() {
+        // A lone top-left 4×4-intra MB with no neighbours and zero
+        // residual: every 4×4 DC predictor sees no top/left, so it falls
+        // back to 128; chroma DC also falls back to 128. The whole picture
+        // becomes a flat 128.
+        let mut pic = Svq3Picture::new(1, 1);
+        let pos = macroblock_position(0, 1).unwrap();
+        pic.reconstruct_intra_macroblock_into(
+            pos,
+            &zero_residual_luma(Svq3IntraMode::Dc),
+            &zero_chroma(),
+            &zero_chroma(),
+            10,
+        );
+        assert!(pic.luma().iter().all(|&p| p == 128), "luma flat 128");
+        assert!(pic.cb().iter().all(|&p| p == 128), "cb flat 128");
+        assert!(pic.cr().iter().all(|&p| p == 128), "cr flat 128");
+    }
+
+    #[test]
+    fn into_driver_propagates_left_column_across_mb_boundary() {
+        // Two horizontally-adjacent 4×4-intra MBs, both Horizontal mode
+        // with zero residual.
+        //
+        // MB0 (top-left) has no left neighbour → each sub-block's DC
+        // fallback would normally fire, but Horizontal needs `left`. The
+        // dispatcher routes an unavailable-left Horizontal block to the DC
+        // fallback (128). So MB0 reconstructs flat 128, and its right
+        // column (picture col 15) is all 128.
+        //
+        // MB1 reads MB0's right column as its left neighbour. Horizontal
+        // mode with zero residual fills every sub-block from `left`, so
+        // MB1 also reconstructs flat 128 — verifying the bind→recon→blit
+        // chain carries the left-column pixels across the MB boundary.
+        let mut pic = Svq3Picture::new(2, 1);
+        let luma = zero_residual_luma(Svq3IntraMode::Horizontal);
+        for idx in 0..2u32 {
+            let pos = macroblock_position(idx, 2).unwrap();
+            pic.reconstruct_intra_macroblock_into(pos, &luma, &zero_chroma(), &zero_chroma(), 10);
+        }
+        // Both MBs reconstruct flat 128 (DC fallback at MB0's left edge
+        // propagated rightward by Horizontal prediction).
+        assert!(pic.luma().iter().all(|&p| p == 128));
+
+        // Now drive MB0 with a vertical luma gradient written directly,
+        // then reconstruct MB1 in Horizontal mode and verify each MB1 row
+        // copies MB0's column-15 value at that row.
+        let mut pic2 = Svq3Picture::new(2, 1);
+        let mut left_mb = LumaMacroblock::new();
+        for y in 0..MB_LUMA_DIM {
+            for x in 0..MB_LUMA_DIM {
+                left_mb.samples[y * MB_LUMA_DIM + x] = (30 + y) as u8;
+            }
+        }
+        pic2.blit_luma(macroblock_position(0, 2).unwrap(), &left_mb);
+
+        let pos1 = macroblock_position(1, 2).unwrap();
+        pic2.reconstruct_intra_macroblock_into(
+            pos1,
+            &zero_residual_luma(Svq3IntraMode::Horizontal),
+            &zero_chroma(),
+            &zero_chroma(),
+            10,
+        );
+        // MB1 occupies picture columns 16..32. Each row y should be flat
+        // equal to MB0's column-15 value at that picture row = 30 + y.
+        for y in 0..MB_LUMA_DIM {
+            for x in 16..32 {
+                assert_eq!(
+                    pic2.luma_sample(x, y),
+                    (30 + y) as u8,
+                    "MB1 pixel ({x},{y}) should copy left column"
+                );
+            }
+        }
     }
 }
