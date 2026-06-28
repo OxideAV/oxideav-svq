@@ -425,6 +425,63 @@ impl Svq3Picture {
         self.blit_chroma(pos, ChromaSelect::Cb, &mb.cb);
         self.blit_chroma(pos, ChromaSelect::Cr, &mb.cr);
     }
+
+    /// Reconstruct a **whole intra picture** by walking every macroblock in
+    /// raster order and driving [`Self::reconstruct_intra_macroblock_into`]
+    /// at each position.
+    ///
+    /// `macroblocks` supplies one [`Svq3IntraMacroblockInput`] per
+    /// macroblock in raster order (`mb_index = mb_y·mb_cols + mb_x`,
+    /// `0..mb_cols·mb_rows`), and `q` is the slice quantiser shared by the
+    /// whole picture. This is the **intra frame-walk skeleton**: the
+    /// per-MB inputs (luma regime + chroma coefficient grids) are exactly
+    /// what the still-gated CBP / MB-type / intra-mode wire decode would
+    /// produce, supplied here directly so the geometry + reconstruction
+    /// composition can be exercised across a whole picture. Cross-MB intra
+    /// prediction is correct because the raster walk reconstructs every
+    /// macroblock's above row + left column before that macroblock is
+    /// reached.
+    ///
+    /// On return the canvas holds the fully reconstructed intra picture.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `macroblocks.len() != mb_cols · mb_rows` or if
+    /// `q >= crate::svq3_dequant::DEQUANT_COEFF_TABLE_LEN`.
+    pub fn reconstruct_intra_frame(&mut self, macroblocks: &[Svq3IntraMacroblockInput], q: u32) {
+        let total = self.mb_cols * self.mb_rows;
+        assert_eq!(
+            macroblocks.len(),
+            total,
+            "expected one input per macroblock ({total}), got {}",
+            macroblocks.len()
+        );
+        let mb_cols = self.mb_cols as u32;
+        for (mb_index, input) in macroblocks.iter().enumerate() {
+            // mb_cols > 0 is guaranteed by Self::new, so this never errs.
+            let pos = crate::svq3::macroblock_position(mb_index as u32, mb_cols)
+                .expect("mb_cols is non-zero");
+            self.reconstruct_intra_macroblock_into(pos, &input.luma, &input.cb, &input.cr, q);
+        }
+    }
+}
+
+/// The per-macroblock decode inputs a [`Svq3Picture::reconstruct_intra_frame`]
+/// walk consumes for one intra macroblock: the luma intra regime + the two
+/// chroma planes' placed coefficient grids.
+///
+/// These are exactly the values the (still-gated) CBP / MB-type /
+/// intra-mode wire decode resolves per macroblock; bundling them lets a
+/// frame walk carry one `Vec<Svq3IntraMacroblockInput>` in raster order.
+#[derive(Debug, Clone)]
+pub struct Svq3IntraMacroblockInput {
+    /// The luma intra regime (4×4-intra modes + coeffs, or 16×16-intra
+    /// mode + coeffs).
+    pub luma: Svq3LumaIntra,
+    /// The Cb chroma plane's placed coefficient grids.
+    pub cb: ChromaPlaneCoeffs,
+    /// The Cr chroma plane's placed coefficient grids.
+    pub cr: ChromaPlaneCoeffs,
 }
 
 /// Selects which chroma plane (Cb or Cr) a [`Svq3Picture`] neighbour-bind
@@ -701,5 +758,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn intra_frame_walk_all_dc_yields_flat_picture() {
+        // A 2×2 all-DC zero-residual intra picture. The top-left MB has no
+        // neighbours (DC → 128) and every subsequent MB's DC predictor
+        // averages all-128 neighbours back to 128, so the whole picture is
+        // flat 128.
+        let mut pic = Svq3Picture::new(2, 2);
+        let input = Svq3IntraMacroblockInput {
+            luma: zero_residual_luma(Svq3IntraMode::Dc),
+            cb: zero_chroma(),
+            cr: zero_chroma(),
+        };
+        let mbs = vec![input; 4];
+        pic.reconstruct_intra_frame(&mbs, 10);
+        assert!(pic.luma().iter().all(|&p| p == 128));
+        assert!(pic.cb().iter().all(|&p| p == 128));
+        assert!(pic.cr().iter().all(|&p| p == 128));
+    }
+
+    #[test]
+    fn intra_frame_walk_matches_manual_per_mb_driving() {
+        // The frame walk must produce byte-identical output to manually
+        // driving reconstruct_intra_macroblock_into in raster order.
+        let mb_cols = 3;
+        let mb_rows = 2;
+        let total = mb_cols * mb_rows;
+
+        // Give each MB a distinct luma regime so cross-MB prediction has
+        // observable structure: alternate Vertical / Horizontal / DC.
+        let modes = [
+            Svq3IntraMode::Vertical,
+            Svq3IntraMode::Horizontal,
+            Svq3IntraMode::Dc,
+        ];
+        let inputs: Vec<Svq3IntraMacroblockInput> = (0..total)
+            .map(|i| Svq3IntraMacroblockInput {
+                luma: zero_residual_luma(modes[i % 3]),
+                cb: zero_chroma(),
+                cr: zero_chroma(),
+            })
+            .collect();
+
+        let mut frame_pic = Svq3Picture::new(mb_cols, mb_rows);
+        frame_pic.reconstruct_intra_frame(&inputs, 12);
+
+        let mut manual_pic = Svq3Picture::new(mb_cols, mb_rows);
+        for (i, input) in inputs.iter().enumerate() {
+            let pos = macroblock_position(i as u32, mb_cols as u32).unwrap();
+            manual_pic.reconstruct_intra_macroblock_into(
+                pos,
+                &input.luma,
+                &input.cb,
+                &input.cr,
+                12,
+            );
+        }
+
+        assert_eq!(frame_pic.luma(), manual_pic.luma());
+        assert_eq!(frame_pic.cb(), manual_pic.cb());
+        assert_eq!(frame_pic.cr(), manual_pic.cr());
+    }
+
+    #[test]
+    #[should_panic(expected = "expected one input per macroblock")]
+    fn intra_frame_walk_rejects_wrong_input_count() {
+        let mut pic = Svq3Picture::new(2, 2);
+        let input = Svq3IntraMacroblockInput {
+            luma: zero_residual_luma(Svq3IntraMode::Dc),
+            cb: zero_chroma(),
+            cr: zero_chroma(),
+        };
+        // 3 inputs for a 4-MB picture.
+        pic.reconstruct_intra_frame(&[input.clone(), input.clone(), input], 10);
     }
 }
