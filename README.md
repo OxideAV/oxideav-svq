@@ -8,16 +8,27 @@ Implemented from the clean-room specifications staged under
 
 ## Status
 
-**Decode pipelines wired up to the per-macroblock unit; the
-frame-level entry point is not yet exposed.** Both decoders parse their
-bitstreams into typed structures and stage the required tables. For
-SVQ3, a single 4×4-intra macroblock now reconstructs **end-to-end from
-slice bits to a 16×16 luma plane** (intra-mode VLC → predictor →
-residual → writeback). `receive_frame` still returns
-`oxideav_core::Error::Unsupported`: the slice-level frame walk that
-drives the per-macroblock units across a whole picture is gated on the
-one remaining CBP `me(v)` docs trace (see the SVQ3 gap note below).
-What is implemented:
+**Decode pipelines wired up through the whole-picture intra
+frame-walk; the only thing gating `receive_frame` is the CBP `me(v)`
+wire decode.** Both decoders parse their bitstreams into typed
+structures and stage the required tables. For SVQ3, a single 4×4-intra
+macroblock reconstructs **end-to-end from slice bits to a 16×16 luma
+plane** (intra-mode VLC → predictor → residual → writeback), and the
+**picture-plane assembly** (`svq3_picture`) now stitches per-macroblock
+reconstruction units into a full Y/Cb/Cr picture: an `Svq3Picture`
+canvas sized to the macroblock grid, MB-raster neighbour binding +
+blit-back, the picture-aware per-MB driver
+(`reconstruct_intra_macroblock_into`), the whole-picture intra
+frame-walk skeleton (`reconstruct_intra_frame`), the
+`oxideav_core::VideoFrame` (Yuv420P) bridge (`to_video_frame`), and the
+inter-MC reference-plane views (`luma_reference` / `chroma_reference`).
+`receive_frame` still returns `oxideav_core::Error::Unsupported`: only
+the per-MB *wire decode* that produces each macroblock's coefficient
+grids / modes — the CBP `me(v)` mapped-Exp-Golomb table the wiki defers
+wholesale to H.264 — is still gated on a docs trace (see the SVQ3 gap
+note below). The geometry, reconstruction composition, frame walk, and
+frame-output bridge above the wire decode are all in place. What is
+implemented:
 
 ### SVQ1
 
@@ -206,6 +217,33 @@ bitstream-driven field decode.
   `Svq3MacroblockPosition` / `macroblock_position` give the raster
   column/row + intra above/left neighbour availability the frame walk
   threads into the per-MB intra decode.
+* **Picture-plane assembly + intra frame-walk (`svq3_picture`).** The
+  full-frame canvas the per-macroblock reconstruction units write into.
+  `Svq3Picture` holds three row-major sample planes (luma 16×16/MB,
+  chroma 8×8/MB — the wiki §"Macroblock layer" 4:2:0 relationship) sized
+  to the macroblock grid. `bind_luma_neighbours` / `bind_chroma_neighbours`
+  populate a per-MB carrier's `above` / `leftcol` / `corner` +
+  availability from the already-reconstructed canvas pixels at a
+  macroblock raster position (raster decode order guarantees the above
+  row + left column are reconstructed before the MB is reached);
+  `blit_luma` / `blit_chroma` copy a reconstructed carrier's samples back
+  into the canvas. `reconstruct_intra_macroblock_into` is the
+  picture-aware per-MB step a frame walk emits (bind → the
+  spec/01 Gap 2-5 `reconstruct_intra_macroblock` → blit), and
+  `reconstruct_intra_frame` is the whole-picture intra frame-walk
+  skeleton: it walks every macroblock in raster order (driving one
+  `Svq3IntraMacroblockInput` per MB) and assembles the entire intra
+  picture with correct cross-macroblock prediction. `to_video_frame`
+  bridges the reconstructed canvas to an `oxideav_core::VideoFrame`
+  (Yuv420P, Y full-res + Cb/Cr half-res, registry-gated), and
+  `luma_reference` / `chroma_reference` expose the canvas as
+  `svq3_mc::ReferencePlane` views so a reconstructed frame can serve as
+  the reference plane for a subsequent inter-predicted frame. This whole
+  layer is wire-format-independent — it threads pixels using only the MB
+  raster ordering + the 4:2:0 subsample, both wiki-pinned — and so is
+  independent of the CBP / separate-DC docs gaps below (those govern
+  *which* residual blocks a macroblock carries, not where a reconstructed
+  macroblock lands or how the picture is assembled / output).
 
 The remaining SVQ3 gap toward a decoded intra frame is now the
 **CBP coded-block-pattern read**, which the wiki defers wholesale to
@@ -218,10 +256,13 @@ stream — stays gated on a docs trace. The **separate-DC luma block**
 branch (MB types `0` / `25`, "luma DCs coded in a separate 4×4 block")
 likewise needs the separate luma-DC block transform + distribution,
 also unpinned under `docs/video/svq3/`. With the intra-mode VLC, the
-inline-DC intra-luma residual path, and the per-MB grid geometry now
-landed, the only thing between here and a decoded intra frame is the
-slice-level frame walk — and the one CBP `me(v)` trace that walk needs
-to know which residual blocks each macroblock carries.
+inline-DC intra-luma residual path, the per-MB grid geometry, the
+whole-picture intra frame-walk skeleton (`svq3_picture`), and the
+`VideoFrame` output bridge now landed, the *only* thing between here and
+a decoded intra frame is the CBP `me(v)` wire decode that resolves which
+residual blocks each macroblock carries — everything downstream of that
+decode (per-MB reconstruction composition, cross-MB intra prediction,
+picture assembly, frame output) is implemented and tested.
 
 ## Cargo features
 
