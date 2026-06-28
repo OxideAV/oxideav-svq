@@ -464,6 +464,44 @@ impl Svq3Picture {
             self.reconstruct_intra_macroblock_into(pos, &input.luma, &input.cb, &input.cr, q);
         }
     }
+
+    /// Convert this reconstructed picture into an
+    /// [`oxideav_core::VideoFrame`] with three planar 8-bit planes (Y, Cb,
+    /// Cr) in `Yuv420P` order.
+    ///
+    /// The luma plane is emitted at full resolution (`luma_width ×
+    /// luma_height`); each chroma plane is emitted at half resolution
+    /// (`chroma_width × chroma_height`), the `4:2:0` layout SVQ3 uses. Each
+    /// plane's `stride` equals its sample width (tightly packed, no row
+    /// padding). `pts` is attached to the frame as supplied.
+    ///
+    /// The reconstructed planes are cloned into the frame, leaving the
+    /// picture canvas intact (so it can serve as a reference plane for a
+    /// subsequent inter-predicted frame). The associated [`PixelFormat`]
+    /// (`Yuv420P`) is a stream-level property carried in
+    /// [`oxideav_core::CodecParameters`], not on the frame, so it is not
+    /// set here.
+    #[cfg(feature = "registry")]
+    #[must_use]
+    pub fn to_video_frame(&self, pts: Option<i64>) -> oxideav_core::VideoFrame {
+        oxideav_core::VideoFrame {
+            pts,
+            planes: vec![
+                oxideav_core::VideoPlane {
+                    stride: self.luma_width(),
+                    data: self.luma.clone(),
+                },
+                oxideav_core::VideoPlane {
+                    stride: self.chroma_width(),
+                    data: self.cb.clone(),
+                },
+                oxideav_core::VideoPlane {
+                    stride: self.chroma_width(),
+                    data: self.cr.clone(),
+                },
+            ],
+        }
+    }
 }
 
 /// The per-macroblock decode inputs a [`Svq3Picture::reconstruct_intra_frame`]
@@ -833,5 +871,37 @@ mod tests {
         };
         // 3 inputs for a 4-MB picture.
         pic.reconstruct_intra_frame(&[input.clone(), input.clone(), input], 10);
+    }
+
+    #[cfg(feature = "registry")]
+    #[test]
+    fn to_video_frame_emits_yuv420p_planes() {
+        // Reconstruct a flat 128 all-DC 2×2 picture, bridge to a VideoFrame.
+        let mut pic = Svq3Picture::new(2, 2);
+        let input = Svq3IntraMacroblockInput {
+            luma: zero_residual_luma(Svq3IntraMode::Dc),
+            cb: zero_chroma(),
+            cr: zero_chroma(),
+        };
+        pic.reconstruct_intra_frame(&vec![input; 4], 10);
+
+        let frame = pic.to_video_frame(Some(42));
+        assert_eq!(frame.pts, Some(42));
+        assert_eq!(frame.planes.len(), 3);
+
+        // Luma: full 32×32, stride 32.
+        assert_eq!(frame.planes[0].stride, 32);
+        assert_eq!(frame.planes[0].data.len(), 32 * 32);
+        assert!(frame.planes[0].data.iter().all(|&p| p == 128));
+
+        // Chroma Cb / Cr: half 16×16, stride 16.
+        for plane in &frame.planes[1..] {
+            assert_eq!(plane.stride, 16);
+            assert_eq!(plane.data.len(), 16 * 16);
+            assert!(plane.data.iter().all(|&p| p == 128));
+        }
+
+        // Bridging leaves the canvas intact (clones, not moves).
+        assert!(pic.luma().iter().all(|&p| p == 128));
     }
 }
