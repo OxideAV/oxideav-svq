@@ -465,6 +465,39 @@ impl Svq3Picture {
         }
     }
 
+    /// Borrow this picture's reconstructed luma plane as a
+    /// [`crate::svq3_mc::ReferencePlane`] for inter motion compensation.
+    ///
+    /// A reconstructed frame is the reference a subsequent inter-predicted
+    /// (P/B) frame's motion vectors sample from. This view exposes the luma
+    /// plane (`luma_width × luma_height`) to the SVQ3 MC fetch /
+    /// interpolation path ([`crate::svq3_mc`]) with the H.264
+    /// edge-replication clamping for unrestricted motion vectors. Always
+    /// succeeds (the canvas is always non-empty and correctly sized), so it
+    /// returns the plane directly rather than an `Option`.
+    #[must_use]
+    pub fn luma_reference(&self) -> crate::svq3_mc::ReferencePlane<'_> {
+        crate::svq3_mc::ReferencePlane::new(&self.luma, self.luma_width(), self.luma_height())
+            .expect("picture luma plane is always non-empty and correctly sized")
+    }
+
+    /// Borrow one of this picture's reconstructed chroma planes (selected
+    /// by `which`) as a [`crate::svq3_mc::ReferencePlane`] for inter motion
+    /// compensation.
+    ///
+    /// The chroma reference plane is half-resolution
+    /// (`chroma_width × chroma_height`), the `4:2:0` layout. Like
+    /// [`Self::luma_reference`], the view always succeeds.
+    #[must_use]
+    pub fn chroma_reference(&self, which: ChromaSelect) -> crate::svq3_mc::ReferencePlane<'_> {
+        let plane = match which {
+            ChromaSelect::Cb => &self.cb,
+            ChromaSelect::Cr => &self.cr,
+        };
+        crate::svq3_mc::ReferencePlane::new(plane, self.chroma_width(), self.chroma_height())
+            .expect("picture chroma plane is always non-empty and correctly sized")
+    }
+
     /// Convert this reconstructed picture into an
     /// [`oxideav_core::VideoFrame`] with three planar 8-bit planes (Y, Cb,
     /// Cr) in `Yuv420P` order.
@@ -871,6 +904,49 @@ mod tests {
         };
         // 3 inputs for a 4-MB picture.
         pic.reconstruct_intra_frame(&[input.clone(), input.clone(), input], 10);
+    }
+
+    #[test]
+    fn reference_planes_view_canvas_pixels() {
+        // Reconstruct a flat 128 all-DC 2×2 picture, then borrow its
+        // reference-plane views and verify dimensions + clamped samples.
+        let mut pic = Svq3Picture::new(2, 2);
+        let input = Svq3IntraMacroblockInput {
+            luma: zero_residual_luma(Svq3IntraMode::Dc),
+            cb: zero_chroma(),
+            cr: zero_chroma(),
+        };
+        pic.reconstruct_intra_frame(&vec![input; 4], 10);
+
+        let luma_ref = pic.luma_reference();
+        assert_eq!(luma_ref.width(), 32);
+        assert_eq!(luma_ref.height(), 32);
+        // In-bounds sample matches the canvas (flat 128).
+        assert_eq!(luma_ref.sample_clamped(5, 7), 128);
+        // Out-of-bounds clamps to the nearest edge pixel (still 128).
+        assert_eq!(luma_ref.sample_clamped(-4, -9), 128);
+        assert_eq!(luma_ref.sample_clamped(100, 100), 128);
+
+        let cb_ref = pic.chroma_reference(ChromaSelect::Cb);
+        assert_eq!(cb_ref.width(), 16);
+        assert_eq!(cb_ref.height(), 16);
+        assert_eq!(cb_ref.sample_clamped(3, 3), 128);
+    }
+
+    #[test]
+    fn reference_plane_clamps_to_distinct_edge_pixels() {
+        // Write a recognisable corner pattern so the clamp direction is
+        // observable: a single bright pixel at the bottom-right luma corner.
+        let mut pic = Svq3Picture::new(1, 1);
+        let mut mb = LumaMacroblock::new();
+        mb.samples[15 * MB_LUMA_DIM + 15] = 200; // bottom-right pixel
+        pic.blit_luma(macroblock_position(0, 1).unwrap(), &mb);
+
+        let luma_ref = pic.luma_reference();
+        // Sampling past the bottom-right corner clamps to (15,15) = 200.
+        assert_eq!(luma_ref.sample_clamped(99, 99), 200);
+        // Sampling past the top-left corner clamps to (0,0) = 0.
+        assert_eq!(luma_ref.sample_clamped(-1, -1), 0);
     }
 
     #[cfg(feature = "registry")]
