@@ -60,6 +60,10 @@ impl From<crate::Error> for Error {
                 "oxideav-svq: SVQ1 in-place quantise decision at {level:?} is illegal — \
                  no codebook stored at this level (spec §14.10/§14.11)"
             )),
+            crate::Error::InvalidVlcCode => Error::InvalidData(
+                "oxideav-svq: SVQ1 bit pattern matched no codeword in the addressed VLC table"
+                    .into(),
+            ),
             crate::Error::NotImplemented => Error::unsupported(
                 "oxideav-svq: SVQ1 pixel decode blocked on codebook docs-gap — see crates/oxideav-svq/README.md",
             ),

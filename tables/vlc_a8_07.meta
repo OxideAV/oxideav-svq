@@ -1,0 +1,34 @@
+source: reference/binaries/quicktimethirdparty.qtx
+source_sha256: ac3509bf22aa1458dfc6e1af980956c0153b4c287af452ae5b9cac6f923be169
+size_bytes: 598016
+image_base_hex: 0x67d70000
+vma_start_hex: 0x67dcd14c
+vma_end_exclusive_hex: 0x67dcd174
+file_offset_start_hex: 0x0005d14c
+file_offset_end_exclusive_hex: 0x0005d174
+byte_length: 40
+section: .rdata
+table_index_in_window: 11
+alphabet_size: 8
+header_min_value_raw_hex: 0x00000000
+header_min_value_signed: 0
+header_bytes: 8 (u32 alphabet, u32 min_value)
+record_size_bytes: 4
+record_count: 8
+record_layout: u16_le value + u8 zero_pad + u8 length_byte
+length_byte_encoding: length_byte == code_length * 8 (low 3 bits always 0)
+value_range_observed: 0..3
+code_length_range_observed: 1..5
+length_byte_distinct: ['0x08', '0x18', '0x20', '0x28']
+representation_hint: option_1_length_pair (sorted-by-bit-position records)
+tool: python3 struct + PE section table
+method: |
+  Self-consistent forward walk through (u32 alphabet, u32 min) headers
+  starting at 0x0005c304; this is the unique walk that
+  lands EXACTLY at the codebook-descriptor boundary 0x0005d214.
+  All sixteen tables consume the 3856 B between those bounds with no gap.
+notes: |
+  Pure byte-level extraction; no semantic claim about the role of this
+  table (stage count vs. mean, intra vs. inter, level binding).
+  See provenance/07-extractor-vlc-tables.md for the brief-vs-binary
+  reconciliation that motivates the neutral naming.

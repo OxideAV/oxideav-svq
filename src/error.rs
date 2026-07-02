@@ -52,6 +52,14 @@ pub enum Error {
     /// build's codebook region — the only codebooks present cover
     /// L=0..L=3.
     InvalidLevelQuantise(crate::svq1_blocktree::Svq1Level),
+    /// A variable-length-code read accumulated the table's maximum
+    /// code length without matching any codeword. For a complete
+    /// (Kraft sum 1) table this can only happen on a truncation-free
+    /// corrupt stream; for the motion-vector component VLC T02 it
+    /// additionally fires on the five soft-reserved length-13
+    /// patterns `docs/video/svq1/audit/01-report.md` §3.1 / §7.3
+    /// documents as never emitted by conformant streams.
+    InvalidVlcCode,
     /// Reserved scaffold variant. Surfaces from API endpoints (codec
     /// registration, frame decode) that the round-1 frame-header
     /// parser has not yet wired up.
@@ -96,6 +104,9 @@ impl core::fmt::Display for Error {
                      no codebook stored at this level (spec §14.10/§14.11)"
                 )
             }
+            Error::InvalidVlcCode => f.write_str(
+                "oxideav-svq: SVQ1 bit pattern matched no codeword in the addressed VLC table",
+            ),
             Error::NotImplemented => f.write_str(
                 "oxideav-svq: clean-room rebuild in progress — see crates/oxideav-svq/README.md",
             ),

@@ -1,0 +1,6 @@
+index,file_offset_hex,vma_hex,raw_hex,value_u16,pad_byte,length_byte,code_length,value_dec
+HDR,0x0005d01c,0x67dcd01c,0400000000000000,4,,,,alphabet=4 min=0x00000000
+0,0x0005d024,0x67dcd024,01000010,1,0x00,0x10,2,1
+1,0x0005d028,0x67dcd028,01000018,1,0x00,0x18,3,1
+2,0x0005d02c,0x67dcd02c,00000018,0,0x00,0x18,3,0
+3,0x0005d030,0x67dcd030,01000008,1,0x00,0x08,1,1

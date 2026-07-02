@@ -8,6 +8,36 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 383 — SVQ1 wire VLC layer (`svq1_vlc`) — all sixteen staged
+  tables landed.** Mirrors the sixteen VLC tables the docs
+  collaborator's Extractor 03 pass staged
+  (`docs/video/svq1/tables/vlc_*.csv`, round 6) and Auditor 02
+  role-mapped (`docs/video/svq1/audit/01-report.md`, round 7)
+  bit-exact into `tables/` and parses them at build time into
+  compile-time constants: the single inter mean VLC (T00, alphabet
+  512, `min_value = −256`), the single intra mean VLC (T01, alphabet
+  256), the motion-vector component VLC (T02, alphabet 64), the
+  interframe MB-coding-mode VLC (T03, alphabet 4), and the twelve
+  per-`(level, half)` stage-count VLCs (T04..T15, L=5..L=0 × intra /
+  inter). The new `svq1_vlc` module builds a verified prefix-code
+  decoder per table (`Svq1VlcDecoder`): record index = alphabet
+  position, record value = the codeword's MSB-first bit pattern —
+  the constructor PROVES the reading by rejecting any duplicate /
+  prefix-colliding table, and all sixteen pass with the documented
+  Kraft sums (fifteen complete; T02 at the audit's `8187/8192`).
+  Role-layer reads land as `read_stage_count` (`N = position − 1`,
+  spec/04 §4.1 audit-corrected: −1 SKIP / 0 mean-only / 1..6
+  stages), `read_intra_mean` (`u8`), `read_inter_mean` (`s9`),
+  `read_mv_component_position` and `read_mb_mode_position` (raw
+  positions — the Reading A/B and mode-permutation open items stay
+  with the plane layer). New `Error::InvalidVlcCode` surfaces the
+  no-codeword-matched case (T02's five soft-reserved length-13
+  patterns). 13 new lib tests pin the audit's evidence lines
+  (inter-mean 0 → 1-bit code, intra-mean 25/26 → 4-bit, T02 symmetry
+  around position 32, T03 lengths {2,3,3,1}, intra/inter peak
+  positions, duplicate sets A/B) plus an exhaustive every-codeword
+  decode round-trip across representative tables.
+
 - **Round 374 — SVQ1 L=3 inter sub-block reconstruction (`svq1_mc`).**
   Composes the §6.5.2 motion-compensation patch into the §4.6.2 inter
   predictor role of `reconstruct_leaf`: the first end-to-end *reference

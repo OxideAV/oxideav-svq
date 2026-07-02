@@ -484,6 +484,7 @@ pub mod svq1_motion_predictor;
 pub mod svq1_mv_cache;
 pub mod svq1_reconstruct;
 pub mod svq1_stage_indices;
+pub mod svq1_vlc;
 pub mod svq3;
 pub mod svq3_coeff;
 pub mod svq3_dequant;

@@ -100,6 +100,46 @@ const BITMASK_LUT_BYTES: usize = 16;
 /// (`byte_length: 1024`, `record_count: 512`, `record_size_bytes: 2`).
 const U16_PARAM_TABLE_WORDS: usize = 512;
 
+/// The sixteen SVQ1 VLC tables staged by the docs collaborator's
+/// Extractor 03 pass (`docs/video/svq1/provenance/07-extractor-vlc-tables.md`)
+/// and role-mapped by Auditor 02 (`docs/video/svq1/audit/01-report.md`),
+/// mirrored bit-exact under `tables/` (SHA-256s per
+/// `tables/MANIFEST-03.sha256`). Tuple layout:
+/// `(csv_stem, emitted_const_name, alphabet_size, min_value)`.
+///
+/// Per `provenance/07` §5.2 every on-disk record is
+/// `u16_le codeword + u8 zero_pad + u8 (code_length * 8)`; the record
+/// index is the alphabet position and the decoded value is
+/// `position + min_value` (audit/01 §2.1 evidence line 1). Roles per
+/// `audit/01-report.md` §2 / §3 / §4:
+///
+/// | Table | Role |
+/// |-------|------|
+/// | T00 `vlc_a512_0` | inter mean VLC (s9, min −256) |
+/// | T01 `vlc_a256_0` | intra mean VLC (u8) |
+/// | T02 `vlc_a64_0`  | motion-vector component VLC |
+/// | T03 `vlc_a4_0`   | interframe MB-coding-mode VLC |
+/// | T04..T09 `vlc_a8_00..05` | intra stage-count VLCs, L=5..L=0 |
+/// | T10..T15 `vlc_a8_06..11` | inter stage-count VLCs, L=5..L=0 |
+const VLC_TABLE_SPECS: &[(&str, &str, usize, i32)] = &[
+    ("vlc_a512_0", "SVQ1_VLC_INTER_MEAN", 512, -256),
+    ("vlc_a256_0", "SVQ1_VLC_INTRA_MEAN", 256, 0),
+    ("vlc_a64_0", "SVQ1_VLC_MV_COMPONENT", 64, 0),
+    ("vlc_a4_0", "SVQ1_VLC_MB_MODE", 4, 0),
+    ("vlc_a8_00", "SVQ1_VLC_INTRA_STAGE_COUNT_L5", 8, 0),
+    ("vlc_a8_01", "SVQ1_VLC_INTRA_STAGE_COUNT_L4", 8, 0),
+    ("vlc_a8_02", "SVQ1_VLC_INTRA_STAGE_COUNT_L3", 8, 0),
+    ("vlc_a8_03", "SVQ1_VLC_INTRA_STAGE_COUNT_L2", 8, 0),
+    ("vlc_a8_04", "SVQ1_VLC_INTRA_STAGE_COUNT_L1", 8, 0),
+    ("vlc_a8_05", "SVQ1_VLC_INTRA_STAGE_COUNT_L0", 8, 0),
+    ("vlc_a8_06", "SVQ1_VLC_INTER_STAGE_COUNT_L5", 8, 0),
+    ("vlc_a8_07", "SVQ1_VLC_INTER_STAGE_COUNT_L4", 8, 0),
+    ("vlc_a8_08", "SVQ1_VLC_INTER_STAGE_COUNT_L3", 8, 0),
+    ("vlc_a8_09", "SVQ1_VLC_INTER_STAGE_COUNT_L2", 8, 0),
+    ("vlc_a8_10", "SVQ1_VLC_INTER_STAGE_COUNT_L1", 8, 0),
+    ("vlc_a8_11", "SVQ1_VLC_INTER_STAGE_COUNT_L0", 8, 0),
+];
+
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo");
     let tables_dir = Path::new(&manifest_dir).join("tables");
@@ -151,6 +191,203 @@ fn main() {
     emit_clip_lut(&mut f, &clip);
     emit_bitmask_lut(&mut f, &bitmask);
     emit_u16_param_table(&mut f, &u16_param);
+
+    for &(stem, const_name, alphabet, min_value) in VLC_TABLE_SPECS {
+        let csv = tables_dir.join(format!("{stem}.csv"));
+        println!("cargo:rerun-if-changed={}", csv.display());
+        let records = parse_vlc_csv(&csv, alphabet, min_value);
+        emit_vlc_table(&mut f, const_name, stem, min_value, &records);
+    }
+}
+
+/// One parsed VLC record: `(codeword_bits, code_length)` at its
+/// alphabet position. Per `docs/video/svq1/provenance/07-extractor-vlc-tables.md`
+/// §5.2 the codeword is the numeric value of the `code_length`-bit
+/// MSB-first bit pattern (the crate's canonical-prefix-code check in
+/// `src/svq1_vlc.rs` verifies the sixteen tables are prefix-free
+/// under exactly that reading).
+type VlcRecord = (u16, u8);
+
+/// Parse a `index,file_offset_hex,vma_hex,raw_hex,value_u16,pad_byte,
+/// length_byte,code_length,value_dec` VLC CSV (the Extractor 03
+/// format) and return one `(codeword, code_length)` record per
+/// alphabet position. The `HDR` row's `alphabet=N min=0x...` trailer
+/// is verified against `expected_alphabet` / `expected_min`.
+fn parse_vlc_csv(path: &Path, expected_alphabet: usize, expected_min: i32) -> Vec<VlcRecord> {
+    let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let mut out: Vec<VlcRecord> = Vec::with_capacity(expected_alphabet);
+    let mut saw_hdr = false;
+    for (lineno, line) in text.lines().enumerate() {
+        if lineno == 0 {
+            // column-header row
+            continue;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').collect();
+        assert!(
+            cols.len() == 9,
+            "{}:{} expected 9 columns, got {} ({:?})",
+            path.display(),
+            lineno + 1,
+            cols.len(),
+            line
+        );
+        if cols[0] == "HDR" {
+            // e.g. "alphabet=512 min=0xffffff00"
+            let trailer = cols[8];
+            let alphabet: usize = trailer
+                .split_whitespace()
+                .find_map(|t| t.strip_prefix("alphabet="))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}:{} bad HDR trailer {trailer:?}",
+                        path.display(),
+                        lineno + 1
+                    )
+                });
+            let min_raw = trailer
+                .split_whitespace()
+                .find_map(|t| t.strip_prefix("min=0x"))
+                .and_then(|v| u32::from_str_radix(v, 16).ok())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}:{} bad HDR min field {trailer:?}",
+                        path.display(),
+                        lineno + 1
+                    )
+                });
+            let min_signed = min_raw as i32;
+            assert_eq!(
+                alphabet,
+                expected_alphabet,
+                "{} HDR alphabet",
+                path.display()
+            );
+            assert_eq!(min_signed, expected_min, "{} HDR min_value", path.display());
+            saw_hdr = true;
+            continue;
+        }
+        let index: usize = cols[0].parse().unwrap_or_else(|e| {
+            panic!(
+                "{}:{} parse index {:?}: {e}",
+                path.display(),
+                lineno + 1,
+                cols[0]
+            )
+        });
+        assert_eq!(
+            index,
+            out.len(),
+            "{}:{} record-index gap (expected {}, got {})",
+            path.display(),
+            lineno + 1,
+            out.len(),
+            index
+        );
+        let codeword: u32 = cols[4].parse().unwrap_or_else(|e| {
+            panic!(
+                "{}:{} parse value_u16 {:?}: {e}",
+                path.display(),
+                lineno + 1,
+                cols[4]
+            )
+        });
+        assert!(
+            codeword <= 0xffff,
+            "{} codeword out of u16 range",
+            path.display()
+        );
+        let code_length: u32 = cols[7].parse().unwrap_or_else(|e| {
+            panic!(
+                "{}:{} parse code_length {:?}: {e}",
+                path.display(),
+                lineno + 1,
+                cols[7]
+            )
+        });
+        assert!(
+            (1..=22).contains(&code_length),
+            "{}:{} code_length {} outside the observed 1..=22 range",
+            path.display(),
+            lineno + 1,
+            code_length
+        );
+        // The codeword must fit in code_length bits.
+        assert!(
+            code_length == 16 || codeword < (1u32 << code_length.min(16)),
+            "{}:{} codeword 0x{:04x} does not fit {} bits",
+            path.display(),
+            lineno + 1,
+            codeword,
+            code_length
+        );
+        // Cross-check the redundant length_byte column
+        // (`length_byte == code_length * 8` per provenance/07 §5.2).
+        let length_byte =
+            u32::from_str_radix(cols[6].trim_start_matches("0x"), 16).unwrap_or_else(|e| {
+                panic!(
+                    "{}:{} parse length_byte {:?}: {e}",
+                    path.display(),
+                    lineno + 1,
+                    cols[6]
+                )
+            });
+        assert_eq!(
+            length_byte,
+            code_length * 8,
+            "{}:{} length_byte / code_length mismatch",
+            path.display(),
+            lineno + 1
+        );
+        out.push((codeword as u16, code_length as u8));
+    }
+    assert!(saw_hdr, "{} missing HDR row", path.display());
+    assert_eq!(
+        out.len(),
+        expected_alphabet,
+        "{} produced {} records; expected {}",
+        path.display(),
+        out.len(),
+        expected_alphabet
+    );
+    out
+}
+
+/// Emit one VLC table as
+/// `pub static <NAME>: ([(u16, u8); N], i32) = ([...], min_value);`
+/// — a `(codeword, code_length)` record per alphabet position plus
+/// the table's decoded-value offset (`min_value`, non-zero only for
+/// the inter mean VLC per audit/01 §2.1).
+fn emit_vlc_table(f: &mut fs::File, name: &str, stem: &str, min_value: i32, records: &[VlcRecord]) {
+    writeln!(
+        f,
+        "\n/// {name} — mirrored bit-exact from tables/{stem}.csv\n\
+         /// (docs/video/svq1/tables/{stem}.csv, Extractor 03 round 6;\n\
+         /// role per docs/video/svq1/audit/01-report.md). One\n\
+         /// `(codeword, code_length)` record per alphabet position;\n\
+         /// decoded value = alphabet position + `.1` (min_value).\n\
+         pub static {name}: ([(u16, u8); {len}], i32) = ([",
+        name = name,
+        stem = stem,
+        len = records.len()
+    )
+    .unwrap();
+    let mut buf = String::new();
+    for (i, (cw, len)) in records.iter().enumerate() {
+        buf.push_str(&format!("(0x{cw:04x}, {len}), "));
+        if (i + 1) % 6 == 0 {
+            writeln!(f, "    {}", buf.trim_end()).unwrap();
+            buf.clear();
+        }
+    }
+    if !buf.is_empty() {
+        writeln!(f, "    {}", buf.trim_end()).unwrap();
+    }
+    writeln!(f, "], {min_value});").unwrap();
 }
 
 /// Emit `SVQ1_CLIP_LUT: [u8; 768]` — the saturating-clip helper LUT
