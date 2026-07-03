@@ -8,11 +8,13 @@ Implemented from the clean-room specifications staged under
 
 ## Status
 
-**SVQ1: the decoder is COMPLETE for the I/P forward path and
-byte-exact against black-box reference decodes.** `receive_frame`
-returns real frames. SVQ3 remains parse + reconstruction-composition
-infrastructure gated on the CBP `me(v)` docs trace (see the SVQ3
-section below).
+**SVQ1: decoder COMPLETE for the I/P forward path AND a full I/P/B
+encoder (adaptive λ-tree, MV search, INTER_4MV, droppable frames),
+both byte-exact against black-box reference decodes.**
+`receive_frame` returns real frames; `make_encoder` produces streams
+the reference decoder reproduces sample-exact. SVQ3 remains parse +
+reconstruction-composition infrastructure gated on the CBP `me(v)`
+docs trace (see the SVQ3 section below).
 
 ### SVQ1
 
@@ -61,20 +63,54 @@ chain exercising overhang macroblocks:
 * **Robustness**: every-byte truncation, pseudo-random soup, and
   bit-flip sweeps error cleanly.
 
-An **intra encoder** (`svq1_enc`) implements the staged
-encoder-companion bring-up ladder: mean-only 16×16 (`MeanOnlyL5`),
-mean-only 8×8 (`MeanOnlyL3`), and mean + SSE-best stage-1 vector
-(`MeanPlusOneStageL3`). All three modes' streams were decoded by the
-reference decoder binary (black box) byte-identical to our own
-decoder; CI pins encoder determinism + cross-decode fixtures.
+A **full I/P/B encoder** is implemented and black-box
+cross-validated — every stream shape below decodes byte-identical
+between our decoder and the reference decoder binary:
 
-Remaining SVQ1 tails: an INTER_4MV-bearing real-stream fixture (the
-black-box encoder never emits the mode; its position in the T03
-alphabet is pinned by elimination); B-frame samples; the frame-tail
-checksum polynomial and embedded-string XOR table (locations still
-unpinned in the docs staging); deeper encoder modes (multi-stage,
-deeper subdivision, inter frames, rate control); and a native
-`Yuv410P` output once `oxideav-core` grows the pixel format.
+* **Leaf search** (`svq1_enc_leaf`): the spec/04 §4.5 stage
+  accumulation run as the inverse — rounded residual mean (intra
+  `[0,255]` / inter `[-256,+255]`) + greedy ascending-stage descent
+  committing each stage's SSE-best vector while it strictly improves
+  (up to all six stages), modelling the decoder's wide-accumulation
+  arithmetic exactly, with exact wire-bit accounting and the
+  inter-only leaf SKIP.
+* **Adaptive block tree** (`svq1_enc_tree`): per-macroblock λ-cost
+  subdivision over the full L=5..L=0 hierarchy (`SSE + λ·bits`),
+  serialised in the decoder's breadth-first per-level queue order.
+  `Svq1EncoderMode::Adaptive { lambda }` spans 8466 → 860 bytes on
+  the same 176×144 frame (λ 0 → 2048); the bring-up modes
+  (`MeanOnlyL5` / `MeanOnlyL3` / `MeanPlusOneStageL3` /
+  `MultiStageL3`) remain.
+* **P-frames** (`svq1_enc_inter`): per-MB SKIP / INTER / INTER_4MV /
+  INTRA λ-cost mode decision; two-phase motion search (full-pel SAD
+  around the median predictor + half-pel refine) with differentials
+  as signed T02 codewords; INTER_4MV's four serial per-8×8 searches
+  against a trial MV cache (`Svq1MvCache::store_subblock`); the
+  encoder-side cache mirrors the decoder's §6.8.1 store rules.
+  Motion candidates are confined to a **visible-reference window**
+  (every visible output reads only visible reference samples) —
+  black-box probing showed decoders genuinely diverge on the
+  spec/06 §6.7 edge extension and spec/04 §4.7.3 overhang storage,
+  both implementation-defined. Validated on I+3P chains at 176×144
+  and the 160×120 overhang geometry.
+* **INTER_4MV fixture**: the committed quadrant-motion chain
+  (`tests/svq1_enc_inter_conformance.rs`) is the first 4MV stream
+  wire-validated in either direction (~5× smaller than the
+  single-MV encode of the same content); the reference encoder
+  binary never emits the mode.
+* **Droppable (B) frames**: `Svq1InterParams::droppable` emits
+  picture type 2; an I+B+P chain whose P predicts from the I
+  decodes byte-exact — conforming decoders keep B frames out of the
+  reference chain.
+* **Registry `Encoder`** (`make_encoder` / `Svq1EncoderHandle`):
+  `Yuv420P` in, 4:1:0 decimation (exact inverse of the decode
+  bridge), keyframe cadence + λ knobs, keyframe-flagged packets;
+  registry-level encode→decode round trip is CI-pinned.
+
+Remaining SVQ1 tails: the frame-tail checksum polynomial and
+embedded-string XOR table (locations still unpinned in the docs
+staging); rate control; and a native `Yuv410P` pixel format once
+`oxideav-core` grows one.
 
 ### SVQ3
 
