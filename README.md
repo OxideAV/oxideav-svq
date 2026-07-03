@@ -61,11 +61,19 @@ chain exercising overhang macroblocks:
 * **Robustness**: every-byte truncation, pseudo-random soup, and
   bit-flip sweeps error cleanly.
 
+An **intra encoder** (`svq1_enc`) implements the staged
+encoder-companion bring-up ladder: mean-only 16×16 (`MeanOnlyL5`),
+mean-only 8×8 (`MeanOnlyL3`), and mean + SSE-best stage-1 vector
+(`MeanPlusOneStageL3`). All three modes' streams were decoded by the
+reference decoder binary (black box) byte-identical to our own
+decoder; CI pins encoder determinism + cross-decode fixtures.
+
 Remaining SVQ1 tails: an INTER_4MV-bearing real-stream fixture (the
 black-box encoder never emits the mode; its position in the T03
 alphabet is pinned by elimination); B-frame samples; the frame-tail
 checksum polynomial and embedded-string XOR table (locations still
-unpinned in the docs staging); an SVQ1 encoder; and a native
+unpinned in the docs staging); deeper encoder modes (multi-stage,
+deeper subdivision, inter frames, rate control); and a native
 `Yuv410P` output once `oxideav-core` grows the pixel format.
 
 ### SVQ3
