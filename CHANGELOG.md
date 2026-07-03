@@ -106,6 +106,16 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   round-trip (encode through `Encoder`, decode through `Decoder`)
   is CI-pinned.
 
+- **Round 386 — droppable (B) frame encoding.**
+  `Svq1InterParams::droppable` emits picture type `2`: the wire
+  payload is identical to a P-frame's (SVQ1 B-frames are
+  unidirectional, wiki §"Algorithm Basics"), and the frame must
+  never enter the reference chain. An I+B+P sequence where the P
+  predicts from the I (dropping the B) decodes byte-identical
+  between our decoder and the reference decoder binary — positive
+  wire validation that conforming decoders keep droppable frames
+  out of the reference chain.
+
 - **Round 383 — SVQ1 intra encoder (`svq1_enc`), cross-validated
   against the black-box reference decoder.** Implements the staged
   encoder companion's bring-up ladder

@@ -73,6 +73,14 @@ pub struct Svq1InterParams {
     /// Evaluate the INTER_4MV candidate (four per-8×8 MVs, spec/06
     /// §6.1) alongside SKIP / INTER / INTRA.
     pub allow_4mv: bool,
+    /// Emit picture type `2` (B, "droppable") instead of `1` (P).
+    /// SVQ1 B-frames are UNIDIRECTIONAL — the wire payload is
+    /// identical to a P-frame's and predicts from the previous I- or
+    /// P-frame; the only semantic difference is that a droppable
+    /// frame must never become a reference (wiki §"Algorithm Basics"
+    /// / spec/06 §6.10 item 8), which the caller honours by NOT
+    /// chaining the returned reconstruction.
+    pub droppable: bool,
     /// 8-bit temporal reference emitted in the frame header.
     pub temporal_reference: u8,
 }
@@ -83,6 +91,7 @@ impl Default for Svq1InterParams {
             lambda: 32,
             search_radius: 8,
             allow_4mv: true,
+            droppable: false,
             temporal_reference: 0,
         }
     }
@@ -579,7 +588,9 @@ pub fn encode_inter_frame(
     // absent; 22 + 8 + 2 + 1 + 1 = 34 bits.
     w.push_bits(22, 0x20); // frame code
     w.push_bits(8, u32::from(params.temporal_reference));
-    w.push_bits(2, 1); // picture type = P
+    // Picture type: 1 = P, 2 = B ("droppable" — forward-predicted,
+    // never a reference; wiki §"Algorithm Basics").
+    w.push_bits(2, if params.droppable { 2 } else { 1 });
     w.push_bits(1, 0); // checksum_present
     w.push_bits(1, 0); // unknown_flag_1
 
@@ -852,6 +863,56 @@ mod tests {
             cost(&with_4mv),
             cost(&without_4mv)
         );
+    }
+
+    /// Droppable (B) frames carry picture type 2, decode against the
+    /// same forward reference as a P-frame, and never enter the
+    /// reference chain: a following P encoded against the ORIGINAL
+    /// reference still decodes byte-exact when the B is dropped.
+    #[test]
+    fn droppable_frame_round_trips_and_is_reference_transparent() {
+        let (cw, ch) = (chroma_dim(W), chroma_dim(H));
+        let y0 = gradient_plane(W, H, 7);
+        let u0 = gradient_plane(cw, ch, 101);
+        let v0 = gradient_plane(cw, ch, 202);
+        let reference = intra_reference(&y0, &u0, &v0);
+
+        let yb = shifted(&reference.y.visible(), W, H, 1);
+        let yp = shifted(&reference.y.visible(), W, H, 2);
+        let u1 = reference.u.visible();
+        let v1 = reference.v.visible();
+
+        let (ybr, ubr, vbr) = plane_refs(&yb, &u1, &v1);
+        let b = encode_inter_frame(
+            ybr,
+            ubr,
+            vbr,
+            &reference,
+            &Svq1InterParams {
+                droppable: true,
+                ..Default::default()
+            },
+        )
+        .expect("B encodes");
+        assert_eq!(
+            b.reconstruction.header.picture_type,
+            crate::header::Svq1PictureType::Droppable
+        );
+
+        // P against the ORIGINAL reference (the B never chains).
+        let (ypr, upr, vpr) = plane_refs(&yp, &u1, &v1);
+        let p = encode_inter_frame(ypr, upr, vpr, &reference, &Svq1InterParams::default())
+            .expect("P encodes");
+        assert_eq!(
+            p.reconstruction.header.picture_type,
+            crate::header::Svq1PictureType::Predicted
+        );
+
+        // Decoding the P with the B dropped (reference = the I frame)
+        // reproduces the encoder's reconstruction — the B is fully
+        // reference-transparent.
+        let dropped = decode_frame(&p.bytes, Some(&reference)).expect("P decodes");
+        assert_eq!(dropped.y.visible(), p.reconstruction.y.visible());
     }
 
     /// Mis-sized planes are rejected.
