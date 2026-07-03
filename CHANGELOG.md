@@ -8,6 +8,25 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 383 — SVQ1 intra encoder (`svq1_enc`), cross-validated
+  against the black-box reference decoder.** Implements the staged
+  encoder companion's bring-up ladder
+  (`docs/video/svq1/wiki/eggs-naive-svq1-encoder.html`): `BitWriter`
+  (the MSB-first mirror of `BitReader`), header emission (common-size
+  code or the code-7 explicit escape, all optional trailers off), and
+  three modes — `MeanOnlyL5` (one mean-only 16×16 leaf per
+  macroblock, the companion's coarsest legal stream), `MeanOnlyL3`
+  (four mean-only 8×8 leaves), and `MeanPlusOneStageL3` (per-leaf
+  SSE search over the intra L=3 stage-1 codebook vectors in the
+  pinned hierarchical tile order, falling back to mean-only). All
+  three modes' outputs were decoded by the reference decoder binary
+  (black-box, minimal-container delivery) BYTE-IDENTICAL to our own
+  decoder's output — the encoder-side counterpart of the decoder
+  conformance work. `tests/svq1_encoder_conformance.rs` pins encoder
+  determinism against a committed stream plus our-decode ==
+  reference-decode on that stream; round-trip unit tests cover all
+  modes, overhang dimensions, and the explicit-dimension escape.
+
 - **Round 383 — SVQ1 overhang-dimension conformance + corrupt-stream
   robustness.** A 160×120 I+2P black-box chain fixture
   (`tests/svq1_overhang_conformance.rs`) decodes byte-exact on all
