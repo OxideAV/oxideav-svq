@@ -1,0 +1,47 @@
+source: reference/binaries/quicktimethirdparty.qtx (docs/video/svq1/reference/binaries/)
+source_sha256: ac3509bf22aa1458dfc6e1af980956c0153b4c287af452ae5b9cac6f923be169
+size_bytes: 598016
+image_base_hex: 0x67d70000
+vma_start_hex: 0x67dd2c00
+vma_end_exclusive_hex: 0x67dd2c14
+file_offset_start_hex: 0x00062c00
+file_offset_end_exclusive_hex: 0x00062c14
+byte_length: 20
+section: .rdata
+record_count: 20
+record_size_bytes: 1
+sample_signedness: signed i8
+interpretation: |
+  The 20 codebook bytes between the end of the staged
+  docs/video/svq1/tables/codebook-l0l3.csv extraction window
+  (file 0x62c00) and the true codebook upper boundary (file 0x62c14,
+  where the embedded "BM" bitmap header begins).
+
+  docs/video/svq1/audit/00-report.md pinned the codebook's functional
+  base at file 0x5d214 (the single reloc-resolved static pointer from
+  the SVC dispatch .text range, §2.3) and observed that the signed-VQ
+  byte character extends past 0x62c00 to 0x62c14 (§2.5). The span
+  0x5d214..0x62c14 is EXACTLY the canonical L=0..L=3 intra+inter sum
+  of 23 040 bytes (spec/14 §14.4) — closing audit/00 §7 item 1's
+  "16-byte gap" open item: the canonical codebook is
+  [16 block-shape-LUT bytes at 0x5d214..0x5d224 (dual-use as the
+  first vector bytes)] + [23 004 payload bytes at 0x5d224..0x62c00,
+  staged as codebook-l0l3.csv] + [these 20 tail bytes].
+
+  These 20 bytes are the tail of the LAST page — the L=0 level block's
+  SECOND (inter) half: stage 6, vector 13 (bytes 4..8), vector 14, and
+  vector 15 — pinned by locating the wiki §"Decoding Intraframe Plane
+  Data" worked-example vectors (stage 1 vec 4 / stage 2 vec 14) at
+  payload offsets 22288 / 22496, which places that page at canonical
+  offset 22272..23040 ending exactly at 0x62c14. (The full page layout
+  — level-major descending L=3..L=0, intra half then inter half per
+  level — is pinned by the black-box intra conformance fixture in
+  crates/oxideav-svq/tests/svq1_intra_conformance.rs.)
+tool: python3 file read at the audit-pinned offsets; SHA-256 verified
+  against the source_sha256 above before extraction
+notes: |
+  Byte-level data extraction only (a numeric table, no code or control
+  flow). Staged locally because docs/video/svq1/tables/ does not yet
+  carry this 20-byte window; the docs staging should backfill it (and
+  the CSV here matches the codebook-l0l3.csv column format so it can
+  be lifted verbatim).

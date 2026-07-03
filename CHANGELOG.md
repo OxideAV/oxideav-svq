@@ -8,6 +8,51 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 383 — SVQ1 whole-frame intra decode (`svq1_plane`),
+  BYTE-EXACT against a black-box reference decode.** The new
+  `svq1_plane` module composes every staged layer into the real wire
+  decode: per-plane 16×16 MB raster scan (spec/02 §2.3/§2.4), the
+  breadth-first L=5→L=0 block-tree walk with the §3.4
+  dimension-halving geometry (`Svq1PlaneCanvas` MB-padded canvases,
+  overhang decode-and-crop per §4.7.3), per-leaf stage-count /
+  mean / stage-index reads, codebook stage accumulation, and the
+  full-frame `decode_intra_frame` (header + Y + U + V at the 4:1:0
+  chroma geometry). `tests/svq1_intra_conformance.rs` decodes a
+  reference-encoder-produced 176×144 I-frame **byte-exact on all
+  three planes** (28 512/28 512 samples) against the encoder
+  binary's own decode — the Validator round the docs called for.
+  Four wire-format facts were pinned (all docs errata):
+  1. **§14.8 codebook layout resolved** — the canonical 23 040-byte
+     region (functional base `0x5d214`, audit/00 §2.3; upper bound
+     `0x62c14`) tiles level-major DESCENDING (L=3→L=0), intra half
+     then inter half per level — neither §14.8 hypothesis. The
+     first 16 canonical bytes are the block-shape-LUT dual-use
+     window; the last 20 (`0x62c00..0x62c14`, past the staged
+     `codebook-l0l3.csv` extraction) are staged locally as
+     `tables/codebook-tail.csv` (extracted at the audit-pinned
+     offsets from the SHA-pinned staged binary) — closing the
+     audit/00 §7 item-1 "16-byte gap".
+  2. **L=2 / L=3 vector byte→sample order is hierarchical**
+     (`vector_byte_to_raster`): 16-byte 4×4 raster tiles in
+     subdivision order (L=3: TL, TR, BL, BR; L=2: L, R), not
+     whole-block raster (§4.7.1 erratum).
+  3. **Wide accumulation, single final clamp** (spec/04 §4.11
+     item 2 resolved): per-stage clamping loses transient
+     overshoots the reference decode preserves; `reconstruct_leaf`
+     now accumulates wide and saturates once at the store.
+  4. **The L=4 / L=5 subdivide bit can legitimately read `0`** —
+     the wiki gate is `(stages > 0) && (level >= 4)` on the STAGE
+     COUNT (spec/03 §3.8.2); real streams carry mean-only 16×16
+     leaves for flat regions. `read_block_decision` now accepts
+     the leaf decision at every level and the leaf decoder fires
+     `InvalidLevelQuantise` only on `N ≥ 1` at L≥4 (mean-only
+     L=4/L=5 leaves fill with `saturate(pred + mean)`).
+  New errors: `UnexpectedIntraSkip` (SKIP on an intra leaf, §4.9.1
+  conformant rejection), `ReconstructFailed`. New codebook surface:
+  `codebook_canonical()` / `SVQ1_CODEBOOK_CANONICAL_BYTES` /
+  `half_byte_offset_in_payload` / `codebook_half` /
+  `vector_byte_to_raster`.
+
 - **Round 383 — SVQ1 wire VLC layer (`svq1_vlc`) — all sixteen staged
   tables landed.** Mirrors the sixteen VLC tables the docs
   collaborator's Extractor 03 pass staged

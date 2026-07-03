@@ -60,6 +60,20 @@ pub enum Error {
     /// patterns `docs/video/svq1/audit/01-report.md` §3.1 / §7.3
     /// documents as never emitted by conformant streams.
     InvalidVlcCode,
+    /// The per-leaf stage-count VLC decoded to `−1` (SKIP) on an
+    /// INTRA-coded leaf. Per
+    /// `docs/video/svq1/spec/04-multistage-vq-decoder.md` §4.9.1
+    /// there is no previous-frame reference to skip TO on the intra
+    /// path; rejecting the frame is one of the spec's enumerated
+    /// conformant behaviours (the wiki source is silent on the edge
+    /// case and well-formed encoders do not emit it).
+    UnexpectedIntraSkip,
+    /// A leaf-block reconstruction failed (absent level, mis-sized
+    /// predictor, stage overflow, or a codebook lookup outside the
+    /// staged payload — including the 36-byte inter-L=3 tail gap of
+    /// `docs/video/svq1/spec/14-codebook-architecture.md` §14.4
+    /// audit-corrected / audit/00 §7 item 1).
+    ReconstructFailed,
     /// Reserved scaffold variant. Surfaces from API endpoints (codec
     /// registration, frame decode) that the round-1 frame-header
     /// parser has not yet wired up.
@@ -106,6 +120,14 @@ impl core::fmt::Display for Error {
             }
             Error::InvalidVlcCode => f.write_str(
                 "oxideav-svq: SVQ1 bit pattern matched no codeword in the addressed VLC table",
+            ),
+            Error::UnexpectedIntraSkip => f.write_str(
+                "oxideav-svq: SVQ1 stage-count VLC decoded to SKIP on an intra-coded leaf \
+                 (no reference frame exists on the intra path)",
+            ),
+            Error::ReconstructFailed => f.write_str(
+                "oxideav-svq: SVQ1 leaf-block reconstruction failed (codebook lookup out of \
+                 range or malformed leaf parameters)",
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-svq: clean-room rebuild in progress — see crates/oxideav-svq/README.md",

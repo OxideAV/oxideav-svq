@@ -20,10 +20,15 @@
 //!   [`oxideav_svq::svq1_codebook::SVQ1_L4_ABSENCE`] and
 //!   [`oxideav_svq::svq1_codebook::SVQ1_L5_ABSENCE`] themselves —
 //!   bit-exact mirrors of the meta-file scalar keys.
-//! * The [`oxideav_svq::svq1_blocktree::read_block_decision`] walker
-//!   — surfaces an in-place quantise request at L=4 / L=5 as the
+//! * The leaf decoder ([`oxideav_svq::svq1_plane`]) — surfaces a
+//!   staged (`N ≥ 1`) leaf at L=4 / L=5 as the
 //!   [`oxideav_svq::Error::InvalidLevelQuantise`] structural-failure
-//!   variant.
+//!   variant, per the wiki gate `(stages > 0) && (level >= 4)`
+//!   (`docs/video/svq1/spec/03-block-hierarchy.md` §3.8.2 — the
+//!   gate fires on the STAGE COUNT; a mean-only L=4 / L=5 leaf is
+//!   representable and real streams emit it, so the
+//!   [`oxideav_svq::svq1_blocktree::read_block_decision`] walker
+//!   itself accepts the `0`-subdivide bit at every level).
 //!
 //! Each of these is also unit-tested inside the relevant module; the
 //! integration-test layer below exercises the full chain from a
@@ -33,7 +38,9 @@
 //! end-to-end contract surfaces here.
 
 use oxideav_svq::svq1_blocktree::{read_block_decision, Svq1Level};
-use oxideav_svq::svq1_codebook::{SVQ1_L4_ABSENCE, SVQ1_L5_ABSENCE};
+use oxideav_svq::svq1_codebook::{SVQ1_L4_ABSENCE, SVQ1_L5_ABSENCE, SVQ1_VLC_INTRA_MEAN};
+use oxideav_svq::svq1_plane::decode_intra_plane;
+use oxideav_svq::svq1_vlc::intra_stage_count_table;
 use oxideav_svq::{BitReader, Error};
 
 /// `Svq1Level::L4` is reported as having no codebook through every
@@ -113,46 +120,86 @@ fn svq1_levels_l0_through_l3_are_not_absent() {
     }
 }
 
-/// A bitstream that would otherwise tell the decoder to quantise an
-/// L=4 block in place must surface as
-/// [`Error::InvalidLevelQuantise`] — closing the loop between the
-/// blocktree walker and the L=4 codebook absence record. The structural
-/// `0` bit (the "quantise this block" branch at every level) is what
-/// triggers the rejection at L=4.
+/// Bit-level writer for synthesising a plane payload that exercises
+/// the leaf-level `stages > 0 && level >= 4` gate end-to-end.
+struct BitWriter {
+    bytes: Vec<u8>,
+    bit_pos: usize,
+}
+
+impl BitWriter {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            bit_pos: 0,
+        }
+    }
+
+    fn push_bits(&mut self, width: u32, value: u32) {
+        for i in (0..width).rev() {
+            let bit = ((value >> i) & 1) as u8;
+            if self.bit_pos / 8 >= self.bytes.len() {
+                self.bytes.push(0);
+            }
+            self.bytes[self.bit_pos / 8] |= bit << (7 - (self.bit_pos % 8));
+            self.bit_pos += 1;
+        }
+    }
+
+    fn push_code(&mut self, table: &[(u16, u8)], position: usize) {
+        let (cw, len) = table[position];
+        self.push_bits(u32::from(len), u32::from(cw));
+    }
+}
+
+/// The `0`-subdivide bit at L=4 / L=5 is a LEAF decision — the
+/// walker accepts it (spec/03 §3.8.2; real streams carry mean-only
+/// 16×16 leaves) and a mean-only L=5 leaf decodes to a uniform
+/// macroblock.
 #[test]
-fn svq1_blocktree_rejects_in_place_quantise_at_l4_with_typed_error() {
-    let bytes = [0b0000_0000_u8];
-    let mut br = BitReader::new(&bytes);
-    let err = read_block_decision(Svq1Level::L4, &mut br)
-        .expect_err("L=4 + bit=0 must reject as InvalidLevelQuantise");
-    assert_eq!(err, Error::InvalidLevelQuantise(Svq1Level::L4));
-    // The walker consumes the bit before surfacing the error, so a
-    // downstream caller can re-synchronise on the next macroblock.
-    assert_eq!(br.bits_consumed(), 1);
+fn svq1_mean_only_l5_leaf_is_accepted_end_to_end() {
+    for level in [Svq1Level::L4, Svq1Level::L5] {
+        let bytes = [0b0000_0000_u8];
+        let mut br = BitReader::new(&bytes);
+        let decision = read_block_decision(level, &mut br)
+            .expect("bit=0 at L=4/L=5 is a leaf decision, not an error");
+        assert_eq!(
+            decision,
+            oxideav_svq::svq1_blocktree::Svq1BlockDecision::Quantise
+        );
+        assert_eq!(br.bits_consumed(), 1);
+    }
+
+    // End-to-end: one MB whose L=5 block is a mean-only leaf.
+    let mut w = BitWriter::new();
+    w.push_bits(1, 0); // L=5 leaf
+    w.push_code(&intra_stage_count_table(Svq1Level::L5).0, 1); // N = 0
+    w.push_code(&SVQ1_VLC_INTRA_MEAN.0, 61); // mean = 61
+    let mut br = BitReader::new(&w.bytes);
+    let canvas = decode_intra_plane(&mut br, 16, 16).expect("mean-only L=5 leaf decodes");
+    assert!(canvas.samples.iter().all(|&s| s == 61));
+}
+
+/// A STAGED (`N ≥ 1`) leaf at L=5 fires the wiki gate
+/// `(stages > 0) && (level >= 4)` as [`Error::InvalidLevelQuantise`]
+/// — closing the loop between the leaf decoder and the L=4 / L=5
+/// codebook absence records.
+#[test]
+fn svq1_staged_l5_leaf_rejects_with_invalid_level_quantise() {
+    let mut w = BitWriter::new();
+    w.push_bits(1, 0); // L=5 leaf
+    w.push_code(&intra_stage_count_table(Svq1Level::L5).0, 2); // N = 1
+    w.push_code(&SVQ1_VLC_INTRA_MEAN.0, 61); // mean (read before the gate)
+    w.push_bits(4, 0); // would-be stage index
+    let mut br = BitReader::new(&w.bytes);
+    let err = decode_intra_plane(&mut br, 16, 16)
+        .expect_err("N >= 1 at L=5 must reject as InvalidLevelQuantise");
+    assert_eq!(err, Error::InvalidLevelQuantise(Svq1Level::L5));
 
     // The level surfaced by the error must agree with the absence
     // record's scalar `level` field — so a consumer recovering from
     // the structural failure can name the level using the same
     // documented numeric.
-    let Error::InvalidLevelQuantise(reported_level) = err else {
-        unreachable!()
-    };
-    let record = reported_level
-        .absence_record()
-        .expect("the rejected level must always carry an absence record");
-    assert_eq!(u32::from(record.level), 4);
-}
-
-/// Same end-to-end shape as the L=4 case, with the L=5 (16×16) level.
-#[test]
-fn svq1_blocktree_rejects_in_place_quantise_at_l5_with_typed_error() {
-    let bytes = [0b0000_0000_u8];
-    let mut br = BitReader::new(&bytes);
-    let err = read_block_decision(Svq1Level::L5, &mut br)
-        .expect_err("L=5 + bit=0 must reject as InvalidLevelQuantise");
-    assert_eq!(err, Error::InvalidLevelQuantise(Svq1Level::L5));
-    assert_eq!(br.bits_consumed(), 1);
-
     let Error::InvalidLevelQuantise(reported_level) = err else {
         unreachable!()
     };

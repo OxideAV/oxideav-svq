@@ -243,8 +243,13 @@ pub fn reconstruct_leaf(
     }
 
     // Resolve every stage's V_L codebook vector up front so a lookup
-    // failure is reported before any per-sample work begins.
-    let mut stage_vectors: Vec<&[i8]> = Vec::with_capacity(stages.len());
+    // failure is reported before any per-sample work begins. Each
+    // vector's bytes are re-ordered from their stored hierarchical
+    // 4×4-tile order into output-raster order via
+    // `vector_byte_to_raster` (a no-op for L=0 / L=1; the
+    // empirically-pinned tile permutation for L=2 / L=3 — see
+    // `crate::svq1_codebook::vector_byte_to_raster`).
+    let mut stage_vectors: Vec<Vec<i8>> = Vec::with_capacity(stages.len());
     for s in stages {
         let vector = codebook_vector_in_half(half, level, s.stage, s.vec_idx).ok_or(
             ReconstructError::CodebookLookup {
@@ -252,20 +257,37 @@ pub fn reconstruct_leaf(
                 vec_idx: s.vec_idx,
             },
         )?;
-        stage_vectors.push(vector);
+        let mut raster = vec![0i8; v_l];
+        for (byte_idx, &value) in vector.iter().enumerate() {
+            raster[crate::svq1_codebook::vector_byte_to_raster(level, byte_idx)] = value;
+        }
+        stage_vectors.push(raster);
     }
 
-    // §4.5 / §4.7.1: per-position fixed-order accumulation, raster
-    // order, clamp after every add.
+    // §4.5: per-position fixed-order accumulation in output-raster
+    // order — WIDE accumulator, saturated once at the final store.
+    //
+    // spec/04 §4.5.1 reads the wiki's saturation note as a per-stage
+    // clamp, with §4.5.2 flagging the wider-accumulator variant as
+    // an open Validator question (the two differ exactly when an
+    // intermediate stage overshoots `[0, 255]` and a later stage
+    // pulls the sum back in range). The black-box conformance
+    // fixture pins the WIDE variant: per-stage clamping loses the
+    // overshoot on eight chroma samples of the intra fixture
+    // (`got < reference` by the clipped amount), while the wide
+    // accumulate + final clamp reconstructs every plane byte-exact.
+    // This resolves spec/04 §4.11 item 2 (and spec/14 §14.3's
+    // matching caveat) in the Validator role — an erratum for the
+    // per-stage reading, since the sum of a leaf's stages CAN
+    // transiently leave `[0, 255]`.
     let mut out = Vec::with_capacity(v_l);
     for (pos, &pred) in predictor.iter().enumerate() {
-        // §4.5.1 mean step: clamp predictor + mean.
-        let mut acc = saturate_u8(pred as i16 + mean) as i16;
-        // §4.2 ascending-stage order; §4.5.1 per-step clamp.
+        let mut acc = pred as i16 + mean;
+        // §4.2 ascending-stage order.
         for vector in &stage_vectors {
-            acc = saturate_u8(acc + vector[pos] as i16) as i16;
+            acc += vector[pos] as i16;
         }
-        out.push(acc as u8);
+        out.push(saturate_u8(acc));
     }
 
     Ok(out)
@@ -362,12 +384,16 @@ mod tests {
     }
 
     #[test]
-    fn per_step_saturation_diverges_from_deferred() {
-        // §4.8.5 pathological case: mean = 250, stage-1 = +30 at a
-        // position, stage-2 = -25 at the same position. Per-step:
+    fn wide_accumulation_preserves_transient_overshoot() {
+        // §4.8.5's pathological case: mean = 250, stage-1 = +30 at a
+        // position, stage-2 = -25 at the same position. A per-step
+        // clamp would lose the overshoot:
         //   sat(0+250)=250, sat(250+30)=255, sat(255-25)=230.
-        // A wider-register decoder would give 250+30-25 = 255.
-        // This module is the NORMATIVE per-step form → must yield 230.
+        // The wide accumulator gives 250+30-25 = 255 (clamped once
+        // at the store). The black-box conformance fixture pins the
+        // WIDE form (spec/04 §4.11 item 2 resolved): eight chroma
+        // samples of the intra fixture reconstruct byte-exact ONLY
+        // under wide accumulation.
         let mut half = vec![0i8; Svq1Level::L0.codebook_bytes_per_half().unwrap()];
         // stage 1 vec 0 at offset 0; put +30 at position 0.
         half[0] = 30;
@@ -384,7 +410,10 @@ mod tests {
             },
         ];
         let out = reconstruct_leaf(Svq1Level::L0, &half, &[0u8; 8], 250, &stages).unwrap();
-        assert_eq!(out[0], 230, "per-step saturation must yield 230, not 255");
+        assert_eq!(
+            out[0], 255,
+            "wide accumulation preserves the transient overshoot"
+        );
     }
 
     #[test]
@@ -421,15 +450,17 @@ mod tests {
             let mean = (seed as i16 * 17) - 256;
             let got = reconstruct_leaf(level, &half, &predictor, mean, &stages).unwrap();
 
-            // Independent recompute.
+            // Independent recompute (wide accumulation, single final
+            // clamp; L=1 vector bytes are already raster-ordered so
+            // no byte→sample permutation applies).
             let mut want = Vec::with_capacity(v_l);
             for (pos, &pred) in predictor.iter().enumerate() {
-                let mut acc = saturate_u8(pred as i16 + mean) as i16;
+                let mut acc = pred as i16 + mean;
                 for s in &stages {
                     let v = codebook_vector_in_half(&half, level, s.stage, s.vec_idx).unwrap();
-                    acc = saturate_u8(acc + v[pos] as i16) as i16;
+                    acc += v[pos] as i16;
                 }
-                want.push(acc as u8);
+                want.push(saturate_u8(acc));
             }
             assert_eq!(got, want, "mismatch at seed {seed}");
         }

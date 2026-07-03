@@ -83,6 +83,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const CODEBOOK_L0L3_BYTES: usize = 23004;
+
+/// Length of the codebook tail window at file `0x62c00..0x62c14` —
+/// the 20 bytes between the `codebook-l0l3.csv` extraction end and
+/// the true codebook upper boundary (the "BM" bitmap header at
+/// `0x62c14`), per `tables/codebook-tail.meta` — the final (inter
+/// L=0) page's stage-6 tail (vector 13 bytes 4..8, vectors 14 / 15).
+const CODEBOOK_TAIL_BYTES: usize = 20;
 const CODEBOOK_DESCRIPTOR_BYTES: usize = 36;
 const BLOCK_SHAPE_LUT_LEN: usize = 16;
 const BLOCK_SHAPE_LUT_OFFSET: usize = 0x14; // 20
@@ -145,6 +152,7 @@ fn main() {
     let tables_dir = Path::new(&manifest_dir).join("tables");
 
     let codebook_csv = tables_dir.join("codebook-l0l3.csv");
+    let codebook_tail_csv = tables_dir.join("codebook-tail.csv");
     let descriptor_csv = tables_dir.join("codebook-descriptor.csv");
     let l4_meta = tables_dir.join("codebook-l4.meta");
     let l5_meta = tables_dir.join("codebook-l5.meta");
@@ -153,6 +161,7 @@ fn main() {
     let u16_param_csv = tables_dir.join("u16_param_table.csv");
 
     println!("cargo:rerun-if-changed={}", codebook_csv.display());
+    println!("cargo:rerun-if-changed={}", codebook_tail_csv.display());
     println!("cargo:rerun-if-changed={}", descriptor_csv.display());
     println!("cargo:rerun-if-changed={}", l4_meta.display());
     println!("cargo:rerun-if-changed={}", l5_meta.display());
@@ -161,6 +170,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", u16_param_csv.display());
 
     let l0l3 = parse_signed_csv(&codebook_csv, CODEBOOK_L0L3_BYTES);
+    let tail = parse_signed_csv(&codebook_tail_csv, CODEBOOK_TAIL_BYTES);
     let descriptor = parse_signed_csv(&descriptor_csv, CODEBOOK_DESCRIPTOR_BYTES);
     let absent_l4 = parse_absent_meta(&l4_meta, 4, "16x8", 128, 12288);
     let absent_l5 = parse_absent_meta(&l5_meta, 5, "16x16", 256, 24576);
@@ -185,6 +195,7 @@ fn main() {
     .unwrap();
 
     emit_i8_array(&mut f, "SVQ1_CODEBOOK_L0L3_BYTES", &l0l3);
+    emit_i8_array(&mut f, "SVQ1_CODEBOOK_TAIL_BYTES", &tail);
     emit_descriptor(&mut f, &descriptor);
     emit_absent_record(&mut f, "SVQ1_L4_ABSENCE", &absent_l4);
     emit_absent_record(&mut f, "SVQ1_L5_ABSENCE", &absent_l5);

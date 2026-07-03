@@ -55,17 +55,24 @@
 //!
 //! This module mirrors that fact in code. [`read_block_decision`]
 //! reads ONE bit at L=1..=L=5. At L=0 it reads zero bits and always
-//! returns [`Svq1BlockDecision::Quantise`]. At L=4 or L=5 a bit value
-//! of `0` (the "quantise this block" branch) is rejected with the
-//! new [`crate::Error::InvalidLevelQuantise`] variant.
+//! returns [`Svq1BlockDecision::Quantise`].
 //!
-//! Round 8 stays structural — the per-leaf "stages count VLC + mean
-//! VLC + (stages × 4)-bit codebook selector" wiring is still gated
-//! on the L=0…L=3 codebook layout / VLC table extraction tracked in
-//! `docs/video/svq1/CODEBOOK_GAP.md`.
+//! Note the wiki gate above fires on `(stages > 0)` — the STAGE
+//! COUNT — not on the subdivide bit itself:
+//! `docs/video/svq1/spec/03-block-hierarchy.md` §3.8.2 spells out
+//! that a mean-only (`N = 0`) leaf at L=4 / L=5 is acceptable, and
+//! the black-box conformance fixture
+//! (`tests/svq1_intra_conformance.rs`) confirms real intra streams
+//! DO emit `0`-subdivide bits at L=5 for flat 16×16 regions. The
+//! walker therefore returns [`Svq1BlockDecision::Quantise`] at
+//! every level; the `stages > 0 && level >= 4` rejection
+//! ([`crate::Error::InvalidLevelQuantise`]) is enforced by the leaf
+//! decoder in [`crate::svq1_plane`], exactly where the wiki
+//! pseudocode places it. (An earlier round rejected the subdivide
+//! bit here, which mis-parsed conformant streams.)
 
 use crate::bitreader::BitReader;
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 /// SVQ1 block hierarchy level. See the table in the module-level
 /// doc-comment for the level → block-size mapping enumerated in
@@ -111,10 +118,15 @@ impl Svq1Level {
         (c as u16) * (r as u16)
     }
 
-    /// `true` for the two top levels (L=4, L=5) — the spec rejects an
-    /// in-place quantised leaf at either, per the wiki spec's
+    /// `true` for the two top levels (L=4, L=5) — a leaf at either
+    /// level cannot carry VQ stages (`N ≥ 1`), per the wiki spec's
     /// `(stages > 0) && (level >= 4)` error branch and the
-    /// §14.10 / §14.11 clean-room resolution.
+    /// §14.10 / §14.11 clean-room resolution (no codebook stored at
+    /// those levels). SKIP (`N = −1`, inter) and mean-only (`N = 0`)
+    /// leaves ARE representable at L=4 / L=5 per
+    /// `docs/video/svq1/spec/03-block-hierarchy.md` §3.8.2; the gate
+    /// this predicate feeds fires on the stage count in the leaf
+    /// decoder, not on the subdivide bit.
     pub const fn rejects_in_place_quantise(self) -> bool {
         matches!(self, Svq1Level::L4 | Svq1Level::L5)
     }
@@ -139,13 +151,22 @@ pub enum Svq1BlockDecision {
 /// Walk one level of the SVQ1 block tree.
 ///
 /// At L=1..=L=5 the function reads ONE bit from `br`. A bit value of
-/// `1` means subdivide; `0` means quantise the block in place. At
-/// L=4 and L=5 a bit value of `0` is rejected with
-/// [`Error::InvalidLevelQuantise`] because — per
-/// `docs/video/svq1/spec/14.10-codebook-L4.md` and
-/// `docs/video/svq1/spec/14.11-codebook-L5.md` — no codebook is
-/// stored at those levels and the wiki spec's
-/// `(stages > 0) && (level >= 4)` error path fires.
+/// `1` means subdivide; `0` means quantise the block in place — at
+/// EVERY level, including L=4 and L=5.
+///
+/// The wiki spec's error branch is `(stages > 0) && (level >= 4)` —
+/// it gates the STAGE COUNT, not the subdivide bit
+/// (`docs/video/svq1/spec/03-block-hierarchy.md` §3.8.2: "a
+/// non-zero stage count is the violation, not a non-subdivide bit
+/// per se … a conforming decoder MAY accept a mean-only leaf at
+/// L=4 or L=5"). Real intra streams DO emit `0`-subdivide bits at
+/// L=5 / L=4 for flat regions (mean-only 16×16 / 16×8 leaves) —
+/// pinned empirically by the black-box conformance fixture in
+/// `tests/svq1_intra_conformance.rs`, in the Validator role
+/// spec/03 §3.10 item 1 called for. The `stages > 0` gate is
+/// enforced by the leaf decoder ([`crate::svq1_plane`]) where the
+/// wiki places it; earlier rounds rejected the subdivide bit here,
+/// which mis-parsed conformant streams.
 ///
 /// At L=0 the function reads zero bits and always returns
 /// [`Svq1BlockDecision::Quantise`] (the wiki spec's
@@ -157,9 +178,6 @@ pub fn read_block_decision(level: Svq1Level, br: &mut BitReader<'_>) -> Result<S
     let bit = br.read_bit()?;
     if bit == 1 {
         return Ok(Svq1BlockDecision::Subdivide);
-    }
-    if level.rejects_in_place_quantise() {
-        return Err(Error::InvalidLevelQuantise(level));
     }
     Ok(Svq1BlockDecision::Quantise)
 }
@@ -185,6 +203,7 @@ pub const fn subdivide(level: Svq1Level) -> Option<(Svq1Level, Svq1Level)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
 
     /// Pack the leading bits of a stream into a single byte, MSB
     /// first, padded with zero bits.
@@ -317,23 +336,23 @@ mod tests {
         }
     }
 
+    /// A `0` bit at L=4 / L=5 is a LEAF decision (spec/03 §3.8.2 —
+    /// mean-only leaves at those levels are representable and real
+    /// intra streams emit them); the `stages > 0 && level >= 4`
+    /// rejection belongs to the leaf decoder, not the walker.
     #[test]
-    fn l4_zero_bit_rejects_with_invalid_level_quantise() {
-        let bytes = pack(&[0]);
-        let mut br = BitReader::new(&bytes);
-        let err = read_block_decision(Svq1Level::L4, &mut br).unwrap_err();
-        assert_eq!(err, Error::InvalidLevelQuantise(Svq1Level::L4));
-        // The error is recorded after the bit has been consumed.
-        assert_eq!(br.bits_consumed(), 1);
-    }
-
-    #[test]
-    fn l5_zero_bit_rejects_with_invalid_level_quantise() {
-        let bytes = pack(&[0]);
-        let mut br = BitReader::new(&bytes);
-        let err = read_block_decision(Svq1Level::L5, &mut br).unwrap_err();
-        assert_eq!(err, Error::InvalidLevelQuantise(Svq1Level::L5));
-        assert_eq!(br.bits_consumed(), 1);
+    fn l4_l5_zero_bit_is_a_leaf_decision() {
+        for level in [Svq1Level::L4, Svq1Level::L5] {
+            let bytes = pack(&[0]);
+            let mut br = BitReader::new(&bytes);
+            let decision = read_block_decision(level, &mut br).unwrap();
+            assert_eq!(
+                decision,
+                Svq1BlockDecision::Quantise,
+                "{level:?} with bit=0 is a leaf; the stage-count gate fires downstream"
+            );
+            assert_eq!(br.bits_consumed(), 1);
+        }
     }
 
     #[test]

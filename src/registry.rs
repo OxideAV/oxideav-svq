@@ -64,6 +64,13 @@ impl From<crate::Error> for Error {
                 "oxideav-svq: SVQ1 bit pattern matched no codeword in the addressed VLC table"
                     .into(),
             ),
+            crate::Error::UnexpectedIntraSkip => Error::InvalidData(
+                "oxideav-svq: SVQ1 stage-count VLC decoded to SKIP on an intra-coded leaf"
+                    .into(),
+            ),
+            crate::Error::ReconstructFailed => Error::InvalidData(
+                "oxideav-svq: SVQ1 leaf-block reconstruction failed".into(),
+            ),
             crate::Error::NotImplemented => Error::unsupported(
                 "oxideav-svq: SVQ1 pixel decode blocked on codebook docs-gap — see crates/oxideav-svq/README.md",
             ),

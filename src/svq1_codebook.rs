@@ -67,22 +67,26 @@
 //! helpers operate only WITHIN a half the caller already isolated, so
 //! they do not depend on the still-open ordering question below.
 //!
-//! ## Open work (not blocked on this crate)
+//! ## Cross-half / cross-level ordering (RESOLVED, Validator role)
 //!
-//! The exact intra-vs-inter ordering and the *cross-half / cross-
-//! level* concatenation order *within* the 23004-byte payload is a
-//! sibling docs spec task — `docs/video/svq1/spec/14-codebook-architecture.md`
-//! §14.8 leaves it as an explicit OPEN item with two unresolved
-//! hypotheses (A: intra-first level-ascending; B: level-major
-//! intra-then-inter), distinguishable only by a Validator round or a
-//! statistical-boundary discrimination not yet performed. Until that
-//! lands, this module exposes the raw payload, per-level byte counts,
-//! and the pinned within-half accessor, but does NOT yet expose a
-//! whole-payload `(level, stage, intra_or_inter, vector_idx) → &[i8]`
-//! accessor — the byte offset of a given half within the contiguous
-//! payload is what §14.8 has not yet fixed.
+//! `docs/video/svq1/spec/14-codebook-architecture.md` §14.8 left the
+//! intra-vs-inter ordering and cross-level concatenation as an OPEN
+//! item with two working hypotheses (A: intra-first level-ascending;
+//! B: level-major intra-then-inter, level-ascending), resolvable by
+//! a Validator round. This crate performed that validation against a
+//! black-box conformance fixture
+//! (`tests/svq1_intra_conformance.rs`): the realised layout is
+//! **level-major DESCENDING (L=3 → L=0), intra half then inter half
+//! per level**, over the canonical 23 040-byte region whose
+//! functional base is `0x5d214` (audit/00 §2.3) — see
+//! [`half_byte_offset_in_payload`] for the offsets + evidence and
+//! [`vector_byte_to_raster`] for the L=2 / L=3 hierarchical
+//! byte→sample tile order the same validation pinned. Both findings
+//! are errata for the §14.8 hypothesis pair / §4.7.1 raster claim
+//! (flagged for the docs staging).
 
 use crate::svq1_blocktree::Svq1Level;
+use crate::svq1_vlc::Svq1Half;
 
 include!(concat!(env!("OUT_DIR"), "/svq1_codebook_data.rs"));
 
@@ -339,6 +343,151 @@ pub fn codebook_vector_in_half(
     let offset = vector_byte_offset_in_half(level, stage, vec_idx)?;
     let vector_length = level.vector_length() as usize;
     half.get(offset..offset + vector_length)
+}
+
+/// Total byte count of the CANONICAL codebook region at file
+/// `0x5d214..0x62c14` of the reference binary — exactly the
+/// `2 × (768 + 1536 + 3072 + 6144) = 23 040` canonical L=0..L=3
+/// intra+inter sum of
+/// `docs/video/svq1/spec/14-codebook-architecture.md` §14.4.
+///
+/// audit/00 §2.3 pinned the codebook's FUNCTIONAL BASE at `0x5d214`
+/// (the single reloc-resolved static pointer from the SVC dispatch
+/// `.text` range) and §2.5 observed the signed-VQ byte character
+/// extends to `0x62c14` (the embedded "BM" bitmap header). The span
+/// between those two audited boundaries is exactly canonical —
+/// closing audit/00 §7 item 1's "16-byte gap" open item: the first
+/// 16 canonical bytes are the block-shape LUT bytes (dual-use), and
+/// the last 20 canonical bytes sit past the `codebook-l0l3.csv`
+/// extraction window (staged locally as `tables/codebook-tail.csv`).
+pub const SVQ1_CODEBOOK_CANONICAL_BYTES: usize = 23040;
+
+/// The full canonical 23 040-byte codebook region (file
+/// `0x5d214..0x62c14`): the 16 block-shape-LUT bytes + the
+/// 23 004-byte `codebook-l0l3.csv` payload + the 20-byte
+/// `codebook-tail.csv` window. See
+/// [`SVQ1_CODEBOOK_CANONICAL_BYTES`] for the boundary derivation.
+pub fn codebook_canonical() -> &'static [i8] {
+    static CELL: std::sync::OnceLock<Vec<i8>> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let mut buf = Vec::with_capacity(SVQ1_CODEBOOK_CANONICAL_BYTES);
+        buf.extend(SVQ1_BLOCK_SHAPE_LUT.iter().map(|&b| b as i8));
+        buf.extend_from_slice(&SVQ1_CODEBOOK_L0L3_BYTES);
+        buf.extend_from_slice(&SVQ1_CODEBOOK_TAIL_BYTES);
+        debug_assert_eq!(buf.len(), SVQ1_CODEBOOK_CANONICAL_BYTES);
+        buf
+    })
+}
+
+/// Byte offset of the `(level, half)` codebook page within the
+/// canonical 23 040-byte region ([`codebook_canonical`]), resolving
+/// the `docs/video/svq1/spec/14-codebook-architecture.md` §14.8
+/// open item ("intra-vs-inter ordering within the payload") in the
+/// Validator role §14.8 called for:
+///
+/// ```text
+///   intra L=3 at     0   inter L=3 at  6144
+///   intra L=2 at 12288   inter L=2 at 15360
+///   intra L=1 at 18432   inter L=1 at 19968
+///   intra L=0 at 21504   inter L=0 at 22272
+/// ```
+///
+/// i.e. **level-major, levels DESCENDING (L=3 → L=0), intra half
+/// then inter half within each level** — neither §14.8 working
+/// hypothesis (both assumed level-ascending). Pinned by three
+/// independent anchors:
+///
+/// 1. The black-box intra conformance fixture
+///    (`tests/svq1_intra_conformance.rs`): single-stage intra
+///    leaves' reference residuals occur VERBATIM in the canonical
+///    region exactly at these page offsets (an L=1 leaf's stage-1
+///    vec-0 residual at canonical 18432 = the L=1 block start; an
+///    L=0 leaf's stage-1 vec-1 residual at 21512 = 21504 + 8), and
+///    the full I-frame reconstructs byte-exact.
+/// 2. The wiki §"Decoding Intraframe Plane Data" worked-example
+///    vectors (stage 1 vec 4 = `7 −16 −10 20 7 −17 −10 20`; stage 2
+///    vec 14 = `−13 −6 −1 −4 25 37 −2 −35`) occur in the region
+///    EXACTLY ONCE each, 208 bytes apart (the stage-major L=0
+///    distance), at offsets placing their page at canonical
+///    `22272..23040` — the L=0 SECOND (inter) half, ending exactly
+///    at the audited `0x62c14` upper boundary. (The wiki narrates
+///    the example on the intraframe path; the bytes live in the
+///    level's second half, so the second half being INTER is pinned
+///    by anchor 1's intra hits at each level's FIRST half.)
+/// 3. The first 16 canonical bytes (the block-shape-LUT dual-use
+///    window) read `4 4 3 2 4 3 3 2 3 3 2 2 3 2 2 1` — a smooth
+///    decaying 4×4 patch, structurally consistent with an intra
+///    L=3 stage-1 vec-0 leading quadrant.
+///
+/// The within-half layout stays the canonical §14.5 stage-major
+/// arithmetic (`stage_idx × 16 × V_L + vec_idx × V_L`), confirmed
+/// by anchor 2 (208-byte distance); the BYTE → SAMPLE order within
+/// one vector is hierarchical for L=2 / L=3 — see
+/// [`vector_byte_to_raster`]. Returns `None` for the absent L=4 /
+/// L=5 levels.
+pub const fn half_byte_offset_in_payload(level: Svq1Level, half: Svq1Half) -> Option<usize> {
+    // Level-major DESCENDING: [L=3 block 12288 B][L=2 block 6144 B]
+    // [L=1 block 3072 B][L=0 block 1536 B]; each level block is
+    // [intra half][inter half].
+    let (intra_off, inter_off) = match level {
+        Svq1Level::L3 => (0usize, 6144),
+        Svq1Level::L2 => (12288, 15360),
+        Svq1Level::L1 => (18432, 19968),
+        Svq1Level::L0 => (21504, 22272),
+        Svq1Level::L4 | Svq1Level::L5 => return None,
+    };
+    match half {
+        Svq1Half::Intra => Some(intra_off),
+        Svq1Half::Inter => Some(inter_off),
+    }
+}
+
+/// Map a codebook-vector BYTE index to its output-raster sample
+/// position within the block, for level `level`.
+///
+/// The vector bytes are NOT stored in whole-block raster order for
+/// the two multi-4×4 levels; they follow the block-subdivision
+/// hierarchy (the same top/bottom-then-left/right split order as
+/// `docs/video/svq1/spec/03-block-hierarchy.md` §3.4), bottoming
+/// out in 4×4 raster tiles:
+///
+/// * **L=3 (8×8):** four 16-byte 4×4 tiles in the order top-left,
+///   top-right, bottom-left, bottom-right.
+/// * **L=2 (8×4):** two 16-byte 4×4 tiles in the order left, right.
+/// * **L=1 (4×4) / L=0 (4×2):** plain raster (the hierarchical
+///   order and the raster order coincide at or below one tile).
+///
+/// Pinned empirically by the black-box intra conformance fixture:
+/// single-stage L=3 leaves' reference residuals equal the addressed
+/// codebook vector under exactly this byte→sample order (and match
+/// NO whole-block-raster window anywhere in the canonical region).
+/// This corrects the whole-block-raster reading of spec/04 §4.7.1 —
+/// an erratum for the docs staging.
+pub const fn vector_byte_to_raster(level: Svq1Level, byte_idx: usize) -> usize {
+    let (block_w, _) = level.block_dims();
+    let block_w = block_w as usize;
+    if block_w <= 4 {
+        // L=0 / L=1: one tile — raster order directly.
+        return byte_idx;
+    }
+    // L=2 / L=3: 16-byte 4×4 tiles. Tile order: L=2 → left, right;
+    // L=3 → top-left, top-right, bottom-left, bottom-right.
+    let tile = byte_idx / 16;
+    let within = byte_idx % 16;
+    let (tile_x, tile_y) = (tile % 2, tile / 2);
+    let (wx, wy) = (within % 4, within / 4);
+    (tile_y * 4 + wy) * block_w + tile_x * 4 + wx
+}
+
+/// Borrow the `(level, half)` codebook page from the canonical
+/// codebook region (see [`half_byte_offset_in_payload`] for the
+/// empirically-pinned page layout). Every page is exactly
+/// `Svq1Level::codebook_bytes_per_half` bytes. Returns `None` for
+/// L=4 / L=5.
+pub fn codebook_half(level: Svq1Level, half: Svq1Half) -> Option<&'static [i8]> {
+    let start = half_byte_offset_in_payload(level, half)?;
+    let len = level.codebook_bytes_per_half()?;
+    codebook_canonical().get(start..start + len)
 }
 
 #[cfg(test)]

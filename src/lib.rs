@@ -482,6 +482,7 @@ pub mod svq1_mc;
 pub mod svq1_mean;
 pub mod svq1_motion_predictor;
 pub mod svq1_mv_cache;
+pub mod svq1_plane;
 pub mod svq1_reconstruct;
 pub mod svq1_stage_indices;
 pub mod svq1_vlc;
