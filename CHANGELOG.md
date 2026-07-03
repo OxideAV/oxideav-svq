@@ -8,6 +8,36 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 383 — SVQ1 P-frame (inter) decode, byte-exact across a
+  six-frame chain.** `svq1_plane` grows the interframe path:
+  `read_mb_mode` (T03), `read_mv_component` / `read_mv_differential`
+  (T02), `decode_inter_plane` (per-MB mode dispatch → SKIP copy /
+  INTER single-MV / INTER_4MV four-MV / INTRA, the spec/06 median MV
+  predictor + `[-32, +31]` clip + per-plane MV cache, half-pel MC
+  baseline via `svq1_mc`, then the breadth-first leaf walk on the
+  inter tables), and `decode_frame` (I / P / B dispatch against an
+  optional reference; new `Error::MissingReference`).
+  `tests/svq1_inter_conformance.rs` decodes a reference-encoder-
+  produced P-frame byte-exact on all three planes against the
+  encoder binary's own decode, plus a six-frame I+5P chain fixture
+  (SKIP + INTER + INTRA mode mix) where every frame predicts from
+  OUR previous reconstruction and lands byte-exact. Two more wire
+  facts pinned in the Validator role (docs errata):
+  1. **spec/06 §6.2.3 Reading B** — the MV component is ONE signed
+     T02 codeword (`position − 32`); no separate sign bit, no
+     distinct peek-bit step (T02's position-32 codeword IS the
+     single `1` bit the wiki's peek-bit describes).
+  2. **audit/01 §7.1 T03 permutation** — the mode alphabet is
+     ROTATED against the wiki numbering: position 3 = SKIP (the
+     1-bit codeword), 0 = INTER, 1 = INTER_4MV, 2 = INTRA
+     (`wiki_mode = (position + 1) mod 4`). SKIP / INTER / INTRA are
+     pinned byte-exact; INTER_4MV holds the remaining position by
+     elimination (the black-box encoder never emits it — flagged
+     as a follow-up for a 4MV-bearing sample).
+  Also pinned byte-exact along the way: the §6.5.1 half-pel
+  `(a + b + 1) >> 1` rounding, §6.7.2 edge replication, the §6.4
+  neighbour geometry, and x-before-y component order.
+
 - **Round 383 — SVQ1 whole-frame intra decode (`svq1_plane`),
   BYTE-EXACT against a black-box reference decode.** The new
   `svq1_plane` module composes every staged layer into the real wire

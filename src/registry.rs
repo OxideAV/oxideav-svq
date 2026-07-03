@@ -71,6 +71,10 @@ impl From<crate::Error> for Error {
             crate::Error::ReconstructFailed => Error::InvalidData(
                 "oxideav-svq: SVQ1 leaf-block reconstruction failed".into(),
             ),
+            crate::Error::MissingReference => Error::InvalidData(
+                "oxideav-svq: SVQ1 P/B frame requires the previous I- or P-frame as reference"
+                    .into(),
+            ),
             crate::Error::NotImplemented => Error::unsupported(
                 "oxideav-svq: SVQ1 pixel decode blocked on codebook docs-gap — see crates/oxideav-svq/README.md",
             ),

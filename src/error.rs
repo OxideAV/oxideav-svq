@@ -74,6 +74,12 @@ pub enum Error {
     /// `docs/video/svq1/spec/14-codebook-architecture.md` §14.4
     /// audit-corrected / audit/00 §7 item 1).
     ReconstructFailed,
+    /// A P / B frame was decoded without a reference frame (or with a
+    /// reference of mismatched geometry). Interframe headers carry no
+    /// dimensions; the previous I- or P-frame supplies both the
+    /// geometry and the prediction planes
+    /// (`docs/video/svq1/spec/06-motion-vectors.md` §6 preamble).
+    MissingReference,
     /// Reserved scaffold variant. Surfaces from API endpoints (codec
     /// registration, frame decode) that the round-1 frame-header
     /// parser has not yet wired up.
@@ -128,6 +134,9 @@ impl core::fmt::Display for Error {
             Error::ReconstructFailed => f.write_str(
                 "oxideav-svq: SVQ1 leaf-block reconstruction failed (codebook lookup out of \
                  range or malformed leaf parameters)",
+            ),
+            Error::MissingReference => f.write_str(
+                "oxideav-svq: SVQ1 P/B frame requires the previous I- or P-frame as reference",
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-svq: clean-room rebuild in progress — see crates/oxideav-svq/README.md",

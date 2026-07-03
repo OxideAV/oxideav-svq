@@ -35,6 +35,9 @@ use crate::error::{Error, Result};
 use crate::header::{parse_frame_header, Svq1FrameHeader, Svq1PictureType};
 use crate::svq1_blocktree::{read_block_decision, subdivide, Svq1BlockDecision, Svq1Level};
 use crate::svq1_codebook::codebook_half;
+use crate::svq1_mc::{motion_compensate_block, Svq1ReferencePlane, MC_BLOCK_DIM};
+use crate::svq1_motion_predictor::Svq1Mv;
+use crate::svq1_mv_cache::Svq1MvCache;
 use crate::svq1_reconstruct::{reconstruct_leaf, LeafStage};
 use crate::svq1_stage_indices::read_stage_indices;
 use crate::svq1_vlc::{read_intra_mean, read_stage_count, Svq1Half};
@@ -388,6 +391,233 @@ pub fn decode_intra_frame(bytes: &[u8]) -> Result<Svq1DecodedFrame> {
     let y = decode_intra_plane(&mut br, width, height)?;
     let u = decode_intra_plane(&mut br, chroma_dim(width), chroma_dim(height))?;
     let v = decode_intra_plane(&mut br, chroma_dim(width), chroma_dim(height))?;
+
+    Ok(Svq1DecodedFrame { header, y, u, v })
+}
+
+// ---- Interframe (P / B) decode ------------------------------------------
+
+/// Interframe macroblock coding mode, per
+/// `docs/video/svq1/spec/02-bitstream-organisation.md` §2.5.1 /
+/// wiki §"Decoding Interframe Plane Data".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Svq1MbMode {
+    /// Block unchanged from the reference frame.
+    Skip,
+    /// One MV for the whole 16×16 block, then the intra-style leaf
+    /// walk on the inter tables over the MC'd baseline.
+    Inter,
+    /// Four MVs (one per 8×8 sub-block), then the leaf walk.
+    Inter4mv,
+    /// Intra-coded macroblock inside a P / B frame.
+    Intra,
+}
+
+/// Read the interframe MB-coding-mode VLC (T03) and map the decoded
+/// alphabet position to its semantic mode.
+///
+/// audit/01 §7.1 left the position → mode permutation open (the
+/// shortest, 1-bit codeword sits at position 3, which under the
+/// wiki's `0 SKIP / 1 INTER / 2 INTER_4MV / 3 INTRA` numbering would
+/// make INTRA — not SKIP — the cheapest mode). The black-box P-frame
+/// conformance fixture (`tests/svq1_inter_conformance.rs`) pins the
+/// answer as audit/01 §3.2 hypothesis (a) — the alphabet IS permuted
+/// against the wiki numbering, by a rotation that puts SKIP on the
+/// 1-bit codeword:
+///
+/// | Position | Code | Mode |
+/// |----------|------|------|
+/// | 3 | `1`   | SKIP |
+/// | 0 | `01`  | INTER |
+/// | 1 | `001` | INTER_4MV |
+/// | 2 | `000` | INTRA |
+///
+/// (equivalently `wiki_mode = (position + 1) mod 4`) — the code
+/// lengths then rank the modes in the natural motion-video
+/// frequency order SKIP > INTER > INTER_4MV ≈ INTRA.
+pub fn read_mb_mode(br: &mut BitReader<'_>) -> Result<Svq1MbMode> {
+    Ok(match crate::svq1_vlc::read_mb_mode_position(br)? {
+        3 => Svq1MbMode::Skip,
+        0 => Svq1MbMode::Inter,
+        1 => Svq1MbMode::Inter4mv,
+        _ => Svq1MbMode::Intra,
+    })
+}
+
+/// Read one differential motion-vector COMPONENT off the wire.
+///
+/// spec/06 §6.2.3 left two readings open: Reading A (the wiki's
+/// peek-bit / magnitude-VLC / sign-bit protocol) vs Reading B (a
+/// single T02 codeword decoding the SIGNED component directly as
+/// `position − 32`). The black-box P-frame conformance fixture pins
+/// **Reading B** — the §6.10 item-1 structural evidence (code-length
+/// symmetry around position 32, the 1-bit codeword at position 32 =
+/// "no motion") was correct. Note Reading B still SUBSUMES the
+/// wiki's peek-bit observation: T02's position-32 codeword is the
+/// single bit `1`, so "if the next bit is 1 the component is 0" is
+/// literally true of the signed VLC as well.
+pub fn read_mv_component(br: &mut BitReader<'_>) -> Result<i32> {
+    Ok(i32::from(crate::svq1_vlc::read_mv_component_position(br)?) - 32)
+}
+
+/// Read one differential motion vector: x component first, then y
+/// (wiki §"Decoding Interframe Plane Data": "the x motion component
+/// for this block is decoded from the stream and added to 0,
+/// followed by the y component").
+pub fn read_mv_differential(br: &mut BitReader<'_>) -> Result<(i32, i32)> {
+    let dx = read_mv_component(br)?;
+    let dy = read_mv_component(br)?;
+    Ok((dx, dy))
+}
+
+/// Copy one 16×16 macroblock region from `reference` into `canvas`
+/// (the SKIP path — wiki: "the block remains unchanged from the
+/// previous I- or P- frame").
+fn copy_mb_from_reference(
+    canvas: &mut Svq1PlaneCanvas,
+    reference: &Svq1PlaneCanvas,
+    mb_x: usize,
+    mb_y: usize,
+) {
+    for row in 0..MB_DIM {
+        let src = (mb_y * MB_DIM + row) * reference.stride + mb_x * MB_DIM;
+        let dst = (mb_y * MB_DIM + row) * canvas.stride + mb_x * MB_DIM;
+        canvas.samples[dst..dst + MB_DIM].copy_from_slice(&reference.samples[src..src + MB_DIM]);
+    }
+}
+
+/// Motion-compensate one 8×8 sub-block from `reference` into
+/// `canvas` at integer-pel position `(base_col, base_row)` with the
+/// half-pel MV `mv` (spec/06 §6.5).
+fn mc_subblock_into(
+    canvas: &mut Svq1PlaneCanvas,
+    reference: &Svq1ReferencePlane<'_>,
+    base_col: usize,
+    base_row: usize,
+    mv: Svq1Mv,
+) {
+    let patch = motion_compensate_block(reference, base_col as i32, base_row as i32, mv);
+    for row in 0..MC_BLOCK_DIM {
+        let dst = (base_row + row) * canvas.stride + base_col;
+        canvas.samples[dst..dst + MC_BLOCK_DIM]
+            .copy_from_slice(&patch[row * MC_BLOCK_DIM..(row + 1) * MC_BLOCK_DIM]);
+    }
+}
+
+/// Decode one INTERFRAME plane payload against `reference` (the
+/// previous I- or P-frame's canvas for the same plane): every
+/// macroblock in raster order reads its T03 coding mode, resolves
+/// its motion (spec/06 — median predictor, `[-32, +31]` clip,
+/// per-plane MV cache), motion-compensates the 16×16 baseline, and
+/// (for INTER / INTER_4MV / INTRA) runs the breadth-first leaf walk
+/// on top per wiki §"Decoding Interframe Plane Data" ("Once the
+/// motion vector is fully decoded and the reference 16x16 block is
+/// copied … repeat the same familiar intraframe decoding process").
+pub fn decode_inter_plane(
+    br: &mut BitReader<'_>,
+    width: usize,
+    height: usize,
+    reference: &Svq1PlaneCanvas,
+) -> Result<Svq1PlaneCanvas> {
+    let mut canvas = Svq1PlaneCanvas::new(width, height);
+    if reference.stride != canvas.stride || reference.rows != canvas.rows {
+        return Err(Error::MissingReference);
+    }
+    let (mb_cols, mb_rows) = canvas.mb_grid();
+    let mut cache = Svq1MvCache::new(mb_cols, mb_rows);
+    let ref_plane = Svq1ReferencePlane::new(&reference.samples, reference.stride, reference.rows)
+        .ok_or(Error::MissingReference)?;
+
+    for mb_y in 0..mb_rows {
+        for mb_x in 0..mb_cols {
+            let (block_row, block_col) = (mb_y * 2, mb_x * 2);
+            match read_mb_mode(br)? {
+                Svq1MbMode::Skip => {
+                    copy_mb_from_reference(&mut canvas, reference, mb_x, mb_y);
+                    cache.store_skip_intra(block_row, block_col);
+                }
+                Svq1MbMode::Intra => {
+                    clear_mb(&mut canvas, mb_x, mb_y);
+                    decode_mb_block_tree(br, &mut canvas, mb_x, mb_y, Svq1Half::Intra)?;
+                    cache.store_skip_intra(block_row, block_col);
+                }
+                Svq1MbMode::Inter => {
+                    let (dx, dy) = read_mv_differential(br)?;
+                    let mv = cache.decode_inter(block_row, block_col, dx, dy);
+                    for (sub_row, sub_col) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
+                        mc_subblock_into(
+                            &mut canvas,
+                            &ref_plane,
+                            (block_col + sub_col) * MC_BLOCK_DIM,
+                            (block_row + sub_row) * MC_BLOCK_DIM,
+                            mv,
+                        );
+                    }
+                    decode_mb_block_tree(br, &mut canvas, mb_x, mb_y, Svq1Half::Inter)?;
+                }
+                Svq1MbMode::Inter4mv => {
+                    // The four differentials are positional on the
+                    // wire; the predictor/store interleave is
+                    // strictly serial inside `decode_inter_4mv`
+                    // (spec/06 §6.4.5).
+                    let mut diffs = [(0i32, 0i32); 4];
+                    for d in &mut diffs {
+                        *d = read_mv_differential(br)?;
+                    }
+                    let mvs = cache.decode_inter_4mv(block_row, block_col, diffs);
+                    // SUBBLOCK_ORDER is top-left, top-right,
+                    // bottom-left, bottom-right (§6.4.4).
+                    for (i, (sub_row, sub_col)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        mc_subblock_into(
+                            &mut canvas,
+                            &ref_plane,
+                            (block_col + sub_col) * MC_BLOCK_DIM,
+                            (block_row + sub_row) * MC_BLOCK_DIM,
+                            mvs[i],
+                        );
+                    }
+                    decode_mb_block_tree(br, &mut canvas, mb_x, mb_y, Svq1Half::Inter)?;
+                }
+            }
+        }
+    }
+    Ok(canvas)
+}
+
+/// Decode a complete SVQ1 frame — I, P, or B — against an optional
+/// reference frame.
+///
+/// I-frames ignore `reference` and carry their own dimensions; P / B
+/// frames REQUIRE `reference` (their headers carry no dimensions —
+/// spec/01; the reference supplies both the geometry and the
+/// prediction planes). B ("droppable") frames use the same forward
+/// prediction as P frames per wiki §"Algorithm Basics" (SVQ1
+/// B-frames are unidirectional) — the only difference is that a B
+/// frame must never BECOME the reference, which is the caller's
+/// frame-management concern (see the registry layer).
+pub fn decode_frame(
+    bytes: &[u8],
+    reference: Option<&Svq1DecodedFrame>,
+) -> Result<Svq1DecodedFrame> {
+    let header = parse_frame_header(bytes)?;
+    if header.picture_type == Svq1PictureType::Intra {
+        return decode_intra_frame(bytes);
+    }
+    let reference = reference.ok_or(Error::MissingReference)?;
+    let width = reference.width();
+    let height = reference.height();
+
+    let mut br = BitReader::new(bytes);
+    for _ in 0..header.header_end_bit {
+        br.read_bit()?;
+    }
+
+    let y = decode_inter_plane(&mut br, width, height, &reference.y)?;
+    let u = decode_inter_plane(&mut br, chroma_dim(width), chroma_dim(height), &reference.u)?;
+    let v = decode_inter_plane(&mut br, chroma_dim(width), chroma_dim(height), &reference.v)?;
 
     Ok(Svq1DecodedFrame { header, y, u, v })
 }
