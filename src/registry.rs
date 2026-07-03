@@ -25,7 +25,7 @@
 
 use oxideav_core::{
     CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag, Decoder,
-    Error, Frame, Packet, ProbeContext, Result, RuntimeContext,
+    Encoder, Error, Frame, Packet, ProbeContext, Result, RuntimeContext,
 };
 
 use crate::header::{parse_frame_header, Svq1FrameHeader};
@@ -106,6 +106,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         CodecInfo::new(CodecId::new(CODEC_ID_STR))
             .capabilities(caps)
             .decoder(make_decoder)
+            .encoder(make_encoder)
             .probe(probe_svq1)
             .tags([CodecTag::fourcc(b"SVQ1"), CodecTag::fourcc(b"svqi")]),
     );
@@ -278,6 +279,226 @@ impl Decoder for Svq1DecoderHandle {
         self.last_header = None;
         self.reference = None;
         self.eof = false;
+        Ok(())
+    }
+}
+
+// ---- Encoder trait impl --------------------------------------------------
+
+/// Factory function the framework calls to instantiate a fresh SVQ1
+/// encoder. Requires video parameters with `width` / `height` set
+/// (≤ 4095 each — the spec/01 12-bit explicit-dimension ceiling).
+///
+/// Input frames are `Yuv420P` [`oxideav_core::VideoFrame`]s (the
+/// bridge layout the decoder side emits); the handle
+/// nearest-neighbour-decimates chroma back onto SVQ1's native 4:1:0
+/// lattice (spec/02 §2.2) — the exact inverse of
+/// [`crate::svq1_plane::Svq1DecodedFrame::to_video_frame_420`]'s
+/// doubling. The first frame (and every
+/// [`Svq1EncoderHandle::keyframe_interval`]-th after it) is coded
+/// intra via the λ-tree ([`crate::svq1_enc_tree`]); the rest are
+/// P-frames through [`crate::svq1_enc_inter::encode_inter_frame`],
+/// chained on the decoder-authoritative reconstruction.
+pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    let width = params.width.unwrap_or(0) as usize;
+    let height = params.height.unwrap_or(0) as usize;
+    if width == 0 || height == 0 || width > 4095 || height > 4095 {
+        return Err(Error::invalid(
+            "oxideav-svq: encoder requires video dimensions in 1..=4095",
+        ));
+    }
+    let mut output_params = CodecParameters::video(params.codec_id.clone());
+    output_params.width = Some(width as u32);
+    output_params.height = Some(height as u32);
+    output_params.pixel_format = params.pixel_format;
+    output_params.frame_rate = params.frame_rate;
+    let output_params = output_params.with_tag(CodecTag::fourcc(b"SVQ1"));
+    Ok(Box::new(Svq1EncoderHandle {
+        codec_id: params.codec_id.clone(),
+        output_params,
+        width,
+        height,
+        lambda: 32,
+        keyframe_interval: 30,
+        frame_index: 0,
+        reference: None,
+        pending: std::collections::VecDeque::new(),
+        eof: false,
+    }))
+}
+
+/// SVQ1 encoder handle bound to a single stream. See [`make_encoder`].
+pub struct Svq1EncoderHandle {
+    codec_id: CodecId,
+    output_params: CodecParameters,
+    width: usize,
+    height: usize,
+    /// Rate weight shared by the intra λ-tree and the inter mode
+    /// decision (SSE units per wire bit).
+    lambda: u64,
+    /// Distance between intra frames; the first frame is always intra.
+    keyframe_interval: u32,
+    frame_index: u32,
+    reference: Option<crate::svq1_plane::Svq1DecodedFrame>,
+    pending: std::collections::VecDeque<Packet>,
+    eof: bool,
+}
+
+impl std::fmt::Debug for Svq1EncoderHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Svq1EncoderHandle")
+            .field("codec_id", &self.codec_id)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("lambda", &self.lambda)
+            .field("keyframe_interval", &self.keyframe_interval)
+            .field("frame_index", &self.frame_index)
+            .field("pending", &self.pending.len())
+            .finish()
+    }
+}
+
+impl Svq1EncoderHandle {
+    /// Set the rate weight λ (SSE units per wire bit; `0` maximises
+    /// fidelity). Direct-API knob — the factory default is `32`.
+    pub fn set_lambda(&mut self, lambda: u64) {
+        self.lambda = lambda;
+    }
+
+    /// Set the intra-frame cadence (`1` = all-intra). Direct-API knob
+    /// — the factory default is `30`.
+    pub fn set_keyframe_interval(&mut self, interval: u32) {
+        self.keyframe_interval = interval.max(1);
+    }
+
+    /// Nearest-neighbour 4:2:0 → 4:1:0 chroma decimation (the exact
+    /// inverse of the decoder bridge's 2×2 doubling).
+    fn decimate_chroma(&self, plane: &oxideav_core::VideoPlane) -> Vec<u8> {
+        let cw20 = self.width.div_ceil(2);
+        let ch20 = self.height.div_ceil(2);
+        let cw10 = crate::svq1_plane::chroma_dim(self.width);
+        let ch10 = crate::svq1_plane::chroma_dim(self.height);
+        let mut out = Vec::with_capacity(cw10 * ch10);
+        for row in 0..ch10 {
+            let src_row = (row * 2).min(ch20 - 1);
+            for col in 0..cw10 {
+                let src_col = (col * 2).min(cw20 - 1);
+                out.push(plane.data[src_row * plane.stride + src_col]);
+            }
+        }
+        out
+    }
+}
+
+impl Encoder for Svq1EncoderHandle {
+    fn codec_id(&self) -> &CodecId {
+        &self.codec_id
+    }
+
+    fn output_params(&self) -> &CodecParameters {
+        &self.output_params
+    }
+
+    fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+        let Frame::Video(video) = frame else {
+            return Err(Error::invalid("oxideav-svq: encoder expects video frames"));
+        };
+        if video.planes.len() != 3 {
+            return Err(Error::invalid(
+                "oxideav-svq: encoder expects 3-plane Yuv420P input",
+            ));
+        }
+        let (cw20, ch20) = (self.width.div_ceil(2), self.height.div_ceil(2));
+        let y_plane = &video.planes[0];
+        if y_plane.stride < self.width
+            || y_plane.data.len() < y_plane.stride * self.height
+            || video.planes[1].stride < cw20
+            || video.planes[1].data.len() < video.planes[1].stride * ch20
+            || video.planes[2].stride < cw20
+            || video.planes[2].data.len() < video.planes[2].stride * ch20
+        {
+            return Err(Error::invalid("oxideav-svq: input plane geometry mismatch"));
+        }
+
+        // Tightly pack the luma plane (drop any stride slack).
+        let y: Vec<u8> = (0..self.height)
+            .flat_map(|row| {
+                y_plane.data[row * y_plane.stride..row * y_plane.stride + self.width]
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        let u = self.decimate_chroma(&video.planes[1]);
+        let v = self.decimate_chroma(&video.planes[2]);
+        let (cw, ch) = (
+            crate::svq1_plane::chroma_dim(self.width),
+            crate::svq1_plane::chroma_dim(self.height),
+        );
+        let yr = crate::svq1_enc::Svq1PlaneRef {
+            samples: &y,
+            width: self.width,
+            height: self.height,
+        };
+        let ur = crate::svq1_enc::Svq1PlaneRef {
+            samples: &u,
+            width: cw,
+            height: ch,
+        };
+        let vr = crate::svq1_enc::Svq1PlaneRef {
+            samples: &v,
+            width: cw,
+            height: ch,
+        };
+
+        let intra_due =
+            self.reference.is_none() || self.frame_index % self.keyframe_interval.max(1) == 0;
+        let (bytes, keyframe) = if intra_due {
+            let bytes = crate::svq1_enc::encode_intra_frame(
+                yr,
+                ur,
+                vr,
+                crate::svq1_enc::Svq1EncoderMode::Adaptive {
+                    lambda: self.lambda,
+                },
+            )?;
+            self.reference = Some(crate::svq1_plane::decode_intra_frame(&bytes)?);
+            (bytes, true)
+        } else {
+            let reference = self.reference.as_ref().expect("reference present");
+            let encoded = crate::svq1_enc_inter::encode_inter_frame(
+                yr,
+                ur,
+                vr,
+                reference,
+                &crate::svq1_enc_inter::Svq1InterParams {
+                    lambda: self.lambda,
+                    temporal_reference: (self.frame_index & 0xff) as u8,
+                    ..Default::default()
+                },
+            )?;
+            self.reference = Some(encoded.reconstruction);
+            (encoded.bytes, false)
+        };
+        self.frame_index = self.frame_index.wrapping_add(1);
+
+        let mut packet =
+            Packet::new(0, oxideav_core::TimeBase::MICROS, bytes).with_keyframe(keyframe);
+        packet.pts = video.pts;
+        packet.dts = video.pts;
+        self.pending.push_back(packet);
+        Ok(())
+    }
+
+    fn receive_packet(&mut self) -> Result<Packet> {
+        match self.pending.pop_front() {
+            Some(packet) => Ok(packet),
+            None if self.eof => Err(Error::Eof),
+            None => Err(Error::NeedMore),
+        }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.eof = true;
         Ok(())
     }
 }
@@ -463,6 +684,111 @@ mod tests {
     use super::*;
     use crate::header::Svq1PictureType;
     use oxideav_core::TimeBase;
+
+    /// Build Yuv420P video parameters for the encoder factory.
+    fn encoder_params(width: u32, height: u32) -> CodecParameters {
+        let mut params = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));
+        params.width = Some(width);
+        params.height = Some(height);
+        params
+    }
+
+    /// Build a synthetic Yuv420P frame with deterministic content.
+    fn synthetic_frame(width: usize, height: usize, seed: u32, pts: i64) -> Frame {
+        let plane = |w: usize, h: usize, s: u32| -> oxideav_core::VideoPlane {
+            oxideav_core::VideoPlane {
+                stride: w,
+                data: (0..w * h)
+                    .map(|i| {
+                        let x = (i % w) as u32;
+                        let y = (i / w) as u32;
+                        ((x * 3 + y * 5 + s) % 256) as u8
+                    })
+                    .collect(),
+            }
+        };
+        let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+        Frame::Video(oxideav_core::VideoFrame {
+            pts: Some(pts),
+            planes: vec![
+                plane(width, height, seed),
+                plane(cw, ch, seed + 60),
+                plane(cw, ch, seed + 120),
+            ],
+        })
+    }
+
+    /// `make_encoder` → `make_decoder` round trip: an I + 2P sequence
+    /// encodes through the registry Encoder trait and decodes through
+    /// the registry Decoder trait; frame 0 is a keyframe, P-frames
+    /// are not; every decoded frame carries the right geometry.
+    #[test]
+    fn registry_encoder_round_trips_through_registry_decoder() {
+        let (width, height) = (64usize, 48usize);
+        let params = encoder_params(width as u32, height as u32);
+        let mut encoder = make_encoder(&params).expect("encoder builds");
+        assert_eq!(encoder.codec_id().as_str(), "svq1");
+        assert_eq!(encoder.output_params().width, Some(width as u32));
+
+        let mut decoder = make_decoder(&params).expect("decoder builds");
+        for (i, seed) in [7u32, 9, 11].into_iter().enumerate() {
+            encoder
+                .send_frame(&synthetic_frame(width, height, seed, i as i64))
+                .expect("frame accepted");
+            let packet = encoder.receive_packet().expect("packet produced");
+            assert_eq!(packet.flags.keyframe, i == 0, "frame {i} keyframe flag");
+            assert_eq!(packet.pts, Some(i as i64));
+
+            decoder.send_packet(&packet).expect("packet accepted");
+            let Frame::Video(video) = decoder.receive_frame().expect("frame decodes") else {
+                panic!("expected a video frame");
+            };
+            assert_eq!(video.planes[0].stride, width, "frame {i} luma stride");
+            assert_eq!(
+                video.planes[0].data.len(),
+                width * height,
+                "frame {i} luma size"
+            );
+            assert_eq!(video.pts, Some(i as i64));
+        }
+        encoder.flush().expect("flush ok");
+        assert!(matches!(encoder.receive_packet(), Err(Error::Eof)));
+    }
+
+    /// The registry encoder is registered under the `svq1` id.
+    #[test]
+    fn registers_svq1_encoder_id() {
+        let mut ctx = RuntimeContext::new();
+        super::register(&mut ctx);
+        assert!(ctx.codecs.encoder_ids().any(|id| id.as_str() == "svq1"));
+    }
+
+    /// Bad geometry / non-video input is rejected.
+    #[test]
+    fn encoder_rejects_bad_input() {
+        assert!(make_encoder(&encoder_params(0, 48)).is_err());
+        assert!(make_encoder(&encoder_params(64, 4096)).is_err());
+        let mut encoder = make_encoder(&encoder_params(64, 48)).expect("builds");
+        // Undersized luma plane.
+        let bad = Frame::Video(oxideav_core::VideoFrame {
+            pts: None,
+            planes: vec![
+                oxideav_core::VideoPlane {
+                    stride: 64,
+                    data: vec![0u8; 64],
+                },
+                oxideav_core::VideoPlane {
+                    stride: 32,
+                    data: vec![0u8; 32 * 24],
+                },
+                oxideav_core::VideoPlane {
+                    stride: 32,
+                    data: vec![0u8; 32 * 24],
+                },
+            ],
+        });
+        assert!(encoder.send_frame(&bad).is_err());
+    }
 
     /// Helper: pack a sequence of `(width, value)` items into a byte
     /// stream by writing them MSB-first. Mirrors the helper used by

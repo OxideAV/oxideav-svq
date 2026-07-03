@@ -546,8 +546,8 @@ pub use crate::header::{
 
 #[cfg(feature = "registry")]
 pub use crate::registry::{
-    __oxideav_entry, make_decoder, make_svq3_decoder, probe_svq1, probe_svq3, register,
-    register_codecs, Svq1DecoderHandle, Svq3DecoderHandle,
+    __oxideav_entry, make_decoder, make_encoder, make_svq3_decoder, probe_svq1, probe_svq3,
+    register, register_codecs, Svq1DecoderHandle, Svq1EncoderHandle, Svq3DecoderHandle,
 };
 
 /// Stable codec id used in the framework registry for SVQ1.

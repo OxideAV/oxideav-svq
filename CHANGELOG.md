@@ -93,6 +93,19 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "INTER_4MV macroblocks decode but have no real-stream fixture"
   tail.
 
+- **Round 386 — registry `Encoder` integration
+  (`make_encoder` / `Svq1EncoderHandle`).** The SVQ1 registration
+  now carries an encoder factory alongside the decoder: `Yuv420P`
+  input frames are nearest-neighbour-decimated back onto the native
+  4:1:0 lattice (the exact inverse of the decoder bridge's
+  doubling), the first frame and every `keyframe_interval`-th after
+  it is coded intra via the λ-tree, and the rest are P-frames
+  chained on the decoder-authoritative reconstruction. Packets
+  carry the keyframe flag and pass-through PTS; `set_lambda` /
+  `set_keyframe_interval` expose the direct-API knobs. Registry
+  round-trip (encode through `Encoder`, decode through `Decoder`)
+  is CI-pinned.
+
 - **Round 383 — SVQ1 intra encoder (`svq1_enc`), cross-validated
   against the black-box reference decoder.** Implements the staged
   encoder companion's bring-up ladder
