@@ -8,6 +8,19 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 383 — SVQ1 overhang-dimension conformance + corrupt-stream
+  robustness.** A 160×120 I+2P black-box chain fixture
+  (`tests/svq1_overhang_conformance.rs`) decodes byte-exact on all
+  planes: 160×120 is `frame_size_code = 0` with a non-multiple-of-16
+  Y height and 40×30 chroma planes, so the bottom macroblock rows
+  overhang the visible frame — pinning spec/02 §2.8 item 1 as
+  **decode-and-discard** (full 16×16 macroblocks are coded over the
+  overhang; the visible crop matches the reference). A companion
+  robustness test sweeps truncations of a conformant frame at every
+  byte boundary, a deterministic pseudo-random byte soup, and a
+  bit-flip sweep over the frame head — every case errors cleanly
+  (no panics, no loops).
+
 - **Round 383 — SVQ1 `receive_frame` — the registry decoder returns
   real pixels.** `Svq1DecoderHandle::receive_frame` now runs the full
   `svq1_plane::decode_frame` pipeline against the handle's held
