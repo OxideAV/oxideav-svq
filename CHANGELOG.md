@@ -6,6 +6,93 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-svq/releases/tag/v0.0.2) - 2026-07-03
+
+### Other
+
+- Release 0.0.2 to get release-plz working
+- r386 rollup — full SVQ1 I/P/B encoder, black-box byte-exact
+- droppable (B) frame encoding, reference-transparency wire-validated
+- SVQ1 Encoder integration (make_encoder / Svq1EncoderHandle)
+- svq1 tests: INTER_4MV black-box conformance fixture (I+3P quadrant-motion chain)
+- INTER_4MV encoding — four serial per-8x8 MVs, black-box cross-validated
+- P-frame encoder (SKIP/INTER/INTRA + MV search), black-box cross-validated
+- adaptive lambda-cost block-tree encoder over the full spec/03 hierarchy
+- multi-stage codebook search (spec/04 §4.5 inverse), black-box cross-validated
+- svq1_enc intra encoder row
+- intra encoder (mean-only L5/L3 + one-stage L3), black-box cross-validated
+- README + crate-doc rollup — SVQ1 decoder complete for the I/P forward path
+- 160x120 overhang conformance (decode-and-discard) + corrupt-stream robustness
+- Svq1DecoderHandle::receive_frame returns decoded frames
+- P-frame inter decode, byte-exact across a six-frame chain
+- whole-frame intra decode, byte-exact vs black-box reference decode
+- all sixteen wire VLC tables (T00..T15) + verified prefix-code decoder
+- README — picture-plane assembly + intra frame-walk subsystem
+- Svq3Picture → inter-MC reference-plane views (luma/chroma_reference)
+- Svq3Picture → oxideav_core::VideoFrame bridge (Yuv420P)
+- whole-picture intra frame-walk skeleton (reconstruct_intra_frame)
+- picture-aware intra-MB driver (reconstruct_intra_macroblock_into)
+- picture-plane assembly canvas (Svq3Picture) — MB-raster neighbour bind + blit-back
+- document round 374 SVQ1 + SVQ3 motion-compensation reference path
+- L=3 inter sub-block reconstruction (MC predictor + leaf)
+- half-pel motion-compensation reference sampling
+- full-pel inter block predictor (MV -> predicted block)
+- whole-block thirdpel interpolation
+- motion-vector sixths-grid decomposition
+- reference-plane integer-pel block fetch with edge clamping
+- README round-365 SVQ3 status rollup
+- macroblock-grid geometry + per-MB neighbour availability
+- intra-luma DC scale residual path
+- bitstream-driven intra-4x4 luma macroblock reconstruction
+- intra-4x4 prediction-mode VLC wire decode + per-MB mode driver
+- whole intra-macroblock reconstruction composition (all 3 planes)
+- intra chroma 8×8 plane reconstruction (spec/01 Gap 2/4/5)
+- intra-16×16 luma macroblock reconstruction (spec/01 Gap 2/4/5)
+- README — document landed MV-difference entropy layer + scope CBP gap
+- inter-macroblock motion-header composition
+- signed-Golomb entropy layer — MV-difference + quant-delta wire decode
+- README — spec/01 Gap 2 residual interleave + end-to-end composition landed
+- integration test — coefficient stream to reconstructed plane
+- per-block reconstruction composition end-to-end from coefficients
+- residual interleave per-element formula (spec/01 Gap 2)
+- macroblock-level intra predictor-selection loop (svq3_recon)
+- 16×16 plane (transposed) + 8×8 chroma DC predictors (spec/01 Gap 4)
+- 4×4 intra-mode binding + standard-H.264 predictors (spec/01 Gap 3)
+- predicted+residual writeback composition (spec/01 Gap 5)
+- land the two 4×4 coefficient scan-order arrays + selection rule
+- r326 motion-vector cache + neighbour-selection geometry (spec/06 §6.8/§6.4.3/§6.4.4)
+- r320 motion-vector median-of-three predictor (spec/06 §6.4/§6.6)
+- leaf stage-accumulation reconstruction (spec/04 §4.5)
+- refresh to current status, drop per-round changelog cruft
+- round 310 — chroma DC full dequantization pipeline
+- within-half codebook-vector accessor (spec §14.5 + §14.8)
+- scrub pre-existing enumerated denials naming FFmpeg/libav*/Sorenson-SDK/MPlayer
+- round 295 — two-sided transform M·X·M^T composition
+- round 290 — transform row-multiply (X·Mᵀ) passes
+- round 282 — 4×4 diagonal-down intra predictor (svq3_pred)
+- 4×4 luma transform application helpers (single-sided M·X)
+- Round 262 — SVQ3 2×2 chroma DC transform application helper
+- drop release-plz.toml — use release-plz defaults across the workspace
+- Round 245 — SVQ3 alt-scan two-half block walker
+- Round 242 — SVQ1 per-stage codebook-index field reader (§4.2)
+- Round 239 — SVQ1 mean-step saturating arithmetic
+- Round 233 — SVQ3 per-block coefficient placement (scan-order infrastructure)
+- Round 230 — SVQ3 macroblock transform + dequantization arithmetic
+- round 224 — SVQ3 sub-pixel thirdpel interpolation arithmetic
+- round 217 — SVQ1 u16-LE parameter table (512 records) mirrored
+- round 203 — SVQ1 saturating-clip + bit-mask helper LUTs
+- round 197 — SVQ1 L=4/L=5 codebook ABSENCE wired end-to-end
+- round 9 — SVQ1 L=0..L=3 codebook payload landed
+- round 8 — SVQ1 block-tree subdivision walker (structural)
+- round 7 — SVQ3 intra-4x4 predictor-from-neighbour resolution helper
+- round 6 — SVQ3 inter-MB motion-vector precision selector
+- round 5 — SVQ3 residual coefficient walker (structural)
+- round 4 — SVQ3 macroblock-type tree walk (structural)
+- round 3 — SVQ3 SEQH + slice-header parser, structural
+- round 2 — oxideav-core framework integration
+- Round 1 — SVQ1 frame-header parser
+- Round 0 — clean-room rebuild scaffold (orphan master)
+
 ### Added
 
 - **Round 386 — SVQ1 multi-stage codebook search
