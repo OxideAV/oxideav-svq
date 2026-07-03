@@ -67,6 +67,21 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reference-encoder stream we hold) are now positively validated on
   the wire.
 
+- **Round 386 — SVQ1 INTER_4MV encoding (four serial per-8×8 MVs).**
+  The encoder now evaluates the fourth macroblock mode: per
+  sub-block, the §6.4.4 neighbour predictor is computed against a
+  TRIAL MV cache that is updated after each sub-block's search
+  (mirroring the decoder's §6.4.5 serial interleave via the new
+  `Svq1MvCache::store_subblock`), each 8×8 sub-block gets its own
+  two-phase motion search inside its own visible-reference window,
+  and the four differentials go on the wire in `SUBBLOCK_ORDER`
+  before the inter-half leaf tree over the composite baseline. On
+  quadrant-divergent motion the mode cuts P-frames ~5× (1357/1178/
+  1076 bytes vs 6744/6112/4985 single-MV) and the whole chain
+  decodes byte-identical to the reference decoder binary — the
+  first positive wire validation of INTER_4MV in either direction
+  (no reference-encoder stream we hold ever emits the mode).
+
 - **Round 383 — SVQ1 intra encoder (`svq1_enc`), cross-validated
   against the black-box reference decoder.** Implements the staged
   encoder companion's bring-up ladder

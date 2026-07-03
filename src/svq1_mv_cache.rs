@@ -251,6 +251,21 @@ impl Svq1MvCache {
         }
     }
 
+    /// Store ONE 8×8 sub-block slot (`index` per [`SUBBLOCK_ORDER`])
+    /// of the macroblock at `(row, col)` — the encoder-side
+    /// counterpart of the §6.4.5 serial decode: an INTER_4MV encoder
+    /// must commit sub-block `i`'s chosen MV into the cache BEFORE
+    /// computing sub-block `i + 1`'s §6.4.4 predictor, exactly as the
+    /// decoder's [`Self::decode_inter_4mv`] interleaves its stores.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= 4`.
+    pub fn store_subblock(&mut self, row: usize, col: usize, index: usize, mv: Svq1Mv) {
+        let (dr, dc) = SUBBLOCK_ORDER[index];
+        self.set(row + dr, col + dc, mv);
+    }
+
     /// Decode the single INTER-mode MV of the macroblock at
     /// `(row, col)`: compute the §6.4.3 predictor, add the supplied
     /// differential `(dx, dy)`, clip to `[-32, +31]` (§6.6), broadcast

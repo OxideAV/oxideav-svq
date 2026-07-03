@@ -56,7 +56,7 @@ use crate::svq1_enc::{BitWriter, Svq1PlaneRef};
 use crate::svq1_enc_tree::{emit_macroblock, plan_macroblock, MbPlan};
 use crate::svq1_mc::{motion_compensate_block, Svq1ReferencePlane, MC_BLOCK_DIM};
 use crate::svq1_motion_predictor::{predict, Svq1Mv, MV_COMPONENT_MAX, MV_COMPONENT_MIN};
-use crate::svq1_mv_cache::Svq1MvCache;
+use crate::svq1_mv_cache::{Svq1MvCache, SUBBLOCK_ORDER};
 use crate::svq1_plane::{chroma_dim, decode_frame, Svq1DecodedFrame, Svq1PlaneCanvas, MB_DIM};
 use crate::svq1_vlc::Svq1Half;
 
@@ -70,6 +70,9 @@ pub struct Svq1InterParams {
     /// (candidates stay inside the `[-32, +31]` half-pel MV and
     /// differential domains regardless).
     pub search_radius: u8,
+    /// Evaluate the INTER_4MV candidate (four per-8×8 MVs, spec/06
+    /// §6.1) alongside SKIP / INTER / INTRA.
+    pub allow_4mv: bool,
     /// 8-bit temporal reference emitted in the frame header.
     pub temporal_reference: u8,
 }
@@ -79,6 +82,7 @@ impl Default for Svq1InterParams {
         Self {
             lambda: 32,
             search_radius: 8,
+            allow_4mv: true,
             temporal_reference: 0,
         }
     }
@@ -100,6 +104,7 @@ pub struct Svq1EncodedFrame {
 /// [`crate::svq1_plane::read_mb_mode`]).
 const T03_POS_SKIP: usize = 3;
 const T03_POS_INTER: usize = 0;
+const T03_POS_INTER_4MV: usize = 1;
 const T03_POS_INTRA: usize = 2;
 
 /// Bit length of the T03 codeword at `position`.
@@ -146,9 +151,20 @@ fn mc_macroblock(
     out
 }
 
-/// Sum of absolute differences of a 16×16 candidate against the
-/// target (the cheap phase-1 motion metric).
-fn sad(target: &[u8; 256], candidate: &[u8; 256]) -> u64 {
+/// Motion-compensate one 8×8 sub-block at integer-pel position
+/// `(x0_px, y0_px)` (the INTER_4MV per-sub-block predictor shape of
+/// spec/04 §4.6.3).
+fn mc_subblock(
+    reference: &Svq1ReferencePlane<'_>,
+    x0_px: usize,
+    y0_px: usize,
+    mv: Svq1Mv,
+) -> Vec<u8> {
+    motion_compensate_block(reference, x0_px as i32, y0_px as i32, mv)
+}
+
+/// Sum of absolute differences (the cheap phase-1 motion metric).
+fn sad(target: &[u8], candidate: &[u8]) -> u64 {
     target
         .iter()
         .zip(candidate.iter())
@@ -195,21 +211,34 @@ pub(crate) struct MvVisibleWindow {
 }
 
 impl MvVisibleWindow {
-    /// Window for the macroblock at `(mb_x, mb_y)` of a
-    /// `visible_w × visible_h` plane.
-    pub(crate) fn new(mb_x: usize, mb_y: usize, visible_w: usize, visible_h: usize) -> Self {
-        let x0 = (mb_x * MB_DIM) as i32;
-        let y0 = (mb_y * MB_DIM) as i32;
+    /// Window for the `dim × dim` block whose top-left sample is at
+    /// `(x0_px, y0_px)` of a `visible_w × visible_h` plane (`dim` is
+    /// 16 for whole macroblocks, 8 for INTER_4MV sub-blocks).
+    pub(crate) fn for_block(
+        x0_px: usize,
+        y0_px: usize,
+        dim: usize,
+        visible_w: usize,
+        visible_h: usize,
+    ) -> Self {
+        let x0 = x0_px as i32;
+        let y0 = y0_px as i32;
         let vw = visible_w as i32;
         let vh = visible_h as i32;
         Self {
             x0,
             y0,
-            xlast: (x0 + MB_DIM as i32 - 1).min(vw - 1),
-            ylast: (y0 + MB_DIM as i32 - 1).min(vh - 1),
+            xlast: (x0 + dim as i32 - 1).min(vw - 1),
+            ylast: (y0 + dim as i32 - 1).min(vh - 1),
             vw,
             vh,
         }
+    }
+
+    /// Window for the macroblock at `(mb_x, mb_y)` of a
+    /// `visible_w × visible_h` plane.
+    pub(crate) fn new(mb_x: usize, mb_y: usize, visible_w: usize, visible_h: usize) -> Self {
+        Self::for_block(mb_x * MB_DIM, mb_y * MB_DIM, MB_DIM, visible_w, visible_h)
     }
 
     /// `true` when every visible output of the MB reads only visible
@@ -222,27 +251,37 @@ impl MvVisibleWindow {
     }
 }
 
-/// Two-phase motion search for one macroblock: full-pel SAD scan of
-/// radius `radius` centred on the median `predictor` (plus the zero
-/// vector), then ±1 half-pel refinement. Returns the best codable MV
-/// inside the visible-reference `window`.
+/// Two-phase motion search for one block (a whole 16×16 macroblock
+/// or one 8×8 INTER_4MV sub-block, selected by `dim`): full-pel SAD
+/// scan of radius `radius` centred on the median `predictor` (plus
+/// the zero vector), then ±1 half-pel refinement. Returns the best
+/// codable MV inside the visible-reference `window`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn search_motion_vector(
     reference: &Svq1ReferencePlane<'_>,
-    target: &[u8; 256],
-    block_row: usize,
-    block_col: usize,
+    target: &[u8],
+    dim: usize,
+    x0_px: usize,
+    y0_px: usize,
     predictor: Svq1Mv,
     radius: u8,
     window: MvVisibleWindow,
 ) -> Svq1Mv {
+    debug_assert_eq!(target.len(), dim * dim);
     let mut best = Svq1Mv::ZERO;
     let mut best_sad = u64::MAX;
     let consider = |mv: Svq1Mv, best: &mut Svq1Mv, best_sad: &mut u64| {
         if !mv_is_codable(mv, predictor) || !window.permits(mv) {
             return;
         }
-        let candidate = mc_macroblock(reference, block_row, block_col, mv);
-        let s = sad(target, &candidate);
+        let s = if dim == MB_DIM {
+            let candidate =
+                mc_macroblock(reference, y0_px / MC_BLOCK_DIM, x0_px / MC_BLOCK_DIM, mv);
+            sad(target, &candidate)
+        } else {
+            let candidate = mc_subblock(reference, x0_px, y0_px, mv);
+            sad(target, &candidate)
+        };
         if s < *best_sad {
             *best_sad = s;
             *best = mv;
@@ -281,8 +320,8 @@ pub(crate) fn search_motion_vector(
 struct MbCandidate {
     /// T03 alphabet position to emit.
     t03_position: usize,
-    /// Differential MV to emit (INTER only).
-    mv_diff: Option<(i32, i32)>,
+    /// Motion payload to emit.
+    motion: MbMotion,
     /// Leaf tree to emit (None for MB-level SKIP).
     plan: Option<MbPlan>,
     /// Half the plan's leaves are coded on.
@@ -291,6 +330,20 @@ struct MbCandidate {
     bits: u32,
     /// SSE against the source target.
     sse: u64,
+}
+
+/// Motion payload of one macroblock candidate.
+enum MbMotion {
+    /// SKIP / INTRA — no MV on the wire.
+    None,
+    /// INTER — one differential, broadcast MV (spec/06 §6.1).
+    One { diff: (i32, i32), mv: Svq1Mv },
+    /// INTER_4MV — four serial differentials in [`SUBBLOCK_ORDER`]
+    /// order (spec/06 §6.4.4 / §6.4.5).
+    Four {
+        diffs: [(i32, i32); 4],
+        mvs: [Svq1Mv; 4],
+    },
 }
 
 impl MbCandidate {
@@ -336,7 +389,7 @@ fn encode_inter_plane(
             }
             let skip = MbCandidate {
                 t03_position: T03_POS_SKIP,
-                mv_diff: None,
+                motion: MbMotion::None,
                 plan: None,
                 half: Svq1Half::Inter,
                 bits: mb_mode_bits(T03_POS_SKIP),
@@ -349,8 +402,9 @@ fn encode_inter_plane(
             let mv = search_motion_vector(
                 &ref_plane,
                 &target,
-                block_row,
-                block_col,
+                MB_DIM,
+                mb_x * MB_DIM,
+                mb_y * MB_DIM,
                 predictor,
                 params.search_radius,
                 window,
@@ -361,7 +415,7 @@ fn encode_inter_plane(
                 plan_macroblock(&target, &mc_baseline, Svq1Half::Inter, true, params.lambda);
             let inter = MbCandidate {
                 t03_position: T03_POS_INTER,
-                mv_diff: Some((dx, dy)),
+                motion: MbMotion::One { diff: (dx, dy), mv },
                 bits: mb_mode_bits(T03_POS_INTER)
                     + mv_component_bits(dx)
                     + mv_component_bits(dy)
@@ -376,33 +430,100 @@ fn encode_inter_plane(
                 plan_macroblock(&target, &[0u8; 256], Svq1Half::Intra, false, params.lambda);
             let intra = MbCandidate {
                 t03_position: T03_POS_INTRA,
-                mv_diff: None,
+                motion: MbMotion::None,
                 bits: mb_mode_bits(T03_POS_INTRA) + intra_plan.bits,
                 sse: intra_plan.sse,
                 plan: Some(intra_plan),
                 half: Svq1Half::Intra,
             };
 
+            let mut candidates = vec![skip, inter, intra];
+
+            // INTER_4MV: serial per-sub-block search on a TRIAL cache
+            // (the §6.4.4 predictors of sub-blocks 2..4 depend on the
+            // just-chosen earlier MVs, mirroring the §6.4.5 serial
+            // decode).
+            if params.allow_4mv {
+                let mut trial = cache.clone();
+                let mut diffs = [(0i32, 0i32); 4];
+                let mut mvs = [Svq1Mv::ZERO; 4];
+                let mut baseline = [0u8; 256];
+                let mut mv_bits = 0u32;
+                for (i, (sub_row, sub_col)) in SUBBLOCK_ORDER.iter().enumerate() {
+                    let x0_px = (block_col + sub_col) * MC_BLOCK_DIM;
+                    let y0_px = (block_row + sub_row) * MC_BLOCK_DIM;
+                    let mut sub_target = [0u8; 64];
+                    for row in 0..MC_BLOCK_DIM {
+                        let src_off = (sub_row * 8 + row) * 16 + sub_col * 8;
+                        sub_target[row * 8..row * 8 + 8]
+                            .copy_from_slice(&target[src_off..src_off + 8]);
+                    }
+                    let pred = predict(trial.inter_4mv_neighbours(block_row, block_col, i));
+                    let sub_window = MvVisibleWindow::for_block(
+                        x0_px,
+                        y0_px,
+                        MC_BLOCK_DIM,
+                        src.width,
+                        src.height,
+                    );
+                    let sub_mv = search_motion_vector(
+                        &ref_plane,
+                        &sub_target,
+                        MC_BLOCK_DIM,
+                        x0_px,
+                        y0_px,
+                        pred,
+                        params.search_radius,
+                        sub_window,
+                    );
+                    diffs[i] = (sub_mv.x - pred.x, sub_mv.y - pred.y);
+                    mvs[i] = sub_mv;
+                    mv_bits += mv_component_bits(diffs[i].0) + mv_component_bits(diffs[i].1);
+                    trial.store_subblock(block_row, block_col, i, sub_mv);
+                    let patch = mc_subblock(&ref_plane, x0_px, y0_px, sub_mv);
+                    for row in 0..MC_BLOCK_DIM {
+                        let dst = (sub_row * 8 + row) * 16 + sub_col * 8;
+                        baseline[dst..dst + 8].copy_from_slice(&patch[row * 8..row * 8 + 8]);
+                    }
+                }
+                let plan =
+                    plan_macroblock(&target, &baseline, Svq1Half::Inter, true, params.lambda);
+                candidates.push(MbCandidate {
+                    t03_position: T03_POS_INTER_4MV,
+                    motion: MbMotion::Four { diffs, mvs },
+                    bits: mb_mode_bits(T03_POS_INTER_4MV) + mv_bits + plan.bits,
+                    sse: plan.sse,
+                    plan: Some(plan),
+                    half: Svq1Half::Inter,
+                });
+            }
+
             // Commit the λ-cost winner (bits break ties).
-            let winner = [skip, inter, intra]
+            let winner = candidates
                 .into_iter()
                 .min_by(|a, b| {
                     a.cost(params.lambda)
                         .cmp(&b.cost(params.lambda))
                         .then(a.bits.cmp(&b.bits))
                 })
-                .expect("three candidates");
+                .expect("at least three candidates");
 
             w.push_code(&SVQ1_VLC_MB_MODE.0, winner.t03_position);
-            match winner.t03_position {
-                T03_POS_SKIP | T03_POS_INTRA => {
+            match winner.motion {
+                MbMotion::None => {
                     cache.store_skip_intra(block_row, block_col);
                 }
-                _ => {
-                    let (dx, dy) = winner.mv_diff.expect("INTER carries an MV");
+                MbMotion::One { diff: (dx, dy), mv } => {
                     push_mv_differential(w, dx, dy);
                     let stored = cache.decode_inter(block_row, block_col, dx, dy);
                     debug_assert_eq!(stored, mv, "cache reproduces the searched MV");
+                }
+                MbMotion::Four { diffs, mvs } => {
+                    for &(dx, dy) in &diffs {
+                        push_mv_differential(w, dx, dy);
+                    }
+                    let stored = cache.decode_inter_4mv(block_row, block_col, diffs);
+                    debug_assert_eq!(stored, mvs, "cache reproduces the searched MVs");
                 }
             }
             if let Some(plan) = &winner.plan {
@@ -653,6 +774,84 @@ mod tests {
             );
             reference = p.reconstruction;
         }
+    }
+
+    /// Divergent per-quadrant motion: build a source whose four 8×8
+    /// sub-blocks of each macroblock move by DIFFERENT amounts, so a
+    /// single 16×16 MV cannot capture the field. The 4MV-enabled
+    /// encode must decode byte-exact (independent decode == returned
+    /// reconstruction) and must not lose to the 4MV-disabled encode
+    /// in reconstruction SSE.
+    #[test]
+    fn divergent_quadrant_motion_round_trips_with_4mv() {
+        let (cw, ch) = (chroma_dim(W), chroma_dim(H));
+        let y0 = gradient_plane(W, H, 7);
+        let u0 = gradient_plane(cw, ch, 101);
+        let v0 = gradient_plane(cw, ch, 202);
+        let reference = intra_reference(&y0, &u0, &v0);
+
+        // Per-quadrant shift: quadrant (qx, qy) of each MB moves by
+        // (qx * 2 + 1, qy * 2) integer pels — four distinct MVs.
+        let ry = reference.y.visible();
+        let mut y1 = vec![0u8; W * H];
+        for row in 0..H {
+            for col in 0..W {
+                let (qx, qy) = ((col % 16) / 8, (row % 16) / 8);
+                let sx = col.saturating_sub(qx * 2 + 1).min(W - 1);
+                let sy = row.saturating_sub(qy * 2).min(H - 1);
+                y1[row * W + col] = ry[sy * W + sx];
+            }
+        }
+        let u1 = reference.u.visible();
+        let v1 = reference.v.visible();
+        let (yr, ur, vr) = plane_refs(&y1, &u1, &v1);
+
+        let with_4mv = encode_inter_frame(
+            yr,
+            ur,
+            vr,
+            &reference,
+            &Svq1InterParams {
+                lambda: 24,
+                ..Default::default()
+            },
+        )
+        .expect("4MV encodes");
+        let without_4mv = encode_inter_frame(
+            yr,
+            ur,
+            vr,
+            &reference,
+            &Svq1InterParams {
+                lambda: 24,
+                allow_4mv: false,
+                ..Default::default()
+            },
+        )
+        .expect("single-MV encodes");
+
+        // Independent decode must equal the returned reconstruction.
+        let independent = decode_frame(&with_4mv.bytes, Some(&reference)).expect("decodes");
+        assert_eq!(independent.y.visible(), with_4mv.reconstruction.y.visible());
+
+        let sse = |got: &[u8], want: &[u8]| -> u64 {
+            got.iter()
+                .zip(want.iter())
+                .map(|(&a, &b)| {
+                    let d = i64::from(a) - i64::from(b);
+                    (d * d) as u64
+                })
+                .sum()
+        };
+        let cost = |f: &Svq1EncodedFrame| {
+            sse(&f.reconstruction.y.visible(), &y1) + 24 * 8 * f.bytes.len() as u64
+        };
+        assert!(
+            cost(&with_4mv) <= cost(&without_4mv),
+            "enabling 4MV must not worsen the lambda cost ({} vs {})",
+            cost(&with_4mv),
+            cost(&without_4mv)
+        );
     }
 
     /// Mis-sized planes are rejected.
