@@ -8,6 +8,24 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 386 — SVQ1 multi-stage codebook search
+  (`svq1_enc_leaf::search_leaf`).** The encoder-side inverse of the
+  spec/04 §4.5 stage accumulation: per leaf, the rounded residual
+  mean (clamped to the intra `[0, 255]` / inter `[-256, +255]`
+  domains of spec/05 §5.1) plus a greedy ascending-stage descent
+  (spec/04 §4.2 ordering) that commits the SSE-minimising vector of
+  each `(level, half, stage)` codebook page while it strictly
+  improves, up to the full six stages. The searcher models the
+  decoder's wide-accumulation arithmetic exactly, so its
+  reconstruction is byte-identical to `reconstruct_leaf` for the
+  same wire symbols (asserted across every level × half × budget);
+  it also carries exact wire-bit accounting (stage-count VLC + mean
+  VLC + `4N` raw index bits) and the inter-only `N = −1` SKIP
+  alternative for the coming inter encoder. New intra encoder mode
+  `Svq1EncoderMode::MultiStageL3` drives it at L=3; the resulting
+  stream was decoded by the reference decoder binary (black-box)
+  byte-identical to our own decoder.
+
 - **Round 383 — SVQ1 intra encoder (`svq1_enc`), cross-validated
   against the black-box reference decoder.** Implements the staged
   encoder companion's bring-up ladder

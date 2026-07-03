@@ -96,6 +96,11 @@ pub enum Svq1EncoderMode {
     /// stage-1 codebook vector (falling back to mean-only when no
     /// vector reduces the error).
     MeanPlusOneStageL3,
+    /// Four L=3 leaves per macroblock, each running the full greedy
+    /// multi-stage descent of [`crate::svq1_enc_leaf::search_leaf`]
+    /// (up to six stages per leaf — the complete spec/04 §4.5
+    /// vocabulary at L=3).
+    MultiStageL3,
 }
 
 /// One raw input plane (tightly packed, `width × height`).
@@ -153,6 +158,24 @@ fn push_one_stage_leaf(w: &mut BitWriter, level: Svq1Level, mean: u8, vec_idx: u
     w.push_bits(4, vec_idx as u32);
 }
 
+/// Emit one searched leaf payload ([`crate::svq1_enc_leaf`]) on the
+/// intra tables: stage-count codeword at position `N + 1`, the intra
+/// mean codeword, then the `4N` raw index bits (spec/04 §4.2.1).
+pub(crate) fn push_intra_leaf_choice(
+    w: &mut BitWriter,
+    level: Svq1Level,
+    choice: &crate::svq1_enc_leaf::LeafChoice,
+) {
+    let crate::svq1_enc_leaf::LeafCode::Coded { mean, ref stages } = choice.code else {
+        unreachable!("intra leaves are never SKIP (spec/04 §4.9.1)");
+    };
+    w.push_code(&intra_stage_count_table(level).0, stages.len() + 1);
+    w.push_code(&SVQ1_VLC_INTRA_MEAN.0, mean as usize);
+    for &vec_idx in stages {
+        w.push_bits(4, u32::from(vec_idx));
+    }
+}
+
 /// Sum of squared errors between a source block and
 /// `mean + vector` (wide accumulation, final clamp — mirroring the
 /// decoder's pinned arithmetic).
@@ -205,7 +228,9 @@ fn encode_intra_plane(
                     let mean = block_mean(&plane.block(x0, y0, 16, 16));
                     push_mean_only_leaf(w, Svq1Level::L5, mean);
                 }
-                Svq1EncoderMode::MeanOnlyL3 | Svq1EncoderMode::MeanPlusOneStageL3 => {
+                Svq1EncoderMode::MeanOnlyL3
+                | Svq1EncoderMode::MeanPlusOneStageL3
+                | Svq1EncoderMode::MultiStageL3 => {
                     // Subdivide L=5 → two L=4 → four L=3 (spec/03
                     // §3.4: top/bottom then left/right).
                     w.push_bits(1, 1); // L=5
@@ -217,6 +242,18 @@ fn encode_intra_plane(
                         let mean = block_mean(&block);
                         if mode == Svq1EncoderMode::MeanOnlyL3 {
                             push_mean_only_leaf(w, Svq1Level::L3, mean);
+                            continue;
+                        }
+                        if mode == Svq1EncoderMode::MultiStageL3 {
+                            let choice = crate::svq1_enc_leaf::search_leaf(
+                                Svq1Level::L3,
+                                Svq1Half::Intra,
+                                &block,
+                                &[0u8; 64],
+                                6,
+                                false,
+                            );
+                            push_intra_leaf_choice(w, Svq1Level::L3, &choice);
                             continue;
                         }
                         // One-stage search: SSE over the 16 stage-1
@@ -432,6 +469,70 @@ mod tests {
             staged_sse <= mean_sse,
             "one-stage mode must not increase Y-plane SSE ({staged_sse} vs {mean_sse})"
         );
+    }
+
+    /// Multi-stage mode round trip: the decode must equal the
+    /// searcher's own reconstruction model leaf by leaf, and the
+    /// whole-frame SSE must not exceed the one-stage mode's.
+    #[test]
+    fn multi_stage_l3_beats_one_stage_and_round_trips() {
+        let (width, height) = (64usize, 48usize);
+        let (y, u, v) = planes(width, height);
+        let (yr, ur, vr) = refs(&y, &u, &v, width, height);
+
+        let enc_one =
+            encode_intra_frame(yr, ur, vr, Svq1EncoderMode::MeanPlusOneStageL3).expect("encodes");
+        let enc_multi =
+            encode_intra_frame(yr, ur, vr, Svq1EncoderMode::MultiStageL3).expect("encodes");
+
+        let dec_one = decode_intra_frame(&enc_one).expect("decodes");
+        let dec_multi = decode_intra_frame(&enc_multi).expect("decodes");
+
+        let sse = |decoded: &[u8], source: &[u8]| -> u64 {
+            decoded
+                .iter()
+                .zip(source.iter())
+                .map(|(&a, &b)| {
+                    let d = i64::from(a) - i64::from(b);
+                    (d * d) as u64
+                })
+                .sum()
+        };
+        let one_sse = sse(&dec_one.y.visible(), &y);
+        let multi_sse = sse(&dec_multi.y.visible(), &y);
+        assert!(
+            multi_sse <= one_sse,
+            "multi-stage must not increase Y-plane SSE ({multi_sse} vs {one_sse})"
+        );
+
+        // Leaf-level cross-check: the decoded plane equals the
+        // searcher's own recon for every L=3 leaf.
+        let decoded_y = dec_multi.y.visible();
+        for mb_y in 0..height / 16 {
+            for mb_x in 0..width / 16 {
+                for (dx, dy) in [(0usize, 0usize), (8, 0), (0, 8), (8, 8)] {
+                    let block = yr.block(mb_x * 16 + dx, mb_y * 16 + dy, 8, 8);
+                    let choice = crate::svq1_enc_leaf::search_leaf(
+                        Svq1Level::L3,
+                        crate::svq1_vlc::Svq1Half::Intra,
+                        &block,
+                        &[0u8; 64],
+                        6,
+                        false,
+                    );
+                    for row in 0..8 {
+                        for col in 0..8 {
+                            let (px, py) = (mb_x * 16 + dx + col, mb_y * 16 + dy + row);
+                            assert_eq!(
+                                decoded_y[py * width + px],
+                                choice.recon[row * 8 + col],
+                                "MB ({mb_x},{mb_y}) leaf ({dx},{dy}) sample ({col},{row})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Non-standard dimensions take the code-7 explicit escape and
