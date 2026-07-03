@@ -43,6 +43,30 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   binary (black-box) byte-identical to our own decoder. Also drops a
   stray debug `eprintln!` from the leaf decoder's error path.
 
+- **Round 386 — SVQ1 P-frame encoder (`svq1_enc_inter`), black-box
+  cross-validated including overhang geometry.** Per-macroblock
+  SKIP / INTER / INTRA λ-cost mode decision: SKIP copies the
+  reference verbatim (one T03 codeword); INTER runs a two-phase
+  motion search (full-pel SAD scan around the median predictor +
+  ±1 half-pel refinement, spec/06 §6.4/§6.5) and codes the
+  differential as two signed T02 codewords (§6.2.3 Reading B), then
+  the λ-tree on the inter half (per-leaf SKIP allowed) over the
+  motion-compensated baseline; INTRA reuses the intra λ-tree. The
+  encoder-side MV cache follows the decoder's §6.8.1 store rules,
+  and `encode_inter_frame` returns the decoder-authoritative
+  reconstruction for reference chaining. Black-box probing showed
+  decoders genuinely diverge on the spec/06 §6.7 out-of-frame
+  extension and the spec/04 §4.7.3 overhang-region storage (both
+  documented as implementation-defined), so motion candidates are
+  confined to a visible-reference window — every VISIBLE output
+  sample reads only VISIBLE reference samples, including the second
+  half-pel tap. With that constraint, I+3P chains at 176×144 AND at
+  the 160×120 overhang geometry decode byte-identical between our
+  decoder and the reference decoder binary; leaf-level SKIP and
+  mean-only L=4/L=5 inter leaves (both absent from every
+  reference-encoder stream we hold) are now positively validated on
+  the wire.
+
 - **Round 383 — SVQ1 intra encoder (`svq1_enc`), cross-validated
   against the black-box reference decoder.** Implements the staged
   encoder companion's bring-up ladder

@@ -134,7 +134,7 @@ impl<'a> Svq1PlaneRef<'a> {
 
     /// Collect a `w × h` block at `(x, y)` in raster order with edge
     /// replication.
-    fn block(&self, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
+    pub fn block(&self, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(w * h);
         for row in 0..h {
             for col in 0..w {
