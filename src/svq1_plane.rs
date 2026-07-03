@@ -368,6 +368,53 @@ pub const fn chroma_dim(luma_dim: usize) -> usize {
     luma_dim.div_ceil(4)
 }
 
+#[cfg(feature = "registry")]
+impl Svq1DecodedFrame {
+    /// Bridge the decoded frame to an [`oxideav_core::VideoFrame`]
+    /// in `Yuv420P` layout.
+    ///
+    /// SVQ1's native lattice is YUV 4:1:0 (one chroma sample per
+    /// 4×4 luma block, spec/02 §2.2); the framework's `PixelFormat`
+    /// enum does not yet carry a 4:1:0 layout, so the bridge
+    /// nearest-neighbour-doubles each chroma sample onto the 4:2:0
+    /// grid (each 4:1:0 sample covers a 2×2 block of 4:2:0 samples)
+    /// cropped to `ceil(W/2) × ceil(H/2)`. The native 4:1:0 planes
+    /// stay available on this struct (`y` / `u` / `v`) for callers
+    /// that want the unresampled data.
+    pub fn to_video_frame_420(&self, pts: Option<i64>) -> oxideav_core::VideoFrame {
+        let cw = self.width().div_ceil(2);
+        let ch = self.height().div_ceil(2);
+        let upsample = |plane: &Svq1PlaneCanvas| -> Vec<u8> {
+            let mut out = Vec::with_capacity(cw * ch);
+            for row in 0..ch {
+                let src_row = (row / 2).min(plane.height.saturating_sub(1));
+                for col in 0..cw {
+                    let src_col = (col / 2).min(plane.width.saturating_sub(1));
+                    out.push(plane.samples[src_row * plane.stride + src_col]);
+                }
+            }
+            out
+        };
+        oxideav_core::VideoFrame {
+            pts,
+            planes: vec![
+                oxideav_core::VideoPlane {
+                    stride: self.width(),
+                    data: self.y.visible(),
+                },
+                oxideav_core::VideoPlane {
+                    stride: cw,
+                    data: upsample(&self.u),
+                },
+                oxideav_core::VideoPlane {
+                    stride: cw,
+                    data: upsample(&self.v),
+                },
+            ],
+        }
+    }
+}
+
 /// Decode a complete SVQ1 INTRAFRAME chunk: header + Y + U + V.
 ///
 /// Returns [`Error::NotImplemented`] for P / B frames (the inter

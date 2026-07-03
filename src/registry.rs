@@ -180,26 +180,29 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         codec_id,
         pending: None,
         last_header: None,
+        reference: None,
         eof: false,
     }))
 }
 
 /// SVQ1 decoder handle bound to a single stream.
 ///
-/// Round 2 implements the `send_packet` → frame-header-parse path: a
-/// successful `send_packet` records the parsed header in
-/// [`Self::last_header`] (accessible to integrators that need the
-/// dimensions before pixel data is available) and `receive_frame`
-/// returns [`Error::Unsupported`] because the encoded plane data is
-/// blocked on the codebook docs-gap. The handle deliberately does NOT
-/// silently drop packets — the framework contract requires
-/// `send_packet → receive_frame` to be paired, so a packet that
-/// parses structurally is held until `receive_frame` is called and
-/// the (currently `Unsupported`) error is delivered to the caller.
+/// `send_packet` parses + validates the frame header (recorded in
+/// [`Self::last_header`]) and retains the packet; `receive_frame`
+/// runs the full pixel decode ([`crate::svq1_plane::decode_frame`])
+/// against the held reference picture and returns a `Yuv420P`
+/// [`oxideav_core::VideoFrame`] (SVQ1's native 4:1:0 chroma is
+/// nearest-neighbour-bridged to 4:2:0 — see
+/// [`crate::svq1_plane::Svq1DecodedFrame::to_video_frame_420`]; the
+/// native planes are reachable through the standalone
+/// `svq1_plane` API). I- and P-frames become the reference for the
+/// next frame; B ("droppable") frames never do (wiki §"Algorithm
+/// Basics" — other frames cannot predict from them).
 pub struct Svq1DecoderHandle {
     codec_id: CodecId,
     pending: Option<Packet>,
     last_header: Option<Svq1FrameHeader>,
+    reference: Option<crate::svq1_plane::Svq1DecodedFrame>,
     eof: bool,
 }
 
@@ -248,18 +251,21 @@ impl Decoder for Svq1DecoderHandle {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        if self.pending.take().is_none() {
+        let Some(packet) = self.pending.take() else {
             return if self.eof {
                 Err(Error::Eof)
             } else {
                 Err(Error::NeedMore)
             };
+        };
+        let decoded = crate::svq1_plane::decode_frame(&packet.data, self.reference.as_ref())?;
+        let video = decoded.to_video_frame_420(packet.pts);
+        // I- and P-frames become the reference for subsequent frames;
+        // B ("droppable") frames never do (wiki §"Algorithm Basics").
+        if decoded.header.picture_type != crate::header::Svq1PictureType::Droppable {
+            self.reference = Some(decoded);
         }
-        // The frame header parsed OK in send_packet — pixel decode is
-        // the part that needs the codebook tables we don't have yet.
-        Err(Error::unsupported(
-            "oxideav-svq: SVQ1 pixel decode blocked on codebook docs-gap — see crates/oxideav-svq/README.md",
-        ))
+        Ok(Frame::Video(video))
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -270,6 +276,7 @@ impl Decoder for Svq1DecoderHandle {
     fn reset(&mut self) -> Result<()> {
         self.pending = None;
         self.last_header = None;
+        self.reference = None;
         self.eof = false;
         Ok(())
     }
@@ -555,15 +562,68 @@ mod tests {
     }
 
     #[test]
-    fn decoder_send_packet_then_receive_returns_unsupported() {
+    fn decoder_decodes_intra_frame_end_to_end() {
+        // The black-box conformance fixture (see
+        // tests/svq1_intra_conformance.rs for the byte-exact
+        // plane-level check) through the framework Decoder surface.
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let mut decoder = make_decoder(&params).expect("make_decoder ok");
+        let pkt = make_packet(include_bytes!("../tests/fixtures/intra_176x144.svq1").to_vec());
+        decoder.send_packet(&pkt).expect("send_packet ok");
+        let frame = decoder.receive_frame().expect("intra frame decodes");
+        let Frame::Video(video) = frame else {
+            panic!("expected a video frame");
+        };
+        // Yuv420P bridge: Y at 176×144, chroma at 88×72.
+        assert_eq!(video.planes.len(), 3);
+        assert_eq!(video.planes[0].stride, 176);
+        assert_eq!(video.planes[0].data.len(), 176 * 144);
+        assert_eq!(video.planes[1].stride, 88);
+        assert_eq!(video.planes[1].data.len(), 88 * 72);
+        assert_eq!(video.planes[2].data.len(), 88 * 72);
+        // Next receive without a packet → NeedMore.
+        assert!(matches!(decoder.receive_frame(), Err(Error::NeedMore)));
+    }
+
+    #[test]
+    fn decoder_decodes_p_frame_against_held_reference() {
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let mut decoder = make_decoder(&params).expect("make_decoder ok");
+        let i_pkt = make_packet(include_bytes!("../tests/fixtures/intra_176x144.svq1").to_vec());
+        decoder.send_packet(&i_pkt).expect("send I");
+        decoder.receive_frame().expect("I decodes");
+        let p_pkt = make_packet(include_bytes!("../tests/fixtures/inter_176x144_p.svq1").to_vec());
+        decoder.send_packet(&p_pkt).expect("send P");
+        let frame = decoder
+            .receive_frame()
+            .expect("P decodes against held reference");
+        let Frame::Video(video) = frame else {
+            panic!("expected a video frame");
+        };
+        assert_eq!(video.planes[0].data.len(), 176 * 144);
+
+        // After reset the reference is dropped: the same P packet
+        // must be rejected.
+        decoder.reset().expect("reset ok");
+        decoder.send_packet(&p_pkt).expect("send P again");
+        let err = decoder
+            .receive_frame()
+            .expect_err("P without a reference must be rejected");
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn decoder_rejects_truncated_plane_data() {
+        // A header-only packet parses at send_packet but runs out of
+        // bits during the plane decode.
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
         let mut decoder = make_decoder(&params).expect("make_decoder ok");
         let pkt = make_packet(minimal_iframe_packet());
         decoder.send_packet(&pkt).expect("send_packet ok");
         let err = decoder
             .receive_frame()
-            .expect_err("pixel decode is unsupported until codebooks land");
-        assert!(matches!(err, Error::Unsupported(_)));
+            .expect_err("header-only packet has no plane data");
+        assert!(matches!(err, Error::InvalidData(_)));
     }
 
     #[test]
@@ -619,6 +679,7 @@ mod tests {
             codec_id: CodecId::new(CODEC_ID_STR),
             pending: None,
             last_header: None,
+            reference: None,
             eof: false,
         };
         let pkt = make_packet(minimal_iframe_packet());

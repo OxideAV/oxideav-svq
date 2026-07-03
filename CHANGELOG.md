@@ -8,6 +8,24 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 383 — SVQ1 `receive_frame` — the registry decoder returns
+  real pixels.** `Svq1DecoderHandle::receive_frame` now runs the full
+  `svq1_plane::decode_frame` pipeline against the handle's held
+  reference picture and returns an `oxideav_core::VideoFrame`. I- and
+  P-frames become the reference for the next frame; B ("droppable")
+  frames never do (wiki §"Algorithm Basics"); `reset` drops the
+  reference. Output is `Yuv420P` via the new
+  `Svq1DecodedFrame::to_video_frame_420` bridge — SVQ1's native
+  YUV 4:1:0 chroma is nearest-neighbour-doubled onto the 4:2:0 grid
+  because the framework `PixelFormat` enum carries no 4:1:0 layout
+  yet (follow-up: add `Yuv410P` to `oxideav-core` and emit native
+  planes; the unresampled 4:1:0 planes remain reachable through the
+  standalone `svq1_plane` API). The round-2 "pixel decode blocked on
+  codebook docs-gap" `Unsupported` sentinel is gone; three registry
+  tests cover the I-frame end-to-end path, the P-after-I
+  held-reference path (including reset dropping the reference), and
+  truncated-plane-data rejection.
+
 - **Round 383 — SVQ1 P-frame (inter) decode, byte-exact across a
   six-frame chain.** `svq1_plane` grows the interframe path:
   `read_mb_mode` (T03), `read_mv_component` / `read_mv_differential`
