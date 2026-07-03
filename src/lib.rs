@@ -1,5 +1,38 @@
 //! Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec.
 //!
+//! **Round 383 — SVQ1 full decoder: byte-exact I/P decode, wired into
+//! `receive_frame`.**
+//!
+//! Round 383 turns the staged SVQ1 layers into a complete decoder:
+//!
+//! 1. [`svq1_vlc`] — all sixteen wire VLC tables (T00..T15 per
+//!    `docs/video/svq1/audit/01-report.md`) as verified prefix-code
+//!    decoders (construction-time prefix-freedom + Kraft checks).
+//! 2. [`svq1_plane`] — the whole-frame decode: per-plane macroblock
+//!    raster scan, breadth-first block-tree walk, per-leaf
+//!    stage-count / mean / index reads, codebook stage accumulation
+//!    ([`svq1_plane::decode_intra_frame`]), the interframe path
+//!    (T03 mode dispatch, T02 MV wire decode, median predictor +
+//!    clip + per-plane MV cache, half-pel MC baseline), and
+//!    [`svq1_plane::decode_frame`] for I / P / B chunks.
+//! 3. `Svq1DecoderHandle::receive_frame` — decodes against the held
+//!    reference picture and returns a `Yuv420P`
+//!    `oxideav_core::VideoFrame`.
+//!
+//! Everything is validated BYTE-EXACT against a reference encoder
+//! binary's own decodes (black-box only) across intra, single-P,
+//! six-frame-chain, and 160×120 overhang fixtures, pinning in the
+//! Validator role: the §14.8 codebook page layout (level-major
+//! descending, intra-then-inter — see
+//! [`svq1_codebook::half_byte_offset_in_payload`]), the L=2 / L=3
+//! hierarchical vector tile order
+//! ([`svq1_codebook::vector_byte_to_raster`]), wide-accumulator
+//! saturation, mean-only L=4 / L=5 leaves, the T03 mode permutation
+//! (SKIP on the 1-bit codeword), and spec/06 §6.2.3 Reading B for
+//! MV components.
+//!
+//! ## Earlier rounds (carried forward)
+//!
 //! **Round 339 — SVQ3 macroblock-level intra predictor-selection loop.**
 //!
 //! Round 339 closes the SVQ3 intra-reconstruction lacks-tail the README
@@ -456,18 +489,15 @@
 //!       [`Svq1DecoderHandle::last_header`] for the parsed header.
 //!     * `From<crate::Error> for oxideav_core::Error` conversion.
 //!
-//! ## What round 2 does **not** deliver
+//! ## Known SVQ1 tails (not blocking decode)
 //!
-//! * The encoded plane data (`Y`, `U`, `V` planes) is **not** decoded.
-//!   `receive_frame` returns `Error::Unsupported` until the codebook
-//!   docs-gap closes.
 //! * The embedded-string body is captured raw; de-obfuscation is
 //!   deferred until the per-stream XOR table is pinned in `docs/`.
 //! * The checksum byte is captured but not verified — the wiki spec
 //!   itself notes "The specific details of the checksum coding are
 //!   not all known".
-//! * No SVQ3 work yet. SVQ3 is documented in `docs/video/svq3/wiki/`
-//!   but the round-2 prompt scoped to SVQ1.
+//! * INTER_4MV macroblocks decode but have no real-stream fixture
+//!   yet (the black-box reference encoder never emits the mode).
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]

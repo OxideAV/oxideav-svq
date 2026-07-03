@@ -1,6 +1,6 @@
 # oxideav-svq
 
-Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec scaffold for the
+Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 Implemented from the clean-room specifications staged under
 [`docs/video/svq1/`](../../docs/video/svq1/) and
@@ -8,93 +8,65 @@ Implemented from the clean-room specifications staged under
 
 ## Status
 
-**Decode pipelines wired up through the whole-picture intra
-frame-walk; the only thing gating `receive_frame` is the CBP `me(v)`
-wire decode.** Both decoders parse their bitstreams into typed
-structures and stage the required tables. For SVQ3, a single 4×4-intra
-macroblock reconstructs **end-to-end from slice bits to a 16×16 luma
-plane** (intra-mode VLC → predictor → residual → writeback), and the
-**picture-plane assembly** (`svq3_picture`) now stitches per-macroblock
-reconstruction units into a full Y/Cb/Cr picture: an `Svq3Picture`
-canvas sized to the macroblock grid, MB-raster neighbour binding +
-blit-back, the picture-aware per-MB driver
-(`reconstruct_intra_macroblock_into`), the whole-picture intra
-frame-walk skeleton (`reconstruct_intra_frame`), the
-`oxideav_core::VideoFrame` (Yuv420P) bridge (`to_video_frame`), and the
-inter-MC reference-plane views (`luma_reference` / `chroma_reference`).
-`receive_frame` still returns `oxideav_core::Error::Unsupported`: only
-the per-MB *wire decode* that produces each macroblock's coefficient
-grids / modes — the CBP `me(v)` mapped-Exp-Golomb table the wiki defers
-wholesale to H.264 — is still gated on a docs trace (see the SVQ3 gap
-note below). The geometry, reconstruction composition, frame walk, and
-frame-output bridge above the wire decode are all in place. What is
-implemented:
+**SVQ1: the decoder is COMPLETE for the I/P forward path and
+byte-exact against black-box reference decodes.** `receive_frame`
+returns real frames. SVQ3 remains parse + reconstruction-composition
+infrastructure gated on the CBP `me(v)` docs trace (see the SVQ3
+section below).
 
 ### SVQ1
 
-* Full frame-header parse (`parse_frame_header` → `Svq1FrameHeader`):
-  frame code, temporal reference, picture type, I-frame trailer chain,
-  frame-size code / dimensions.
-* The block-tree subdivision walker (all six levels) and per-stage
-  codebook-index field reader.
-* The L0..L3 multistage-VQ codebook payload, block-shape LUT, and the
-  saturating-clip / bit-mask / u16 parameter helper LUTs, all embedded
-  as bit-exact compile-time constants. L4 / L5 codebooks are
-  architecturally absent (always subdivided) and modelled as such.
-* Mean-removal arithmetic (intra `u8` / inter `s9`, saturating).
-* The inter motion-vector **median-of-three predictor**
-  (`svq1_motion_predictor`): the component-independent
-  `MEDIAN(pl, pt, ptr)` baseline with the absent-neighbour fallback
-  (one-present short-circuit, `(0,0)`-substituted median otherwise),
-  plus the `[-32, +31]` final-vector component clip (spec/06 §6.4 /
-  §6.6). Verified bit-exact against the §6.4.1 worked example
-  (`pl=(0,0), pt=(5,17), ptr=(-9,12) → predictor=(0,12)`). The
-  per-component differential VLC (T02) read is deferred: spec/06
-  §6.2.3 flags a bit-stream-affecting Reading A/B ambiguity pending a
-  Validator round, so only the unambiguous predictor + clip
-  arithmetic (shared by both readings) is wired.
-* The per-plane **motion-vector cache + neighbour-selection geometry**
-  (`svq1_mv_cache`): the `(mb_cols × 2) × (mb_rows × 2)` grid of 8×8
-  block MVs (spec/06 §6.8 / §6.1.1 granularity invariant), the INTER
-  single-MV neighbour triple `{pl=(r,c−1), pt=(r−2,c), ptr=(r−2,c+2)}`
-  (§6.4.3, reproducing the wiki grid `[1 2 / 3 4] → {N, C, E}`), the
-  four per-sub-block INTER_4MV triples of §6.4.4 (with the within-MB
-  top-left-as-`ptr` deviation for sub-blocks 3/4), the strictly-serial
-  §6.4.5 INTER_4MV decode, and the §6.8.1 / §6.9 cache-update + SKIP /
-  INTRA `(0,0)` reset rules. Out-of-bounds lookups are *absent*
-  neighbours (§6.4.2), distinct from in-bounds `(0,0)` slots. Pure
-  indexing + storage feeding `svq1_motion_predictor`; the differential
-  `(dx, dy)` remains caller-supplied (the deferred T02 wire decode).
-* The per-leaf stage-accumulation reconstruction (`reconstruct_leaf`):
-  the fixed-order `predictor → mean → stage-1 … stage-N` summation with
-  the `[0, 255]` clamp applied after every add, in output-raster order
-  (spec/04 §4.5 / §4.7.1). Verified bit-exact against the §4.8 worked
-  example (`mean=61`, two stages → `[55 39 50 77 / 93 81 49 46]`).
+Full frame decode, validated byte-exact (every Y/U/V sample) against
+a reference encoder binary's own decode, used strictly as a black box
+— across a 176×144 I-frame, a P-frame, a six-frame I+5P chain (each P
+predicting from OUR previous reconstruction), and a 160×120 I+2P
+chain exercising overhang macroblocks:
 
-The remaining SVQ1 gap is the intra-vs-inter / stage-vs-level
-interleave *within* the codebook payload (which fixes the byte offset
-of each `(level, half)` page the reconstructor reads), plus the
-stage-count / mean / index VLC wire-up, and the MV-component VLC
-(T02) whose Reading A/B disambiguation (spec/06 §6.2.3) awaits a
-Validator round. The inter MV path now has its predictor (§6.4),
-final-vector clip (§6.6), per-plane cache (§6.8), INTER /
-INTER_4MV neighbour-selection geometry (§6.4.3 / §6.4.4), and the
-**half-pel reference sampling** (`svq1_mc`, §6.5 / §6.7) wired; only
-the T02 differential wire decode remains on the MV path. Until the
-deferred field decodes land, full plane reconstruction is blocked on
-bitstream-driven field decode.
+* **Frame header** (`parse_frame_header`): frame code, temporal
+  reference, picture type, I-frame trailer chain (checksum, embedded
+  string, frame-size code / explicit dimensions).
+* **Wire VLC layer** (`svq1_vlc`): all sixteen staged tables (T00
+  inter mean s9, T01 intra mean u8, T02 MV component, T03 MB mode,
+  T04..T15 per-(level, half) stage counts) as verified prefix-code
+  decoders — construction proves prefix-freedom; Kraft sums match the
+  audit (15 complete, T02 at 8187/8192); stage count `N = position −
+  1`.
+* **Codebook** (`svq1_codebook`): the canonical 23 040-byte region at
+  functional base `0x5d214..0x62c14` (block-shape-LUT dual-use front
+  16 bytes + the staged 23 004-byte payload + the locally-staged
+  20-byte tail `tables/codebook-tail.csv`). Page layout pinned in the
+  Validator role — level-major DESCENDING (L=3 → L=0), intra half
+  then inter half per level (`half_byte_offset_in_payload`; neither
+  §14.8 working hypothesis) — and the L=2 / L=3 vector byte→sample
+  order is hierarchical 4×4 tiles (`vector_byte_to_raster`), not
+  whole-block raster.
+* **Plane decode** (`svq1_plane`): per-plane MB raster scan,
+  breadth-first L=5→L=0 block-tree walk (§3.4 halving geometry,
+  MB-padded canvases, overhang decode-and-discard), per-leaf
+  stage-count / mean / 4-bit-index reads, wide-accumulator stage
+  summation with a single final clamp, mean-only leaves at any level
+  (incl. L=5/L=4 — the wiki gate fires on the stage count).
+* **Inter path**: T03 MB-mode dispatch (permutation pinned: position
+  3 = SKIP on the 1-bit code, 0 = INTER, 1 = INTER_4MV, 2 = INTRA),
+  T02 MV components as single signed codewords (spec/06 §6.2.3
+  Reading B, `position − 32`), §6.4 median predictor + §6.6 clip +
+  §6.8 per-plane MV cache, §6.5 half-pel MC with `(a+b+1)>>1`
+  rounding and §6.7.2 edge replication, SKIP copy / INTER /
+  INTER_4MV / INTRA macroblocks, and `decode_frame` (I/P/B against
+  an optional reference; B frames never become the reference).
+* **Framework integration** (`registry`): `receive_frame` decodes
+  against the held reference and returns a `Yuv420P`
+  `oxideav_core::VideoFrame` (native 4:1:0 chroma nearest-neighbour
+  bridged; the native planes stay reachable through `svq1_plane`).
+* **Robustness**: every-byte truncation, pseudo-random soup, and
+  bit-flip sweeps error cleanly.
 
-* The **half-pel motion-compensation reference sampler** (`svq1_mc`):
-  `Svq1ReferencePlane` (row-major plane view with §6.7.2 edge-
-  replication clamping), `sample_halfpel` (the §6.5.1 parity-driven
-  interpolator: integer-pel direct / horizontal two-tap / vertical
-  two-tap / bilinear four-tap, each with the round-toward-+∞ bias),
-  `motion_compensate_block` (the §6.5.2 8×8 reference patch), and
-  `reconstruct_inter_l3_block` (the first end-to-end *reference plane +
-  MV → reconstructed inter sub-block*, composing the MC patch as the
-  §4.6.2 inter predictor of `reconstruct_leaf`). The §6.5.1 / §6.7.2
-  conventions are the spec's documented de-facto baseline (binary
-  confirmation deferred to a Validator round).
+Remaining SVQ1 tails: an INTER_4MV-bearing real-stream fixture (the
+black-box encoder never emits the mode; its position in the T03
+alphabet is pinned by elimination); B-frame samples; the frame-tail
+checksum polynomial and embedded-string XOR table (locations still
+unpinned in the docs staging); an SVQ1 encoder; and a native
+`Yuv410P` output once `oxideav-core` grows the pixel format.
 
 ### SVQ3
 
@@ -268,9 +240,11 @@ picture assembly, frame output) is implemented and tested.
 
 Default (`registry`) installs both codecs into the framework registry
 and pulls in `oxideav-core`. Disable default features for the
-standalone parser surface (`parse_frame_header` / `Svq1FrameHeader` /
-`BitReader` plus the `svq3*` parse + arithmetic modules) without the
-framework dependency.
+standalone surface — the full SVQ1 frame decoder
+(`svq1_plane::decode_frame` returning native YUV 4:1:0 planes,
+`parse_frame_header`, the `svq1_*` table/VLC modules) plus the
+`svq3*` parse + arithmetic modules — without the framework
+dependency.
 
 ```toml
 [dependencies]
