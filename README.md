@@ -1,5 +1,7 @@
 # oxideav-svq
 
+[![CI](https://github.com/OxideAV/oxideav-svq/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-svq/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-svq.svg)](https://crates.io/crates/oxideav-svq) [![docs.rs](https://docs.rs/oxideav-svq/badge.svg)](https://docs.rs/oxideav-svq) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust Sorenson Video (SVQ1 / SVQ3) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 Implemented from the clean-room specifications staged under
