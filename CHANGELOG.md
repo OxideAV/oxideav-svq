@@ -82,6 +82,17 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   first positive wire validation of INTER_4MV in either direction
   (no reference-encoder stream we hold ever emits the mode).
 
+- **Round 386 — INTER_4MV conformance fixture
+  (`tests/svq1_enc_inter_conformance.rs`).** Commits the
+  quadrant-motion I+3P chain (`enc_4mv_176x144_4f.svq1`, frame sizes
+  7601/1357/1178/1076) together with the reference decoder binary's
+  own decode of it. CI now pins (1) encoder determinism against the
+  committed stream, (2) our decode == the committed reference
+  decode, and (3) that the chain genuinely relies on INTER_4MV (a
+  `allow_4mv = false` re-encode is >2× larger). Retires the r383
+  "INTER_4MV macroblocks decode but have no real-stream fixture"
+  tail.
+
 - **Round 383 — SVQ1 intra encoder (`svq1_enc`), cross-validated
   against the black-box reference decoder.** Implements the staged
   encoder companion's bring-up ladder

@@ -496,8 +496,11 @@
 //! * The checksum byte is captured but not verified — the wiki spec
 //!   itself notes "The specific details of the checksum coding are
 //!   not all known".
-//! * INTER_4MV macroblocks decode but have no real-stream fixture
-//!   yet (the black-box reference encoder never emits the mode).
+//! * INTER_4MV wire coverage comes from OUR encoder's streams
+//!   (`tests/svq1_enc_inter_conformance.rs`), cross-validated
+//!   byte-exact through the black-box reference DECODER — the
+//!   reference ENCODER binary never emits the mode, so no
+//!   independent third-party 4MV stream exists in the fixture set.
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
