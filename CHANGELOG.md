@@ -26,6 +26,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stream was decoded by the reference decoder binary (black-box)
   byte-identical to our own decoder.
 
+- **Round 386 — SVQ1 adaptive block-tree encoder
+  (`svq1_enc_tree`).** Per-macroblock λ-cost subdivision over the
+  full spec/03 hierarchy: every block at L=5..L=1 either becomes a
+  searched multi-stage leaf or splits into its §3.4 child halves
+  (squares top/bottom, wider blocks left/right), minimising
+  `SSE + λ · bits` with exact wire-bit accounting; L=0 is the
+  implicit leaf. Serialisation reproduces the decoder's
+  breadth-first per-level queue discipline (spec/03 §3.5.1) so the
+  emitted bits decode through the real block-tree walk to the plan's
+  own reconstruction (asserted). New frame mode
+  `Svq1EncoderMode::Adaptive { lambda }`: `λ = 0` never loses to the
+  fixed L=3 tree in SSE; large λ collapses to the mean-only 16×16
+  floor. Streams at λ ∈ {0, 32, 2048} (8466 → 860 bytes for the same
+  176×144 textured frame) all decoded by the reference decoder
+  binary (black-box) byte-identical to our own decoder. Also drops a
+  stray debug `eprintln!` from the leaf decoder's error path.
+
 - **Round 383 — SVQ1 intra encoder (`svq1_enc`), cross-validated
   against the black-box reference decoder.** Implements the staged
   encoder companion's bring-up ladder

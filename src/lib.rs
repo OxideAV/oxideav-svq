@@ -509,6 +509,7 @@ pub mod svq1_blocktree;
 pub mod svq1_codebook;
 pub mod svq1_enc;
 pub mod svq1_enc_leaf;
+pub mod svq1_enc_tree;
 pub mod svq1_helper_luts;
 pub mod svq1_mc;
 pub mod svq1_mean;

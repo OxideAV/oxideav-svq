@@ -256,14 +256,8 @@ fn decode_leaf(
 
     let page = codebook_half(geom.level, half).ok_or(Error::InvalidLevelQuantise(geom.level))?;
     let predictor = read_predictor(canvas, geom);
-    let reconstructed =
-        reconstruct_leaf(geom.level, page, &predictor, mean, stages).map_err(|e| {
-            eprintln!(
-                "DBG reconstruct fail level={:?} half={:?} stages={:?} err={:?}",
-                geom.level, half, stages, e
-            );
-            Error::ReconstructFailed
-        })?;
+    let reconstructed = reconstruct_leaf(geom.level, page, &predictor, mean, stages)
+        .map_err(|_| Error::ReconstructFailed)?;
     write_leaf(canvas, geom, &reconstructed);
     Ok(())
 }

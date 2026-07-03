@@ -101,6 +101,15 @@ pub enum Svq1EncoderMode {
     /// (up to six stages per leaf — the complete spec/04 §4.5
     /// vocabulary at L=3).
     MultiStageL3,
+    /// Per-macroblock λ-cost block-tree search over the full spec/03
+    /// hierarchy (L=5..L=0) via [`crate::svq1_enc_tree`]: each block
+    /// becomes a multi-stage leaf or splits, minimising
+    /// `SSE + lambda × bits`. `lambda = 0` maximises fidelity; larger
+    /// values trade SSE for rate down to the mean-only-16×16 floor.
+    Adaptive {
+        /// Rate weight (SSE units per wire bit).
+        lambda: u64,
+    },
 }
 
 /// One raw input plane (tightly packed, `width × height`).
@@ -222,6 +231,19 @@ fn encode_intra_plane(
         for mb_x in 0..mb_cols {
             let (x0, y0) = (mb_x * MB_DIM, mb_y * MB_DIM);
             match mode {
+                Svq1EncoderMode::Adaptive { lambda } => {
+                    let block = plane.block(x0, y0, 16, 16);
+                    let mut target = [0u8; 256];
+                    target.copy_from_slice(&block);
+                    let plan = crate::svq1_enc_tree::plan_macroblock(
+                        &target,
+                        &[0u8; 256],
+                        Svq1Half::Intra,
+                        false,
+                        lambda,
+                    );
+                    crate::svq1_enc_tree::emit_macroblock(w, &plan, Svq1Half::Intra);
+                }
                 Svq1EncoderMode::MeanOnlyL5 => {
                     // L=5 leaf: subdivide bit 0, then mean-only.
                     w.push_bits(1, 0);
@@ -529,6 +551,79 @@ mod tests {
                                 "MB ({mb_x},{mb_y}) leaf ({dx},{dy}) sample ({col},{row})"
                             );
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Adaptive λ-tree round trip: the decoded frame equals the
+    /// per-macroblock plan reconstructions, λ = 0 is at least as good
+    /// in SSE as the fixed multi-stage L=3 tree, and a large λ
+    /// produces a smaller stream.
+    #[test]
+    fn adaptive_mode_round_trips_and_orders_by_lambda() {
+        let (width, height) = (64usize, 48usize);
+        let (y, u, v) = planes(width, height);
+        let (yr, ur, vr) = refs(&y, &u, &v, width, height);
+
+        let enc_sharp = encode_intra_frame(yr, ur, vr, Svq1EncoderMode::Adaptive { lambda: 0 })
+            .expect("encodes");
+        let enc_coarse =
+            encode_intra_frame(yr, ur, vr, Svq1EncoderMode::Adaptive { lambda: 1 << 16 })
+                .expect("encodes");
+        let enc_multi =
+            encode_intra_frame(yr, ur, vr, Svq1EncoderMode::MultiStageL3).expect("encodes");
+
+        assert!(
+            enc_coarse.len() < enc_sharp.len(),
+            "large lambda must shrink the stream ({} vs {})",
+            enc_coarse.len(),
+            enc_sharp.len()
+        );
+
+        let sse = |decoded: &[u8], source: &[u8]| -> u64 {
+            decoded
+                .iter()
+                .zip(source.iter())
+                .map(|(&a, &b)| {
+                    let d = i64::from(a) - i64::from(b);
+                    (d * d) as u64
+                })
+                .sum()
+        };
+        let dec_sharp = decode_intra_frame(&enc_sharp).expect("decodes");
+        let dec_coarse = decode_intra_frame(&enc_coarse).expect("decodes");
+        let dec_multi = decode_intra_frame(&enc_multi).expect("decodes");
+        let sharp_sse = sse(&dec_sharp.y.visible(), &y);
+        let multi_sse = sse(&dec_multi.y.visible(), &y);
+        assert!(
+            sharp_sse <= multi_sse,
+            "lambda 0 must not lose to fixed L=3 ({sharp_sse} vs {multi_sse})"
+        );
+
+        // Per-MB cross-check: the decode equals the plan recon.
+        let decoded_y = dec_coarse.y.visible();
+        for mb_y in 0..height / 16 {
+            for mb_x in 0..width / 16 {
+                let block = yr.block(mb_x * 16, mb_y * 16, 16, 16);
+                let mut target = [0u8; 256];
+                target.copy_from_slice(&block);
+                let plan = crate::svq1_enc_tree::plan_macroblock(
+                    &target,
+                    &[0u8; 256],
+                    crate::svq1_vlc::Svq1Half::Intra,
+                    false,
+                    1 << 16,
+                );
+                let recon = crate::svq1_enc_tree::plan_reconstruction(&plan);
+                for row in 0..16 {
+                    for col in 0..16 {
+                        assert_eq!(
+                            decoded_y[(mb_y * 16 + row) * width + mb_x * 16 + col],
+                            recon[row * 16 + col],
+                            "MB ({mb_x},{mb_y}) sample ({col},{row})"
+                        );
                     }
                 }
             }
