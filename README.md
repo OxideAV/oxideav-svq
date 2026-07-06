@@ -131,15 +131,22 @@ between our decoder and the reference decoder binary:
   picture type 2; an I+B+P chain whose P predicts from the I
   decodes byte-exact — conforming decoders keep B frames out of the
   reference chain.
-* **Registry `Encoder`** (`make_encoder` / `Svq1EncoderHandle`):
-  `Yuv420P` in, 4:1:0 decimation (exact inverse of the decode
-  bridge), keyframe cadence + λ knobs, keyframe-flagged packets;
-  registry-level encode→decode round trip is CI-pinned.
+* **Registry `Encoder`** (`make_encoder` / `make_encoder_handle` /
+  `Svq1EncoderHandle`): `Yuv420P` in, 4:1:0 decimation (exact
+  inverse of the decode bridge), keyframe cadence + λ knobs,
+  keyframe-flagged packets; registry-level encode→decode round trip
+  is CI-pinned.
+* **Rate control** (`set_target_frame_bytes`): per-frame byte budget
+  met by a deterministic warm-started doubling + bisection over λ
+  (smallest λ that fits = highest fidelity in budget; generous
+  budgets converge byte-identical to λ = 0; unachievable budgets
+  emit best-effort at the λ ceiling) — CI-pinned through the
+  registry decoder round trip.
 
 Remaining SVQ1 tails: the frame-tail checksum polynomial and
 embedded-string XOR table (locations still unpinned in the docs
-staging); rate control; and a native `Yuv410P` pixel format once
-`oxideav-core` grows one.
+staging); and a native `Yuv410P` pixel format once `oxideav-core`
+grows one.
 
 ### SVQ3
 

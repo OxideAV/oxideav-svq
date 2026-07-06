@@ -8,6 +8,13 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- svq1 encoder: per-frame rate control — `Svq1EncoderHandle::set_target_frame_bytes`
+  finds the smallest λ fitting the byte budget (warm-started doubling +
+  bisection; best-effort at the λ ceiling when the budget is unachievable);
+  `make_encoder_handle` exposes the concrete handle for the tuning knobs
+- svq1 tests: corrupt-P-frame truncation + bit-flip robustness sweep over the
+  reference-window clamp path
+
 - svq1: T03 macroblock coding-mode census — `decode_frame_with_stats` /
   `decode_inter_plane_with_stats` return per-plane SKIP/INTER/INTER_4MV/INTRA
   counts (`Svq1FrameModeStats` / `Svq1PlaneModeStats`); the byte-exact census

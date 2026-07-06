@@ -300,6 +300,14 @@ impl Decoder for Svq1DecoderHandle {
 /// P-frames through [`crate::svq1_enc_inter::encode_inter_frame`],
 /// chained on the decoder-authoritative reconstruction.
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    make_encoder_handle(params).map(|handle| Box::new(handle) as Box<dyn Encoder>)
+}
+
+/// [`make_encoder`] returning the concrete handle, so direct-API
+/// callers can reach the tuning knobs ([`Svq1EncoderHandle::set_lambda`],
+/// [`Svq1EncoderHandle::set_keyframe_interval`],
+/// [`Svq1EncoderHandle::set_target_frame_bytes`]) before boxing.
+pub fn make_encoder_handle(params: &CodecParameters) -> Result<Svq1EncoderHandle> {
     let width = params.width.unwrap_or(0) as usize;
     let height = params.height.unwrap_or(0) as usize;
     if width == 0 || height == 0 || width > 4095 || height > 4095 {
@@ -313,18 +321,20 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     output_params.pixel_format = params.pixel_format;
     output_params.frame_rate = params.frame_rate;
     let output_params = output_params.with_tag(CodecTag::fourcc(b"SVQ1"));
-    Ok(Box::new(Svq1EncoderHandle {
+    Ok(Svq1EncoderHandle {
         codec_id: params.codec_id.clone(),
         output_params,
         width,
         height,
         lambda: 32,
         keyframe_interval: 30,
+        target_frame_bytes: None,
+        rc_lambda: 32,
         frame_index: 0,
         reference: None,
         pending: std::collections::VecDeque::new(),
         eof: false,
-    }))
+    })
 }
 
 /// SVQ1 encoder handle bound to a single stream. See [`make_encoder`].
@@ -338,6 +348,11 @@ pub struct Svq1EncoderHandle {
     lambda: u64,
     /// Distance between intra frames; the first frame is always intra.
     keyframe_interval: u32,
+    /// Per-frame byte budget for the λ rate controller
+    /// ([`Self::set_target_frame_bytes`]); `None` = fixed-λ encoding.
+    target_frame_bytes: Option<usize>,
+    /// The rate controller's warm-start λ (last chosen value).
+    rc_lambda: u64,
     frame_index: u32,
     reference: Option<crate::svq1_plane::Svq1DecodedFrame>,
     pending: std::collections::VecDeque<Packet>,
@@ -369,6 +384,24 @@ impl Svq1EncoderHandle {
     /// — the factory default is `30`.
     pub fn set_keyframe_interval(&mut self, interval: u32) {
         self.keyframe_interval = interval.max(1);
+    }
+
+    /// Enable (`Some(bytes)`) or disable (`None`) the per-frame rate
+    /// controller. Direct-API knob — the factory default is `None`
+    /// (fixed-λ encoding at [`Self::set_lambda`]'s value).
+    ///
+    /// When enabled, each frame is encoded at the SMALLEST λ (highest
+    /// fidelity) whose codec-frame byte size fits the budget, found by
+    /// a deterministic warm-started doubling + bisection over the
+    /// λ-tree encoder (λ is a free encoder-side policy knob — the wire
+    /// format carries no rate state, so any λ schedule yields
+    /// conformant streams; validated by the round-trip tests). If even
+    /// the λ ceiling (`2^20`) cannot fit the budget the frame is
+    /// emitted best-effort at the ceiling — SVQ1 has a per-MB wire
+    /// floor (T03 / block-tree codewords) that no λ can compress away.
+    pub fn set_target_frame_bytes(&mut self, target: Option<usize>) {
+        self.target_frame_bytes = target;
+        self.rc_lambda = self.lambda;
     }
 
     /// Nearest-neighbour 4:2:0 → 4:1:0 chroma decimation (the exact
@@ -452,33 +485,115 @@ impl Encoder for Svq1EncoderHandle {
 
         let intra_due =
             self.reference.is_none() || self.frame_index % self.keyframe_interval.max(1) == 0;
-        let (bytes, keyframe) = if intra_due {
-            let bytes = crate::svq1_enc::encode_intra_frame(
-                yr,
-                ur,
-                vr,
-                crate::svq1_enc::Svq1EncoderMode::Adaptive {
-                    lambda: self.lambda,
-                },
-            )?;
-            self.reference = Some(crate::svq1_plane::decode_intra_frame(&bytes)?);
-            (bytes, true)
-        } else {
-            let reference = self.reference.as_ref().expect("reference present");
-            let encoded = crate::svq1_enc_inter::encode_inter_frame(
-                yr,
-                ur,
-                vr,
-                reference,
-                &crate::svq1_enc_inter::Svq1InterParams {
-                    lambda: self.lambda,
-                    temporal_reference: (self.frame_index & 0xff) as u8,
-                    ..Default::default()
-                },
-            )?;
-            self.reference = Some(encoded.reconstruction);
-            (encoded.bytes, false)
+        let temporal_reference = (self.frame_index & 0xff) as u8;
+        let encode_once = |lambda: u64| -> Result<(Vec<u8>, crate::svq1_plane::Svq1DecodedFrame)> {
+            if intra_due {
+                let bytes = crate::svq1_enc::encode_intra_frame(
+                    yr,
+                    ur,
+                    vr,
+                    crate::svq1_enc::Svq1EncoderMode::Adaptive { lambda },
+                )?;
+                let recon = crate::svq1_plane::decode_intra_frame(&bytes)?;
+                Ok((bytes, recon))
+            } else {
+                let reference = self.reference.as_ref().expect("reference present");
+                let encoded = crate::svq1_enc_inter::encode_inter_frame(
+                    yr,
+                    ur,
+                    vr,
+                    reference,
+                    &crate::svq1_enc_inter::Svq1InterParams {
+                        lambda,
+                        temporal_reference,
+                        ..Default::default()
+                    },
+                )?;
+                Ok((encoded.bytes, encoded.reconstruction))
+            }
         };
+
+        let (bytes, recon, chosen_lambda) = match self.target_frame_bytes {
+            None => {
+                let (bytes, recon) = encode_once(self.lambda)?;
+                (bytes, recon, self.lambda)
+            }
+            Some(target) => {
+                // Smallest λ whose output fits `target`, by warm-started
+                // doubling + bisection (size decreases with λ; occasional
+                // local non-monotonicity only costs optimality of the
+                // bracket endpoint, never the ≤-target guarantee).
+                const LAMBDA_CEILING: u64 = 1 << 20;
+                let warm = self.rc_lambda.min(LAMBDA_CEILING);
+                let mut best = encode_once(warm)?;
+                let mut best_lambda = warm;
+                if best.0.len() <= target {
+                    // Fits — chase fidelity downward. λ = 0 first (the
+                    // common generous-budget exit), then bisect.
+                    let (zero_bytes, zero_recon) = encode_once(0)?;
+                    if zero_bytes.len() <= target {
+                        best = (zero_bytes, zero_recon);
+                        best_lambda = 0;
+                    } else {
+                        let mut lo = 0u64; // known not to fit
+                        let mut hi = best_lambda; // known to fit
+                        while hi - lo > 1 {
+                            let mid = lo + (hi - lo) / 2;
+                            let candidate = encode_once(mid)?;
+                            if candidate.0.len() <= target {
+                                best = candidate;
+                                best_lambda = mid;
+                                hi = mid;
+                            } else {
+                                lo = mid;
+                            }
+                        }
+                    }
+                } else {
+                    // Too big — double upward until it fits (or hit the
+                    // ceiling: best-effort emission), then bisect back.
+                    let mut lo = best_lambda; // known not to fit
+                    let mut hi = best_lambda.max(1) * 2;
+                    loop {
+                        let candidate = encode_once(hi.min(LAMBDA_CEILING))?;
+                        let fits = candidate.0.len() <= target;
+                        if fits {
+                            best = candidate;
+                            best_lambda = hi.min(LAMBDA_CEILING);
+                            break;
+                        }
+                        if hi >= LAMBDA_CEILING {
+                            // Best effort: the ceiling encode is the
+                            // smallest this encoder can produce.
+                            best = candidate;
+                            best_lambda = LAMBDA_CEILING;
+                            break;
+                        }
+                        lo = hi;
+                        hi *= 2;
+                    }
+                    if best.0.len() <= target {
+                        let mut hi = best_lambda; // fits
+                        while hi - lo > 1 {
+                            let mid = lo + (hi - lo) / 2;
+                            let candidate = encode_once(mid)?;
+                            if candidate.0.len() <= target {
+                                best = candidate;
+                                best_lambda = mid;
+                                hi = mid;
+                            } else {
+                                lo = mid;
+                            }
+                        }
+                    }
+                }
+                let (bytes, recon) = best;
+                (bytes, recon, best_lambda)
+            }
+        };
+        let keyframe = intra_due;
+        self.rc_lambda = chosen_lambda;
+        self.reference = Some(recon);
         self.frame_index = self.frame_index.wrapping_add(1);
 
         let mut packet =
@@ -753,6 +868,85 @@ mod tests {
         }
         encoder.flush().expect("flush ok");
         assert!(matches!(encoder.receive_packet(), Err(Error::Eof)));
+    }
+
+    /// Rate controller: every emitted packet fits the per-frame byte
+    /// budget, and the stream still round-trips through the registry
+    /// decoder (λ scheduling is encoder policy — the wire stays
+    /// conformant at any λ).
+    #[test]
+    fn rate_controller_meets_per_frame_budget() {
+        let (width, height) = (64usize, 48usize);
+        let params = encoder_params(width as u32, height as u32);
+        let target = 700usize;
+        let mut encoder = make_encoder_handle(&params).expect("encoder builds");
+        encoder.set_target_frame_bytes(Some(target));
+        let mut decoder = make_decoder(&params).expect("decoder builds");
+
+        for (i, seed) in [7u32, 9, 11, 13].into_iter().enumerate() {
+            encoder
+                .send_frame(&synthetic_frame(width, height, seed, i as i64))
+                .expect("frame accepted");
+            let packet = encoder.receive_packet().expect("packet produced");
+            assert!(
+                packet.data.len() <= target,
+                "frame {i}: {} bytes exceeds the {target}-byte budget",
+                packet.data.len()
+            );
+            decoder.send_packet(&packet).expect("packet accepted");
+            let Frame::Video(video) = decoder.receive_frame().expect("frame decodes") else {
+                panic!("expected a video frame");
+            };
+            assert_eq!(video.planes[0].data.len(), width * height);
+        }
+    }
+
+    /// Rate controller under a generous budget converges on the λ = 0
+    /// (maximum-fidelity) encode — byte-identical to a fixed-λ = 0
+    /// encoder over the same frames (the encoder is deterministic).
+    #[test]
+    fn rate_controller_chases_fidelity_under_generous_budget() {
+        let (width, height) = (64usize, 48usize);
+        let params = encoder_params(width as u32, height as u32);
+        let mut rc = make_encoder_handle(&params).expect("encoder builds");
+        rc.set_target_frame_bytes(Some(1 << 20));
+        let mut fixed = make_encoder_handle(&params).expect("encoder builds");
+        fixed.set_lambda(0);
+
+        for (i, seed) in [7u32, 9, 11].into_iter().enumerate() {
+            let frame = synthetic_frame(width, height, seed, i as i64);
+            rc.send_frame(&frame).expect("rc frame accepted");
+            fixed.send_frame(&frame).expect("fixed frame accepted");
+            let rc_packet = rc.receive_packet().expect("rc packet");
+            let fixed_packet = fixed.receive_packet().expect("fixed packet");
+            assert_eq!(
+                rc_packet.data, fixed_packet.data,
+                "frame {i}: generous-budget rate control must match λ = 0"
+            );
+        }
+    }
+
+    /// An unachievable budget still emits a valid (best-effort,
+    /// λ-ceiling) stream instead of failing — SVQ1 has a per-MB wire
+    /// floor no λ can compress away.
+    #[test]
+    fn rate_controller_best_effort_on_unachievable_budget() {
+        let (width, height) = (64usize, 48usize);
+        let params = encoder_params(width as u32, height as u32);
+        let mut encoder = make_encoder_handle(&params).expect("encoder builds");
+        encoder.set_target_frame_bytes(Some(8));
+        let mut decoder = make_decoder(&params).expect("decoder builds");
+
+        encoder
+            .send_frame(&synthetic_frame(width, height, 7, 0))
+            .expect("frame accepted");
+        let packet = encoder.receive_packet().expect("packet produced");
+        assert!(packet.data.len() > 8, "the 8-byte budget is unachievable");
+        decoder.send_packet(&packet).expect("packet accepted");
+        assert!(matches!(
+            decoder.receive_frame().expect("frame decodes"),
+            Frame::Video(_)
+        ));
     }
 
     /// The registry encoder is registered under the `svq1` id.
