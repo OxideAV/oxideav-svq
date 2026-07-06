@@ -191,6 +191,36 @@ fn inter4mv_luma_mode_census_is_pinned() {
     );
 }
 
+/// Corrupt variants of the fixture's P-frame must error out cleanly —
+/// never panic, never loop. This targets the r391 reference-window
+/// clamp arithmetic specifically: bit-flips inside the MV and mode
+/// fields produce arbitrary (including far-out-of-window) motion
+/// vectors against a real reference frame, the exact input class the
+/// clamp normalises.
+#[test]
+fn corrupt_p_frames_error_cleanly_under_the_window_clamp() {
+    let reference = decode_intra_frame(&FRAMES[..FRAME_SIZES[0]]).expect("I-frame decodes");
+    let p1 = &FRAMES[FRAME_SIZES[0]..FRAME_SIZES[0] + FRAME_SIZES[1]];
+
+    // Truncations at every byte boundary: decode or clean error.
+    for len in 0..p1.len() {
+        let _ = decode_frame_with_stats(&p1[..len], Some(&reference));
+    }
+
+    // Bit-flip sweep over the P-frame payload (every 5th byte, all
+    // 8 bits — dense in the header/MV region, still covering the
+    // whole residual tail; the full sweep is ~5× slower for the same
+    // panic-surface class).
+    let mut mutated = p1.to_vec();
+    for byte in (0..p1.len()).step_by(5) {
+        for bit in 0..8u8 {
+            mutated[byte] ^= 1 << bit;
+            let _ = decode_frame_with_stats(&mutated, Some(&reference));
+            mutated[byte] ^= 1 << bit;
+        }
+    }
+}
+
 /// Exact luma `(skip, inter, intra)` MB counts for P-frames 1..=24
 /// (of 99 MBs each), as decoded by the byte-exact chain — see
 /// [`inter4mv_luma_mode_census_is_pinned`].
