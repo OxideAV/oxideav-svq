@@ -545,6 +545,63 @@ fn mc_subblock_into(
     }
 }
 
+/// Clamp one MV component to the halfpel-domain window that keeps the
+/// MC footprint of a `blk`-wide block at full-pel position `pos`
+/// inside `[0, limit)` — see [`clamp_mv_to_reference_window`].
+fn clamp_mv_component_to_window(v: i32, pos: usize, blk: usize, limit: usize) -> i32 {
+    let lo = -2 * pos as i32;
+    let hi = 2 * (limit as i32 - blk as i32 - pos as i32);
+    v.clamp(lo, hi.max(lo))
+}
+
+/// Clamp a decoded motion vector to the **reference-window law**
+/// pinned by the independently-minted INTER_4MV conformance fixture
+/// (`docs/video/svq1/fixtures/inter-4mv/`, docs `f210f08`): before
+/// motion compensation, each MV component is saturated (in half-pel
+/// units) so that the block's entire MC footprint — including the
+/// half-pel interpolation read at `+1` — stays inside the **padded
+/// (macroblock-aligned) reference canvas** `[0, w) × [0, h)`.
+///
+/// This arbitrates the spec/06 §6.7 / §6.7.4 (#174) implementation-
+/// defined edge question for real third-party streams, replacing edge
+/// replication on the inter path:
+///
+/// * The clamp window is the PADDED canvas, not the visible frame:
+///   the fixture's chroma planes (44 × 36 visible, 48 × 48 padded)
+///   decode byte-exact only when MVs may reach into the §4.7.3
+///   overhang region — which therefore must be decoded AND stored in
+///   the reference (as [`decode_intra_plane`] /
+///   [`decode_inter_plane`] already do). Clamping to the visible
+///   window instead diverges on the chroma planes.
+/// * The clamp applies to the MC read ONLY. The §6.8 MV cache stores
+///   the UNCLAMPED vector (predictor + differential, §6.6-clipped) —
+///   clamping the cached value too diverges on the very next
+///   macroblock row of the fixture.
+///
+/// Because the clamped footprint is always in-window, the §6.7.2 edge
+/// replication of [`Svq1ReferencePlane`] is unreachable from the
+/// frame-decode path; it remains for direct [`crate::svq1_mc`] users.
+///
+/// `(x0, y0)` is the block's top-left full-pel position, `blk` its
+/// edge length (16 for a whole INTER macroblock, 8 for an INTER_4MV
+/// sub-block), `(w, h)` the padded reference canvas dimensions. For a
+/// block that could never fit (overhang wider than the window) the
+/// lower bound wins — unreachable for canvases padded to whole
+/// macroblocks.
+pub fn clamp_mv_to_reference_window(
+    mv: Svq1Mv,
+    x0: usize,
+    y0: usize,
+    blk: usize,
+    w: usize,
+    h: usize,
+) -> Svq1Mv {
+    Svq1Mv::new(
+        clamp_mv_component_to_window(mv.x, x0, blk, w),
+        clamp_mv_component_to_window(mv.y, y0, blk, h),
+    )
+}
+
 /// Decode one INTERFRAME plane payload against `reference` (the
 /// previous I- or P-frame's canvas for the same plane): every
 /// macroblock in raster order reads its T03 coding mode, resolves
@@ -584,7 +641,19 @@ pub fn decode_inter_plane(
                 }
                 Svq1MbMode::Inter => {
                     let (dx, dy) = read_mv_differential(br)?;
-                    let mv = cache.decode_inter(block_row, block_col, dx, dy);
+                    // The cache stores the UNCLAMPED vector (it feeds
+                    // later predictors); the MC read is clamped to the
+                    // padded reference window — both sides pinned by
+                    // the INTER_4MV conformance fixture (see
+                    // `clamp_mv_to_reference_window`).
+                    let mv = clamp_mv_to_reference_window(
+                        cache.decode_inter(block_row, block_col, dx, dy),
+                        mb_x * MB_DIM,
+                        mb_y * MB_DIM,
+                        MB_DIM,
+                        canvas.stride,
+                        canvas.rows,
+                    );
                     for (sub_row, sub_col) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
                         mc_subblock_into(
                             &mut canvas,
@@ -607,18 +676,26 @@ pub fn decode_inter_plane(
                     }
                     let mvs = cache.decode_inter_4mv(block_row, block_col, diffs);
                     // SUBBLOCK_ORDER is top-left, top-right,
-                    // bottom-left, bottom-right (§6.4.4).
+                    // bottom-left, bottom-right (§6.4.4). Each 8×8
+                    // sub-block's MC read is clamped to the padded
+                    // reference window INDEPENDENTLY (per-sub-block
+                    // footprint); the cache stores kept the unclamped
+                    // vectors above.
                     for (i, (sub_row, sub_col)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
                         .into_iter()
                         .enumerate()
                     {
-                        mc_subblock_into(
-                            &mut canvas,
-                            &ref_plane,
-                            (block_col + sub_col) * MC_BLOCK_DIM,
-                            (block_row + sub_row) * MC_BLOCK_DIM,
+                        let x0 = (block_col + sub_col) * MC_BLOCK_DIM;
+                        let y0 = (block_row + sub_row) * MC_BLOCK_DIM;
+                        let mv = clamp_mv_to_reference_window(
                             mvs[i],
+                            x0,
+                            y0,
+                            MC_BLOCK_DIM,
+                            canvas.stride,
+                            canvas.rows,
                         );
+                        mc_subblock_into(&mut canvas, &ref_plane, x0, y0, mv);
                     }
                     decode_mb_block_tree(br, &mut canvas, mb_x, mb_y, Svq1Half::Inter)?;
                 }
@@ -965,5 +1042,79 @@ mod tests {
         assert_eq!(frame.v.visible(), vec![200u8; 16]);
         // Doc-anchor: the intra mean decoder is the single T01 table.
         assert_eq!(intra_mean_decoder().min_value(), 0);
+    }
+
+    #[test]
+    fn reference_window_clamp_is_inert_for_in_window_footprints() {
+        // A 16×16 block at (16, 16) in a 176×144 canvas: MVs whose
+        // halfpel footprint stays inside are untouched.
+        for mv in [
+            Svq1Mv::new(0, 0),
+            Svq1Mv::new(-32, -32),
+            Svq1Mv::new(31, 31),
+            Svq1Mv::new(-7, 13),
+        ] {
+            assert_eq!(
+                clamp_mv_to_reference_window(mv, 16, 16, 16, 176, 144),
+                mv,
+                "in-window MV must pass through"
+            );
+        }
+    }
+
+    #[test]
+    fn reference_window_clamp_saturates_right_edge_including_halfpel_read() {
+        // The INTER_4MV-fixture case: MB column 10 of a 176-wide
+        // plane (x0 = 160). mv.x = +4 (full-pel +2) reads x = 177;
+        // mv.x = +1 (half-pel) reads x = 176; both exceed w−1 = 175
+        // and clamp to 0. The y component is untouched.
+        for bad_x in [4, 1, 2, 31] {
+            assert_eq!(
+                clamp_mv_to_reference_window(Svq1Mv::new(bad_x, -8), 160, 64, 16, 176, 144),
+                Svq1Mv::new(0, -8),
+            );
+        }
+        // Negative x is unconstrained on the right edge (until the
+        // left bound at −2·x0 = −320, far past the §6.6 clip).
+        assert_eq!(
+            clamp_mv_to_reference_window(Svq1Mv::new(-9, -8), 160, 64, 16, 176, 144),
+            Svq1Mv::new(-9, -8),
+        );
+    }
+
+    #[test]
+    fn reference_window_clamp_saturates_all_four_edges() {
+        // Top-left block: negative components clamp to 0.
+        assert_eq!(
+            clamp_mv_to_reference_window(Svq1Mv::new(-5, -1), 0, 0, 16, 176, 144),
+            Svq1Mv::new(0, 0),
+        );
+        // Bottom edge (y0 = 128 of 144): positive y clamps to 0.
+        assert_eq!(
+            clamp_mv_to_reference_window(Svq1Mv::new(0, 3), 0, 128, 16, 176, 144),
+            Svq1Mv::new(0, 0),
+        );
+        // One row up (y0 = 112): up to +2·16 = 32 would fit; the §6.6
+        // range keeps inputs ≤ 31, all of which pass through.
+        assert_eq!(
+            clamp_mv_to_reference_window(Svq1Mv::new(0, 31), 0, 112, 16, 176, 144),
+            Svq1Mv::new(0, 31),
+        );
+    }
+
+    #[test]
+    fn reference_window_clamp_uses_per_subblock_footprint() {
+        // An 8×8 INTER_4MV sub-block at x0 = 168 (the right half of
+        // MB column 10): +4 clamps to 0, while the LEFT sub-block of
+        // the same MB (x0 = 160) may keep +4 with blk = 8 (footprint
+        // 160..170 ≤ 175).
+        assert_eq!(
+            clamp_mv_to_reference_window(Svq1Mv::new(4, 0), 168, 64, 8, 176, 144),
+            Svq1Mv::new(0, 0),
+        );
+        assert_eq!(
+            clamp_mv_to_reference_window(Svq1Mv::new(4, 0), 160, 64, 8, 176, 144),
+            Svq1Mv::new(4, 0),
+        );
     }
 }

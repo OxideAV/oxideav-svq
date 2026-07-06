@@ -6,6 +6,18 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- svq1: reference-window MV clamp (`clamp_mv_to_reference_window`) — inter MC
+  reads are clamped to the padded reference canvas while the MV cache keeps
+  the unclamped vector; arbitrates the spec/06 §6.7/§6.7.4 (#174)
+  implementation-defined edge law against the independently-minted INTER_4MV
+  fixture and pins §4.7.3 overhang samples as stored, readable reference data
+- svq1 tests: 25-frame INTER_4MV conformance chain
+  (docs/video/svq1/fixtures/inter-4mv, docs f210f08) — I + 24 P decoded
+  byte-exact against the minting toolchain's own decode, each P predicting
+  from our previous reconstruction
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-svq/releases/tag/v0.0.2) - 2026-07-03
 
 ### Other
