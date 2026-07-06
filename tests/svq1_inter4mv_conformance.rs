@@ -1,31 +1,31 @@
-//! SVQ1 INTER_4MV conformance — 25-frame independently-minted fixture.
+//! SVQ1 25-frame conformance against the docs `inter-4mv` fixture —
+//! an independently-minted stream from a SECOND encoder family.
 //!
 //! `tests/fixtures/inter4mv_176x144_25f.svq1` is the concatenated raw
 //! SVQ1 frame payload of `docs/video/svq1/fixtures/inter-4mv/`
 //! (docs commit `f210f08`): 176×144 (QCIF — exactly 11×9 luma
 //! macroblocks, no edge overhang), yuv410p, one I-frame + 24
-//! P-frames, minted with an INDEPENDENT black-box SVQ1 encoder whose
-//! rate-distortion search provably selects `INTER_4MV` (the common
-//! reference encoder never emits the mode — see the fixture's
-//! differential proof: the `+mv4` / `-mv4` control pair shares a
-//! byte-identical I-frame yet every P-frame differs, and 12/12
-//! P-frames of a `-g 2` control carry the mode).
-//! `inter4mv_176x144_25f.yuv410p` is that toolchain's own black-box
-//! decode (25 × 28 512 B, verified 0 decoder errors).
+//! P-frames. `inter4mv_176x144_25f.yuv410p` is the minting
+//! toolchain's own black-box decode (25 × 28 512 B, verified 0
+//! decoder errors).
+//!
+//! NOTE ON THE NAME: the fixture was staged to prove `INTER_4MV`
+//! presence via a differential `+mv4`/`-mv4` argument — but the
+//! byte-exact mode census below shows the stream contains **zero**
+//! INTER_4MV macroblocks (see
+//! [`inter4mv_luma_mode_census_is_pinned`] for the refutation
+//! record). The fixture keeps its docs name; what it actually pins
+//! is different and still substantial.
 //!
 //! Decoding all 25 frames byte-exact — each P against OUR previous
 //! reconstruction, so any divergence cascades and cannot hide —
 //! pins, in the Validator role:
 //!
-//! * the `INTER_4MV` decode path against real inter-stream data for
-//!   the first time (the mode was previously validated only against
-//!   our own encoder's output): four positional T02 differentials on
-//!   the wire, strictly serial §6.4.5 predict/store interleave, §6.8.1
-//!   sub-block MV cache stores, per-8×8 half-pel MC;
 //! * cross-encoder generality of the audit/01 §7.1 T03 mode
 //!   permutation, spec/06 §6.2.3 Reading B, and the §6.4 median MV
 //!   predictor — this stream comes from a different encoder family
-//!   than every prior fixture;
+//!   than every prior fixture (SKIP / INTER / INTRA mix per frame,
+//!   ~7 500 macroblocks total);
 //! * the spec/06 §6.7 / §6.7.4 (#174) edge law FOR THIS ORACLE
 //!   FAMILY: despite the fixture's in-frame *content* construction,
 //!   its right-edge macroblocks decode MVs whose halfpel MC footprint
@@ -41,7 +41,9 @@
 //!   visible-window clamp, clamped cache stores) each diverge on this
 //!   stream and are excluded empirically.
 
-use oxideav_svq::svq1_plane::{decode_frame, decode_intra_frame, Svq1DecodedFrame};
+use oxideav_svq::svq1_plane::{
+    decode_frame_with_stats, decode_intra_frame, Svq1DecodedFrame, Svq1FrameModeStats,
+};
 
 const FRAMES: &[u8] = include_bytes!("fixtures/inter4mv_176x144_25f.svq1");
 const REF_YUV: &[u8] = include_bytes!("fixtures/inter4mv_176x144_25f.yuv410p");
@@ -93,13 +95,15 @@ fn assert_frame_matches(n: usize, frame: &Svq1DecodedFrame, want: &[u8]) {
     }
 }
 
-#[test]
-fn inter4mv_25_frame_chain_decodes_byte_exact() {
+/// Decode the whole 25-frame chain, asserting byte-exactness per
+/// frame, and return the per-P-frame T03 mode census.
+fn decode_chain() -> Vec<Svq1FrameModeStats> {
     assert_eq!(FRAME_SIZES.iter().sum::<usize>(), FRAMES.len());
     assert_eq!(REF_YUV.len(), 25 * FRAME_YUV);
 
     let mut offset = 0usize;
     let mut reference: Option<Svq1DecodedFrame> = None;
+    let mut stats = Vec::new();
     for (n, &size) in FRAME_SIZES.iter().enumerate() {
         let bytes = &FRAMES[offset..offset + size];
         offset += size;
@@ -110,14 +114,109 @@ fn inter4mv_25_frame_chain_decodes_byte_exact() {
             assert!(frame.header.is_intra(), "frame 0 must be intra");
             frame
         } else {
-            let frame = decode_frame(bytes, reference.as_ref()).unwrap_or_else(|e| {
-                panic!("P-frame {n} fails to decode: {e:?}");
-            });
+            let (frame, frame_stats) = decode_frame_with_stats(bytes, reference.as_ref())
+                .unwrap_or_else(|e| {
+                    panic!("P-frame {n} fails to decode: {e:?}");
+                });
             assert!(!frame.header.is_intra(), "frame {n} must be inter");
+            stats.push(frame_stats);
             frame
         };
 
         assert_frame_matches(n, &frame, want);
         reference = Some(frame);
     }
+    stats
 }
+
+#[test]
+fn inter4mv_25_frame_chain_decodes_byte_exact() {
+    decode_chain();
+}
+
+/// The exact per-P-frame luma INTER_4MV macroblock counts — the
+/// observable the fixture notes flag as unobtainable without a full
+/// decoder ("exact per-MB INTER_4MV count is NOT independently
+/// obtainable"; `docs/video/svq1/fixtures/inter-4mv/notes.md`). This
+/// decoder is byte-exact against the minting toolchain's own decode
+/// across the whole chain, so its wire census IS the stream's mode
+/// record; pinning it makes the count a CI-conformance fact and a
+/// Validator-round exhibit.
+#[test]
+fn inter4mv_luma_mode_census_is_pinned() {
+    let stats = decode_chain();
+    assert_eq!(stats.len(), 24);
+
+    // Every plane census must cover the full MB grid (11×9 luma,
+    // 3×3 chroma).
+    for (n, s) in stats.iter().enumerate() {
+        assert_eq!(s.y.total(), 11 * 9, "frame {} luma census total", n + 1);
+        assert_eq!(s.u.total(), 3 * 3, "frame {} U census total", n + 1);
+        assert_eq!(s.v.total(), 3 * 3, "frame {} V census total", n + 1);
+    }
+
+    // REFUTATION RECORD: the fixture was minted (docs f210f08) on a
+    // differential argument concluding "≥ 1 INTER_4MV MB in P-frame
+    // 1" — but the byte-exact census shows ZERO INTER_4MV macroblocks
+    // in the ENTIRE stream, on every plane. A mode misread cannot
+    // hide here: T03 codeword lengths and the per-mode MV field
+    // counts differ, so any mode confusion desynchronises the bit
+    // stream, while this decode is byte-exact for all 25 frames (and
+    // the T03 position-1 = INTER_4MV mapping is independently pinned
+    // by the r386 encoder fixture, which the reference Sorenson
+    // decoder binary reproduced byte-exact). The docs' control lemma
+    // ("+mv4 is inert unless INTER_4MV is selected", verified only on
+    // flat content) therefore does not generalise: the flag changed
+    // the minting encoder's mode/MV decisions on this content without
+    // the mode ever being emitted.
+    for (n, s) in stats.iter().enumerate() {
+        assert_eq!(
+            (s.y.inter_4mv, s.u.inter_4mv, s.v.inter_4mv),
+            (0, 0, 0),
+            "frame {} unexpectedly carries INTER_4MV",
+            n + 1
+        );
+    }
+
+    // Pin the exact luma census (skip / inter / intra per P-frame) as
+    // the stream's mode record — the observable the fixture notes
+    // call for.
+    let y_census: Vec<(usize, usize, usize)> = stats
+        .iter()
+        .map(|s| (s.y.skip, s.y.inter, s.y.intra))
+        .collect();
+    assert_eq!(
+        y_census, EXPECTED_Y_CENSUS,
+        "exact per-P-frame luma (skip, inter, intra) MB counts"
+    );
+}
+
+/// Exact luma `(skip, inter, intra)` MB counts for P-frames 1..=24
+/// (of 99 MBs each), as decoded by the byte-exact chain — see
+/// [`inter4mv_luma_mode_census_is_pinned`].
+const EXPECTED_Y_CENSUS: [(usize, usize, usize); 24] = [
+    (1, 81, 17),
+    (0, 79, 20),
+    (0, 74, 25),
+    (0, 72, 27),
+    (0, 78, 21),
+    (0, 76, 23),
+    (0, 77, 22),
+    (0, 74, 25),
+    (0, 75, 24),
+    (0, 75, 24),
+    (0, 71, 28),
+    (0, 76, 23),
+    (0, 83, 16),
+    (0, 79, 20),
+    (0, 88, 11),
+    (0, 87, 12),
+    (0, 86, 13),
+    (0, 84, 15),
+    (0, 84, 15),
+    (0, 82, 17),
+    (0, 84, 15),
+    (0, 88, 11),
+    (0, 88, 11),
+    (0, 83, 16),
+];

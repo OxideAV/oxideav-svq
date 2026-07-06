@@ -8,6 +8,12 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- svq1: T03 macroblock coding-mode census — `decode_frame_with_stats` /
+  `decode_inter_plane_with_stats` return per-plane SKIP/INTER/INTER_4MV/INTRA
+  counts (`Svq1FrameModeStats` / `Svq1PlaneModeStats`); the byte-exact census
+  of the docs inter-4mv fixture is CI-pinned and REFUTES the fixture's
+  INTER_4MV-presence claim (zero 4MV macroblocks in the entire stream)
+
 - svq1: reference-window MV clamp (`clamp_mv_to_reference_window`) — inter MC
   reads are clamped to the padded reference canvas while the MV cache keeps
   the unclamped vector; arbitrates the spec/06 §6.7/§6.7.4 (#174)

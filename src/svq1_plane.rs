@@ -545,6 +545,53 @@ fn mc_subblock_into(
     }
 }
 
+/// Per-plane census of the T03 macroblock coding modes seen while
+/// decoding one interframe plane — the observable record the
+/// INTER_4MV fixture's notes call for (an exact per-MB mode count
+/// requires a full decoder because the stream has no per-MB resync;
+/// this decoder IS one, byte-exact against the fixture oracle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Svq1PlaneModeStats {
+    /// SKIP macroblocks (copied from the reference).
+    pub skip: usize,
+    /// Single-MV INTER macroblocks.
+    pub inter: usize,
+    /// Four-MV INTER_4MV macroblocks.
+    pub inter_4mv: usize,
+    /// Intra-coded macroblocks inside the inter frame.
+    pub intra: usize,
+}
+
+impl Svq1PlaneModeStats {
+    /// Total macroblocks recorded (= the plane's MB-grid size).
+    pub fn total(&self) -> usize {
+        self.skip + self.inter + self.inter_4mv + self.intra
+    }
+
+    fn record(&mut self, mode: Svq1MbMode) {
+        match mode {
+            Svq1MbMode::Skip => self.skip += 1,
+            Svq1MbMode::Inter => self.inter += 1,
+            Svq1MbMode::Inter4mv => self.inter_4mv += 1,
+            Svq1MbMode::Intra => self.intra += 1,
+        }
+    }
+}
+
+/// Per-frame T03 mode census: one [`Svq1PlaneModeStats`] per plane in
+/// Y, U, V order. For an intra frame every macroblock is intra-coded
+/// by definition (there is no T03 field on the wire), so the census
+/// reports `intra = <MB-grid size>` for each plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Svq1FrameModeStats {
+    /// Luma plane census.
+    pub y: Svq1PlaneModeStats,
+    /// First chroma plane census.
+    pub u: Svq1PlaneModeStats,
+    /// Second chroma plane census.
+    pub v: Svq1PlaneModeStats,
+}
+
 /// Clamp one MV component to the halfpel-domain window that keeps the
 /// MC footprint of a `blk`-wide block at full-pel position `pos`
 /// inside `[0, limit)` — see [`clamp_mv_to_reference_window`].
@@ -617,6 +664,17 @@ pub fn decode_inter_plane(
     height: usize,
     reference: &Svq1PlaneCanvas,
 ) -> Result<Svq1PlaneCanvas> {
+    decode_inter_plane_with_stats(br, width, height, reference).map(|(canvas, _)| canvas)
+}
+
+/// [`decode_inter_plane`], additionally returning the per-plane T03
+/// coding-mode census ([`Svq1PlaneModeStats`]) observed on the wire.
+pub fn decode_inter_plane_with_stats(
+    br: &mut BitReader<'_>,
+    width: usize,
+    height: usize,
+    reference: &Svq1PlaneCanvas,
+) -> Result<(Svq1PlaneCanvas, Svq1PlaneModeStats)> {
     let mut canvas = Svq1PlaneCanvas::new(width, height);
     if reference.stride != canvas.stride || reference.rows != canvas.rows {
         return Err(Error::MissingReference);
@@ -625,11 +683,14 @@ pub fn decode_inter_plane(
     let mut cache = Svq1MvCache::new(mb_cols, mb_rows);
     let ref_plane = Svq1ReferencePlane::new(&reference.samples, reference.stride, reference.rows)
         .ok_or(Error::MissingReference)?;
+    let mut stats = Svq1PlaneModeStats::default();
 
     for mb_y in 0..mb_rows {
         for mb_x in 0..mb_cols {
             let (block_row, block_col) = (mb_y * 2, mb_x * 2);
-            match read_mb_mode(br)? {
+            let mode = read_mb_mode(br)?;
+            stats.record(mode);
+            match mode {
                 Svq1MbMode::Skip => {
                     copy_mb_from_reference(&mut canvas, reference, mb_x, mb_y);
                     cache.store_skip_intra(block_row, block_col);
@@ -702,7 +763,7 @@ pub fn decode_inter_plane(
             }
         }
     }
-    Ok(canvas)
+    Ok((canvas, stats))
 }
 
 /// Decode a complete SVQ1 frame — I, P, or B — against an optional
@@ -720,9 +781,39 @@ pub fn decode_frame(
     bytes: &[u8],
     reference: Option<&Svq1DecodedFrame>,
 ) -> Result<Svq1DecodedFrame> {
+    decode_frame_with_stats(bytes, reference).map(|(frame, _)| frame)
+}
+
+/// [`decode_frame`], additionally returning the per-frame T03
+/// coding-mode census ([`Svq1FrameModeStats`]).
+///
+/// For an intra frame the census is synthesised (every macroblock is
+/// intra-coded; no T03 field exists on the wire): each plane reports
+/// `intra` equal to its MB-grid size. For P / B frames the census is
+/// the exact wire record — the fixture-notes "exact per-MB INTER_4MV
+/// count" observable that requires a full decoder (no per-MB resync
+/// exists, so the mode fields are only reachable by decoding every
+/// intervening residual).
+pub fn decode_frame_with_stats(
+    bytes: &[u8],
+    reference: Option<&Svq1DecodedFrame>,
+) -> Result<(Svq1DecodedFrame, Svq1FrameModeStats)> {
     let header = parse_frame_header(bytes)?;
     if header.picture_type == Svq1PictureType::Intra {
-        return decode_intra_frame(bytes);
+        let frame = decode_intra_frame(bytes)?;
+        let intra_census = |canvas: &Svq1PlaneCanvas| {
+            let (mb_cols, mb_rows) = canvas.mb_grid();
+            Svq1PlaneModeStats {
+                intra: mb_cols * mb_rows,
+                ..Svq1PlaneModeStats::default()
+            }
+        };
+        let stats = Svq1FrameModeStats {
+            y: intra_census(&frame.y),
+            u: intra_census(&frame.u),
+            v: intra_census(&frame.v),
+        };
+        return Ok((frame, stats));
     }
     let reference = reference.ok_or(Error::MissingReference)?;
     let width = reference.width();
@@ -733,11 +824,28 @@ pub fn decode_frame(
         br.read_bit()?;
     }
 
-    let y = decode_inter_plane(&mut br, width, height, &reference.y)?;
-    let u = decode_inter_plane(&mut br, chroma_dim(width), chroma_dim(height), &reference.u)?;
-    let v = decode_inter_plane(&mut br, chroma_dim(width), chroma_dim(height), &reference.v)?;
+    let (y, y_stats) = decode_inter_plane_with_stats(&mut br, width, height, &reference.y)?;
+    let (u, u_stats) = decode_inter_plane_with_stats(
+        &mut br,
+        chroma_dim(width),
+        chroma_dim(height),
+        &reference.u,
+    )?;
+    let (v, v_stats) = decode_inter_plane_with_stats(
+        &mut br,
+        chroma_dim(width),
+        chroma_dim(height),
+        &reference.v,
+    )?;
 
-    Ok(Svq1DecodedFrame { header, y, u, v })
+    Ok((
+        Svq1DecodedFrame { header, y, u, v },
+        Svq1FrameModeStats {
+            y: y_stats,
+            u: u_stats,
+            v: v_stats,
+        },
+    ))
 }
 
 #[cfg(test)]
