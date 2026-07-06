@@ -330,6 +330,7 @@ pub fn make_encoder_handle(params: &CodecParameters) -> Result<Svq1EncoderHandle
         keyframe_interval: 30,
         target_frame_bytes: None,
         rc_lambda: 32,
+        droppable_period: 0,
         frame_index: 0,
         reference: None,
         pending: std::collections::VecDeque::new(),
@@ -353,6 +354,9 @@ pub struct Svq1EncoderHandle {
     target_frame_bytes: Option<usize>,
     /// The rate controller's warm-start λ (last chosen value).
     rc_lambda: u64,
+    /// Droppable-frame cadence ([`Self::set_droppable_period`]);
+    /// `0` = no droppable frames.
+    droppable_period: u32,
     frame_index: u32,
     reference: Option<crate::svq1_plane::Svq1DecodedFrame>,
     pending: std::collections::VecDeque<Packet>,
@@ -402,6 +406,21 @@ impl Svq1EncoderHandle {
     pub fn set_target_frame_bytes(&mut self, target: Option<usize>) {
         self.target_frame_bytes = target;
         self.rc_lambda = self.lambda;
+    }
+
+    /// Set the droppable (B) frame cadence. Direct-API knob — the
+    /// factory default is `0` (no droppable frames).
+    ///
+    /// With `period > 0`, every inter frame whose index is NOT a
+    /// multiple of `period` is emitted as an SVQ1 droppable frame
+    /// (picture type 2) — e.g. `period = 2` produces `I B P B P …`.
+    /// Droppable frames predict from the last NON-droppable frame and
+    /// never become the reference (wiki §"Algorithm Basics" / spec/06
+    /// §6.10 item 8), so a transport may discard their packets
+    /// without perturbing any later frame — reference transparency is
+    /// CI-pinned at the registry level.
+    pub fn set_droppable_period(&mut self, period: u32) {
+        self.droppable_period = period;
     }
 
     /// Nearest-neighbour 4:2:0 → 4:1:0 chroma decimation (the exact
@@ -485,6 +504,12 @@ impl Encoder for Svq1EncoderHandle {
 
         let intra_due =
             self.reference.is_none() || self.frame_index % self.keyframe_interval.max(1) == 0;
+        // Droppable (B) cadence: inter frames whose index is not a
+        // multiple of the period are emitted as picture type 2 and
+        // never become the reference (see `set_droppable_period`).
+        let droppable = !intra_due
+            && self.droppable_period > 0
+            && self.frame_index % self.droppable_period != 0;
         let temporal_reference = (self.frame_index & 0xff) as u8;
         let encode_once = |lambda: u64| -> Result<(Vec<u8>, crate::svq1_plane::Svq1DecodedFrame)> {
             if intra_due {
@@ -506,6 +531,7 @@ impl Encoder for Svq1EncoderHandle {
                     &crate::svq1_enc_inter::Svq1InterParams {
                         lambda,
                         temporal_reference,
+                        droppable,
                         ..Default::default()
                     },
                 )?;
@@ -593,7 +619,9 @@ impl Encoder for Svq1EncoderHandle {
         };
         let keyframe = intra_due;
         self.rc_lambda = chosen_lambda;
-        self.reference = Some(recon);
+        if !droppable {
+            self.reference = Some(recon);
+        }
         self.frame_index = self.frame_index.wrapping_add(1);
 
         let mut packet =
@@ -947,6 +975,61 @@ mod tests {
             decoder.receive_frame().expect("frame decodes"),
             Frame::Video(_)
         ));
+    }
+
+    /// Droppable cadence: `set_droppable_period(2)` produces
+    /// `I B P B P`; the B packets carry picture type 2 and are
+    /// reference-transparent — decoding the stream WITHOUT them
+    /// yields byte-identical non-B frames (registry decoder level).
+    #[test]
+    fn droppable_period_emits_reference_transparent_b_frames() {
+        let (width, height) = (64usize, 48usize);
+        let params = encoder_params(width as u32, height as u32);
+        let mut encoder = make_encoder_handle(&params).expect("encoder builds");
+        encoder.set_droppable_period(2);
+
+        let mut packets = Vec::new();
+        for (i, seed) in [7u32, 9, 11, 13, 15].into_iter().enumerate() {
+            encoder
+                .send_frame(&synthetic_frame(width, height, seed, i as i64))
+                .expect("frame accepted");
+            packets.push(encoder.receive_packet().expect("packet produced"));
+        }
+
+        // Picture types on the wire: I B P B P.
+        let picture_types: Vec<u8> = packets
+            .iter()
+            .map(|p| {
+                crate::header::parse_frame_header(&p.data)
+                    .expect("header parses")
+                    .picture_type as u8
+            })
+            .collect();
+        assert_eq!(picture_types, [0, 2, 1, 2, 1], "I B P B P cadence");
+
+        // Full decode: every frame produces output.
+        let decode = |selected: &[usize]| -> Vec<(usize, Vec<u8>)> {
+            let mut decoder = make_decoder(&params).expect("decoder builds");
+            let mut out = Vec::new();
+            for &i in selected {
+                decoder.send_packet(&packets[i]).expect("packet accepted");
+                let Frame::Video(video) = decoder.receive_frame().expect("frame decodes") else {
+                    panic!("expected a video frame");
+                };
+                out.push((i, video.planes[0].data.clone()));
+            }
+            out
+        };
+        let full = decode(&[0, 1, 2, 3, 4]);
+        let dropped = decode(&[0, 2, 4]);
+
+        // The non-B frames decode byte-identical with the B packets
+        // discarded — droppable frames never entered the reference
+        // chain on either side.
+        for (i, luma) in &dropped {
+            let (_, full_luma) = full.iter().find(|(j, _)| j == i).expect("frame present");
+            assert_eq!(luma, full_luma, "frame {i} luma differs after B-drop");
+        }
     }
 
     /// The registry encoder is registered under the `svq1` id.

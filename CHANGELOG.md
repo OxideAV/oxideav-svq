@@ -12,6 +12,9 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   finds the smallest λ fitting the byte budget (warm-started doubling +
   bisection; best-effort at the λ ceiling when the budget is unachievable);
   `make_encoder_handle` exposes the concrete handle for the tuning knobs
+- svq1 encoder: droppable (B) frame cadence — `Svq1EncoderHandle::set_droppable_period`
+  emits `I B P B P …` GOPs; B packets are reference-transparent at the registry
+  level (CI-pinned drop test)
 - svq1 tests: corrupt-P-frame truncation + bit-flip robustness sweep over the
   reference-window clamp path
 

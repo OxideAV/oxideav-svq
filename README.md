@@ -142,6 +142,11 @@ between our decoder and the reference decoder binary:
   budgets converge byte-identical to λ = 0; unachievable budgets
   emit best-effort at the λ ceiling) — CI-pinned through the
   registry decoder round trip.
+* **Droppable cadence** (`set_droppable_period`): `I B P B P …` GOPs
+  from the registry handle; B packets carry picture type 2, predict
+  from the last non-droppable frame, and are reference-transparent
+  (decoding with the B packets discarded leaves every other frame
+  byte-identical — CI-pinned at the registry level).
 
 Remaining SVQ1 tails: the frame-tail checksum polynomial and
 embedded-string XOR table (locations still unpinned in the docs
