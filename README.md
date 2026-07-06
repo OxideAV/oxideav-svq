@@ -10,9 +10,11 @@ Implemented from the clean-room specifications staged under
 
 ## Status
 
-**SVQ1: decoder COMPLETE for the I/P forward path AND a full I/P/B
-encoder (adaptive λ-tree, MV search, INTER_4MV, droppable frames),
-both byte-exact against black-box reference decodes.**
+**SVQ1: decoder COMPLETE for the I/P forward path — byte-exact
+against TWO independent oracle families (the reference Sorenson
+binary and the docs `inter-4mv` fixture's minting toolchain, 25
+chained frames) — AND a full I/P/B encoder (adaptive λ-tree, MV
+search, INTER_4MV, droppable frames).**
 `receive_frame` returns real frames; `make_encoder` produces streams
 the reference decoder reproduces sample-exact. SVQ3 remains parse +
 reconstruction-composition infrastructure gated on the CBP `me(v)`
@@ -37,8 +39,9 @@ chain exercising overhang macroblocks:
   1`.
 * **Codebook** (`svq1_codebook`): the canonical 23 040-byte region at
   functional base `0x5d214..0x62c14` (block-shape-LUT dual-use front
-  16 bytes + the staged 23 004-byte payload + the locally-staged
-  20-byte tail `tables/codebook-tail.csv`). Page layout pinned in the
+  16 bytes + the staged 23 004-byte payload + the 20-byte tail
+  `tables/codebook-tail.csv` — byte-identical with the docs
+  Extractor backfill, docs `717a248`). Page layout pinned in the
   Validator role — level-major DESCENDING (L=3 → L=0), intra half
   then inter half per level (`half_byte_offset_in_payload`; neither
   §14.8 working hypothesis) — and the L=2 / L=3 vector byte→sample
@@ -55,9 +58,28 @@ chain exercising overhang macroblocks:
   T02 MV components as single signed codewords (spec/06 §6.2.3
   Reading B, `position − 32`), §6.4 median predictor + §6.6 clip +
   §6.8 per-plane MV cache, §6.5 half-pel MC with `(a+b+1)>>1`
-  rounding and §6.7.2 edge replication, SKIP copy / INTER /
-  INTER_4MV / INTRA macroblocks, and `decode_frame` (I/P/B against
-  an optional reference; B frames never become the reference).
+  rounding, SKIP copy / INTER / INTER_4MV / INTRA macroblocks, and
+  `decode_frame` (I/P/B against an optional reference; B frames
+  never become the reference). The §6.7/§6.7.4 (#174) edge question
+  is arbitrated for real third-party streams by the
+  **reference-window MV clamp** (`clamp_mv_to_reference_window`,
+  r391): the MC read clamps each MV component (half-pel domain) so
+  the block footprint stays inside the PADDED reference canvas,
+  while the §6.8 cache keeps the unclamped vector — pinned uniquely
+  by the 25-frame independent-encoder fixture (rival readings — bare
+  edge replication, visible-window clamp, clamped cache stores —
+  each diverge on it). The chroma planes force the padded window,
+  proving §4.7.3 overhang samples are decoded, stored, and read as
+  reference data.
+* **Mode census** (`decode_frame_with_stats` /
+  `decode_inter_plane_with_stats`): exact per-plane
+  SKIP/INTER/INTER_4MV/INTRA counts from the wire — the observable
+  that requires a full decoder (no per-MB resync exists). The
+  fixture's luma census is CI-pinned; it REFUTES the fixture's
+  INTER_4MV-presence claim (zero 4MV MBs in the whole stream — the
+  minting `+mv4` flag changed encoder decisions without the mode
+  being emitted; a mode misread cannot hide, as it desynchronises
+  the bit stream while the decode stays byte-exact).
 * **Framework integration** (`registry`): `receive_frame` decodes
   against the held reference and returns a `Yuv420P`
   `oxideav_core::VideoFrame` (native 4:1:0 chroma nearest-neighbour
@@ -93,13 +115,18 @@ between our decoder and the reference decoder binary:
   (every visible output reads only visible reference samples) —
   black-box probing showed decoders genuinely diverge on the
   spec/06 §6.7 edge extension and spec/04 §4.7.3 overhang storage,
-  both implementation-defined. Validated on I+3P chains at 176×144
-  and the 160×120 overhang geometry.
+  both implementation-defined (r391 pinned the ffmpeg-family law —
+  the padded-window MV clamp above — but the Sorenson binary's law
+  is still unpinned, so the encoder keeps the portable window).
+  Validated on I+3P chains at 176×144 and the 160×120 overhang
+  geometry.
 * **INTER_4MV fixture**: the committed quadrant-motion chain
-  (`tests/svq1_enc_inter_conformance.rs`) is the first 4MV stream
+  (`tests/svq1_enc_inter_conformance.rs`) is the ONLY 4MV stream
   wire-validated in either direction (~5× smaller than the
   single-MV encode of the same content); the reference encoder
-  binary never emits the mode.
+  binary never emits the mode, and the docs `inter-4mv` fixture
+  turned out to contain none either (see the census refutation
+  above).
 * **Droppable (B) frames**: `Svq1InterParams::droppable` emits
   picture type 2; an I+B+P chain whose P predicts from the I
   decodes byte-exact — conforming decoders keep B frames out of the
