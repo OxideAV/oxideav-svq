@@ -160,3 +160,48 @@ fn genuine_4mv_mode_census_is_pinned() {
         .sum();
     assert_eq!(total_4mv, 348, "total INTER_4MV macroblock count");
 }
+
+/// Corrupt variants of every genuine-4MV P-frame must error out
+/// cleanly — never panic, never loop. Unlike the retracted #161
+/// stream (whose P-frames carry SKIP / INTER / INTRA only), every
+/// macroblock here is INTER_4MV, so this sweep is the one that
+/// exercises the four-differential MV read and the **per-sub-block**
+/// reference-window clamp under corruption: bit-flips inside the MV
+/// fields produce four arbitrary (including far-out-of-window) 8×8
+/// sub-block motions against a real reference frame, the exact input
+/// class the per-sub-block clamp normalises.
+#[test]
+fn corrupt_genuine_4mv_p_frames_error_cleanly() {
+    // Chain over the clean reconstructions so each P-frame is fuzzed
+    // against the reference geometry it was actually coded against.
+    let mut offset = SIZES[0];
+    let mut reference = decode_intra_frame(&CHAIN[..SIZES[0]]).expect("I-frame decodes");
+
+    for &size in &SIZES[1..] {
+        let p = &CHAIN[offset..offset + size];
+
+        // Truncations at every byte boundary: decode or clean error,
+        // never a panic or hang.
+        for len in 0..p.len() {
+            let _ = decode_frame_with_stats(&p[..len], Some(&reference));
+        }
+
+        // Dense bit-flip sweep (every 3rd byte, all 8 bits) over the
+        // whole 4MV payload — mode field, four MV differentials, and
+        // the residual leaf walk.
+        let mut mutated = p.to_vec();
+        for byte in (0..p.len()).step_by(3) {
+            for bit in 0..8u8 {
+                mutated[byte] ^= 1 << bit;
+                let _ = decode_frame_with_stats(&mutated, Some(&reference));
+                mutated[byte] ^= 1 << bit;
+            }
+        }
+
+        // Advance the chain on the clean decode.
+        reference = decode_frame_with_stats(p, Some(&reference))
+            .expect("clean P-frame decodes")
+            .0;
+        offset += size;
+    }
+}
