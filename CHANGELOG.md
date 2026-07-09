@@ -114,7 +114,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - refresh to current status, drop per-round changelog cruft
 - round 310 — chroma DC full dequantization pipeline
 - within-half codebook-vector accessor (spec §14.5 + §14.8)
-- scrub pre-existing enumerated denials naming FFmpeg/libav*/Sorenson-SDK/MPlayer
+- scrub pre-existing enumerated denials naming external implementations
 - round 295 — two-sided transform M·X·M^T composition
 - round 290 — transform row-multiply (X·Mᵀ) passes
 - round 282 — 4×4 diagonal-down intra predictor (svq3_pred)
