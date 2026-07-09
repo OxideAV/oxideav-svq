@@ -496,11 +496,15 @@
 //! * The checksum byte is captured but not verified — the wiki spec
 //!   itself notes "The specific details of the checksum coding are
 //!   not all known".
-//! * INTER_4MV wire coverage comes from OUR encoder's streams
-//!   (`tests/svq1_enc_inter_conformance.rs`), cross-validated
-//!   byte-exact through the black-box reference DECODER — the
-//!   reference ENCODER binary never emits the mode, so no
-//!   independent third-party 4MV stream exists in the fixture set.
+//! * INTER_4MV wire coverage: the mode is minted by OUR encoder
+//!   (`tests/svq1_enc_inter_conformance.rs`) because no available
+//!   reference ENCODER binary emits it, but its DECODE is now
+//!   confirmed by an INDEPENDENT, separately-written black-box decode
+//!   oracle — `docs/video/svq1/fixtures/inter-4mv/` (#197) ships that
+//!   oracle's byte-exact reconstruction plus an independent wire mode
+//!   census, both reproduced here
+//!   (`tests/svq1_genuine_4mv_conformance.rs`): every P-frame's luma
+//!   grid decodes fully INTER_4MV, 348 INTER_4MV macroblocks in all.
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]

@@ -11,10 +11,11 @@ Implemented from the clean-room specifications staged under
 ## Status
 
 **SVQ1: decoder COMPLETE for the I/P forward path — byte-exact
-against TWO independent oracle families (the reference Sorenson
-binary and the docs `inter-4mv` fixture's minting toolchain, 25
-chained frames) — AND a full I/P/B encoder (adaptive λ-tree, MV
-search, INTER_4MV, droppable frames).**
+against TWO independent oracle families (the black-box reference
+binary and the docs #197 `inter-4mv` fixture's independent decode
+oracle, whose 348-MB INTER_4MV wire census our decode reproduces) —
+AND a full I/P/B encoder (adaptive λ-tree, MV search, INTER_4MV,
+droppable frames).**
 `receive_frame` returns real frames; `make_encoder` produces streams
 the reference decoder reproduces sample-exact. SVQ3 remains parse +
 reconstruction-composition infrastructure gated on the CBP `me(v)`
@@ -74,12 +75,17 @@ chain exercising overhang macroblocks:
 * **Mode census** (`decode_frame_with_stats` /
   `decode_inter_plane_with_stats`): exact per-plane
   SKIP/INTER/INTER_4MV/INTRA counts from the wire — the observable
-  that requires a full decoder (no per-MB resync exists). The
-  fixture's luma census is CI-pinned; it REFUTES the fixture's
-  INTER_4MV-presence claim (zero 4MV MBs in the whole stream — the
-  minting `+mv4` flag changed encoder decisions without the mode
-  being emitted; a mode misread cannot hide, as it desynchronises
-  the bit stream while the decode stays byte-exact).
+  that requires a full decoder (no per-MB resync exists). Two streams
+  are CI-pinned against their independent mode censuses. The
+  *retracted* 25-frame #161 stream carries **zero** 4MV MBs, refuting
+  its original INTER_4MV-presence claim. The genuine #197 stream
+  (`tests/svq1_genuine_4mv_conformance.rs`) carries **348** INTER_4MV
+  MBs — every P-frame's luma grid decodes fully INTER_4MV (99/99),
+  with the lone non-4MV chroma MB per frame decoding INTRA — in
+  macroblock-for-macroblock agreement with that fixture's independent
+  wire census. A mode misread cannot hide either way: it
+  desynchronises the T03/MV bit stream while the decode stays
+  byte-exact.
 * **Framework integration** (`registry`): `receive_frame` decodes
   against the held reference and returns a `Yuv420P`
   `oxideav_core::VideoFrame` (native 4:1:0 chroma nearest-neighbour
@@ -115,18 +121,22 @@ between our decoder and the reference decoder binary:
   (every visible output reads only visible reference samples) —
   black-box probing showed decoders genuinely diverge on the
   spec/06 §6.7 edge extension and spec/04 §4.7.3 overhang storage,
-  both implementation-defined (r391 pinned the ffmpeg-family law —
-  the padded-window MV clamp above — but the Sorenson binary's law
-  is still unpinned, so the encoder keeps the portable window).
+  both implementation-defined (r391 pinned the second-oracle-family
+  law — the padded-window MV clamp above — but the reference binary's
+  law is still unpinned, so the encoder keeps the portable window).
   Validated on I+3P chains at 176×144 and the 160×120 overhang
   geometry.
 * **INTER_4MV fixture**: the committed quadrant-motion chain
-  (`tests/svq1_enc_inter_conformance.rs`) is the ONLY 4MV stream
-  wire-validated in either direction (~5× smaller than the
-  single-MV encode of the same content); the reference encoder
-  binary never emits the mode, and the docs `inter-4mv` fixture
-  turned out to contain none either (see the census refutation
-  above).
+  (byte-identical to the docs #197 `inter-4mv` fixture) is the 4MV
+  stream wire-validated in BOTH directions — encoder determinism
+  (`tests/svq1_enc_inter_conformance.rs`, ~5× smaller than the
+  single-MV encode of the same content) and byte-exact decode against
+  an independent black-box oracle whose 348-MB INTER_4MV census our
+  decode reproduces (`tests/svq1_genuine_4mv_conformance.rs`). No
+  reference encoder binary emits the mode; the earlier retracted #161
+  `inter-4mv` fixture carried none (see the census section above), so
+  #197 is the first stream to genuinely exercise the decode-side 4MV
+  path on real wire data.
 * **Droppable (B) frames**: `Svq1InterParams::droppable` emits
   picture type 2; an I+B+P chain whose P predicts from the I
   decodes byte-exact — conforming decoders keep B frames out of the
