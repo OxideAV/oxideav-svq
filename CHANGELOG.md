@@ -8,6 +8,26 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- svq1 tests: genuine-INTER_4MV conformance (`svq1_genuine_4mv_conformance`) —
+  the docs #197 `inter-4mv` fixture (byte-identical to `enc_4mv_176x144_4f`)
+  supersedes the retracted #161 stream and is the first SVQ1 stream that
+  genuinely carries INTER_4MV macroblocks whose decode is confirmed by an
+  independent black-box oracle. Pins the exact per-plane T03 census (every
+  P-frame's luma grid fully INTER_4MV, the lone non-4MV chroma MB INTRA, 348
+  INTER_4MV macroblocks total) in agreement with the fixture's independent wire
+  census, plus a truncation + bit-flip robustness sweep over the four-
+  differential-read / per-sub-block-clamp 4MV path
+- svq1 registry: the genuine-4MV chain decodes end-to-end through
+  `make_decoder` / `send_packet` / `receive_frame` — exercises the multi-frame
+  decoder state machine and the 4:1:0 → Yuv420P chroma bridge on real 4MV
+  output, luma byte-exact against the independent oracle for every frame
+
+### Changed
+
+- svq1: documented the resolved INTER_4MV independent-oracle situation (docs
+  #197) in the crate note, README, and mode-census section; scrubbed a
+  pre-existing external-implementation family-name from the README encoder note
+
 - svq1 encoder: per-frame rate control — `Svq1EncoderHandle::set_target_frame_bytes`
   finds the smallest λ fitting the byte budget (warm-started doubling +
   bisection; best-effort at the λ ceiling when the budget is unachievable);
