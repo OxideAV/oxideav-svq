@@ -1216,6 +1216,44 @@ mod tests {
     }
 
     #[test]
+    fn decoder_decodes_genuine_4mv_chain_end_to_end() {
+        // The genuine-INTER_4MV chain (docs #197 inter-4mv, byte-
+        // identical to enc_4mv_176x144_4f) through the framework
+        // Decoder surface: exercises the multi-frame state machine +
+        // the 4:1:0 → Yuv420P chroma bridge on real 4MV output, where
+        // svq1_genuine_4mv_conformance.rs covers the native plane
+        // decode. The framework luma plane is 1:1 with the native
+        // decode, so it must match the black-box oracle Y exactly for
+        // every frame; chroma is nearest-neighbour upscaled and only
+        // its bridged geometry is checked here.
+        const CHAIN: &[u8] = include_bytes!("../tests/fixtures/enc_4mv_176x144_4f.svq1");
+        const ORACLE: &[u8] = include_bytes!("../tests/fixtures/enc_4mv_176x144_4f.yuv410p");
+        const SIZES: [usize; 4] = [7601, 1357, 1178, 1076];
+        const FRAME_YUV: usize = 176 * 144 + 2 * 44 * 36;
+
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let mut decoder = make_decoder(&params).expect("make_decoder ok");
+        let mut offset = 0usize;
+        for (n, &size) in SIZES.iter().enumerate() {
+            let pkt = make_packet(CHAIN[offset..offset + size].to_vec());
+            offset += size;
+            decoder.send_packet(&pkt).expect("send frame");
+            let Frame::Video(video) = decoder.receive_frame().expect("frame decodes") else {
+                panic!("expected a video frame for frame {n}");
+            };
+            // Yuv420P bridge geometry: Y 176×144, chroma 88×72.
+            assert_eq!(video.planes.len(), 3, "frame {n} plane count");
+            assert_eq!(video.planes[0].data.len(), 176 * 144, "frame {n} Y size");
+            assert_eq!(video.planes[1].data.len(), 88 * 72, "frame {n} U size");
+            assert_eq!(video.planes[2].data.len(), 88 * 72, "frame {n} V size");
+            // Luma is 1:1 with the native decode → byte-exact vs the
+            // independent oracle for every frame of the chain.
+            let want_y = &ORACLE[n * FRAME_YUV..n * FRAME_YUV + 176 * 144];
+            assert_eq!(video.planes[0].data, want_y, "frame {n} luma vs oracle");
+        }
+    }
+
+    #[test]
     fn decoder_rejects_truncated_plane_data() {
         // A header-only packet parses at send_packet but runs out of
         // bits during the plane decode.
