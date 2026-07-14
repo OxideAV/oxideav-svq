@@ -196,7 +196,11 @@ pub fn read_chroma_dc_coefficient(br: &mut BitReader<'_>) -> Result<Option<Coeff
         3 => (1u32, 1i32),
         other => {
             let run = other & 0x3;
-            let value = ((other + 9) >> 2) as i32 - run as i32;
+            // Evaluate the spec's `((code + 9) >> 2) - run` in 64-bit:
+            // a hostile near-`u32::MAX` Golomb code must not wrap on
+            // the `+ 9` (the shifted result always fits `i32`). Found
+            // by `fuzz/fuzz_targets/svq3_mb_layer`.
+            let value = ((other as u64 + 9) >> 2) as i32 - run as i32;
             (run, value)
         }
     };
@@ -1130,6 +1134,27 @@ mod tests {
             2 * COEFFS_PER_ALT_SCAN_HALF,
             COEFFS_PER_4X4_BLOCK,
             "alt-scan two-half capacity must equal the 4×4 block capacity"
+        );
+    }
+
+    /// The largest Golomb code `read_ue_golomb` can emit (31 leading
+    /// zeros + all-ones tail = `u32::MAX - 1`) must flow through the
+    /// chroma-DC closed-form extension `((code + 9) >> 2) - run`
+    /// without wrapping on the `+ 9`. Found by
+    /// `fuzz/fuzz_targets/svq3_mb_layer` (u32 add overflow).
+    #[test]
+    fn chroma_dc_extension_survives_maximum_golomb_code() {
+        // 31 zero bits + '1' + 31 one bits (tail) + '0' (sign bit).
+        let bits = [0x00, 0x00, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFE];
+        let mut br = BitReader::new(&bits);
+        let coeff = read_chroma_dc_coefficient(&mut br)
+            .expect("read succeeds")
+            .expect("non-zero coefficient");
+        let code = u32::MAX - 1;
+        assert_eq!(coeff.run, code & 0x3);
+        assert_eq!(
+            coeff.value,
+            ((code as u64 + 9) >> 2) as i32 - (code & 0x3) as i32
         );
     }
 }
