@@ -331,6 +331,38 @@ residual blocks each macroblock carries — everything downstream of that
 decode (per-MB reconstruction composition, cross-MB intra prediction,
 picture assembly, frame output) is implemented and tested.
 
+## Fuzzing
+
+`fuzz/` is a seven-target libFuzzer harness (nightly + `cargo fuzz`;
+CI type-checks it so it cannot rot, runs stay local and bounded):
+
+* **SVQ1** — `svq1_frame_header` (header parse), `svq1_decode_intra`
+  (whole-frame decode, structural canvas invariants),
+  `svq1_decode_inter` (untrusted P/B bytes against a held reference:
+  the committed 176×144 fixture or a synthesised 160×120 overhang
+  geometry), and `svq1_enc_roundtrip` — the differential invariant:
+  fuzz-derived content/dimensions/mode/knobs are encoded, our decoder
+  must accept the stream, and the decoded P-frame must be
+  byte-identical to the encoder's own `reconstruction`.
+* **SVQ3** — `svq3_extradata` (SEQH walk), `svq3_slice` (envelope
+  prefix/size/unpermute + header walk), and `svq3_mb_layer` (MB-type
+  walk, intra-4×4 mode VLC, the three Golomb coefficient walkers,
+  inter-MB motion header, and bits→reconstruction with
+  hostile-magnitude placed coefficients).
+
+Seed the SVQ1 targets from `tests/fixtures/` and run bounded, e.g.:
+
+```sh
+cargo fuzz run svq1_enc_roundtrip -- -max_total_time=240 -rss_limit_mb=3000
+```
+
+The harness has already paid for itself: it found (and the same
+round fixes) a `u32` wrap in the chroma-DC Golomb extension at
+near-maximum codes, and `i32` overflow through the entire
+dequant/transform pipeline at hostile wire-reachable coefficient
+magnitudes — both now widened/saturating with regression tests, with
+conforming-domain arithmetic bit-identical.
+
 ## Cargo features
 
 Default (`registry`) installs both codecs into the framework registry

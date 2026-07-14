@@ -8,6 +8,33 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- fuzz: seven-target bounded libFuzzer harness (`fuzz/`) — SVQ1 frame-header
+  parse, whole-frame intra decode, P/B decode against held references
+  (committed 176×144 fixture + synthesised 160×120 overhang geometry), and a
+  structured encoder↔decoder differential roundtrip (arbitrary content, all
+  dimension residues, every encoder mode + P-frame knob; the decoded P-frame
+  must be byte-identical to `Svq1EncodedFrame::reconstruction`); SVQ3 SEQH
+  extradata parse, slice envelope (prefix/size/unpermute/header), and the
+  macroblock layer (MB-type walk, intra-4×4 mode VLC, all three Golomb
+  coefficient walkers, inter-MB motion header, bits→reconstruction with
+  hostile-magnitude placed coefficients). A `fuzz-check` CI job type-checks
+  the harness so it cannot rot; fuzz runs themselves stay local and bounded
+
+### Fixed
+
+- svq3_coeff: the chroma-DC closed-form extension `((code + 9) >> 2) - run`
+  is evaluated in 64-bit — a hostile near-`u32::MAX` Golomb code no longer
+  wraps on the `+ 9` (found by the `svq3_mb_layer` fuzz target); regression
+  test pins the maximum-code path
+- svq3_dequant: every dequantization / transform helper computes in 64-bit
+  and saturates to the `i32` return domain — hostile wire-reachable
+  coefficient magnitudes (the Golomb walkers admit values up to
+  `code >> 4` ≈ 2^28) can no longer overflow the dequant-scale multiply, the
+  `M·X·Mᵀ` transform dot products, the 2×2 chroma-DC transform, or the fused
+  `+ dc + 0x80000 >> 20` finalisation (found by the `svq3_mb_layer` fuzz
+  target); conforming-domain results are bit-identical, and the downstream
+  `Clip1` writeback bounds the residual regardless
+
 - svq1 tests: genuine-INTER_4MV conformance (`svq1_genuine_4mv_conformance`) —
   the docs #197 `inter-4mv` fixture (byte-identical to `enc_4mv_176x144_4f`)
   supersedes the retracted #161 stream and is the first SVQ1 stream that
