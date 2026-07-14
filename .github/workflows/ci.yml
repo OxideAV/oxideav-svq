@@ -45,3 +45,29 @@ jobs:
 
       - name: Test (no-default-features)
         run: cargo test --no-default-features --lib --verbose
+
+  # Keeps the libFuzzer harness from rotting: the fuzz targets are a
+  # detached cargo unit that `cargo clippy --all-targets` at the crate
+  # root never sees. Actual fuzz RUNS stay local/bounded (they need a
+  # nightly toolchain + cargo-fuzz); CI only proves the harness still
+  # compiles and stays formatted.
+  fuzz-check:
+    name: Type-check fuzz harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz-check
+          workspaces: fuzz
+
+      - name: Check (fuzz targets compile)
+        run: cargo check --manifest-path fuzz/Cargo.toml --verbose
+
+      - name: Format (fuzz targets)
+        run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check

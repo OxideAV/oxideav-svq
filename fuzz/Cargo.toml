@@ -1,0 +1,75 @@
+[package]
+name = "oxideav-svq-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-svq]
+path = ".."
+# The fuzz harness exercises the standalone (framework-free) surface:
+# the full SVQ1 decoder + encoder and the SVQ3 parse / entropy /
+# reconstruction modules are all reachable without `oxideav-core`.
+default-features = false
+
+# Detach the fuzz harness from any enclosing cargo workspace — it is
+# its own build unit and must not join a parent workspace's member set.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "svq1_frame_header"
+path = "fuzz_targets/svq1_frame_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "svq1_decode_intra"
+path = "fuzz_targets/svq1_decode_intra.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "svq1_decode_inter"
+path = "fuzz_targets/svq1_decode_inter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "svq1_enc_roundtrip"
+path = "fuzz_targets/svq1_enc_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "svq3_extradata"
+path = "fuzz_targets/svq3_extradata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "svq3_slice"
+path = "fuzz_targets/svq3_slice.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "svq3_mb_layer"
+path = "fuzz_targets/svq3_mb_layer.rs"
+test = false
+doc = false
+bench = false
