@@ -9,13 +9,14 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
 
 [dependencies.oxideav-svq]
 path = ".."
-# The fuzz harness exercises the standalone (framework-free) surface:
-# the full SVQ1 decoder + encoder and the SVQ3 parse / entropy /
-# reconstruction modules are all reachable without `oxideav-core`.
-default-features = false
+# Default features: most targets exercise the standalone surface
+# (the full SVQ1 decoder + encoder and the SVQ3 parse / entropy /
+# reconstruction modules need no framework), while `registry_stream`
+# drives the framework-facing `Decoder` handles end-to-end.
 
 # Detach the fuzz harness from any enclosing cargo workspace — it is
 # its own build unit and must not join a parent workspace's member set.
@@ -70,6 +71,13 @@ bench = false
 [[bin]]
 name = "svq3_mb_layer"
 path = "fuzz_targets/svq3_mb_layer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "registry_stream"
+path = "fuzz_targets/registry_stream.rs"
 test = false
 doc = false
 bench = false

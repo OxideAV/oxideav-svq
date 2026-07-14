@@ -333,7 +333,7 @@ picture assembly, frame output) is implemented and tested.
 
 ## Fuzzing
 
-`fuzz/` is a seven-target libFuzzer harness (nightly + `cargo fuzz`;
+`fuzz/` is an eight-target libFuzzer harness (nightly + `cargo fuzz`;
 CI type-checks it so it cannot rot, runs stay local and bounded):
 
 * **SVQ1** — `svq1_frame_header` (header parse), `svq1_decode_intra`
@@ -345,10 +345,14 @@ CI type-checks it so it cannot rot, runs stay local and bounded):
   must accept the stream, and the decoded P-frame must be
   byte-identical to the encoder's own `reconstruction`.
 * **SVQ3** — `svq3_extradata` (SEQH walk), `svq3_slice` (envelope
-  prefix/size/unpermute + header walk), and `svq3_mb_layer` (MB-type
-  walk, intra-4×4 mode VLC, the three Golomb coefficient walkers,
-  inter-MB motion header, and bits→reconstruction with
-  hostile-magnitude placed coefficients).
+  prefix/size/unpermute + header walk, both header versions swept
+  directly), and `svq3_mb_layer` (MB-type walk, intra-4×4 mode VLC,
+  the three Golomb coefficient walkers, inter-MB motion header, and
+  bits→reconstruction with hostile-magnitude placed coefficients).
+* **Framework** — `registry_stream`: the `make_decoder` /
+  `make_svq3_decoder` handles driven end-to-end over arbitrary
+  packetisations (`send_packet` → `receive_frame` drain → `flush`),
+  including the SVQ3 extradata-at-construction path.
 
 Seed the SVQ1 targets from `tests/fixtures/` and run bounded, e.g.:
 

@@ -8,7 +8,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- fuzz: seven-target bounded libFuzzer harness (`fuzz/`) — SVQ1 frame-header
+- fuzz: eight-target bounded libFuzzer harness (`fuzz/`) — SVQ1 frame-header
   parse, whole-frame intra decode, P/B decode against held references
   (committed 176×144 fixture + synthesised 160×120 overhang geometry), and a
   structured encoder↔decoder differential roundtrip (arbitrary content, all
@@ -17,8 +17,11 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   extradata parse, slice envelope (prefix/size/unpermute/header), and the
   macroblock layer (MB-type walk, intra-4×4 mode VLC, all three Golomb
   coefficient walkers, inter-MB motion header, bits→reconstruction with
-  hostile-magnitude placed coefficients). A `fuzz-check` CI job type-checks
-  the harness so it cannot rot; fuzz runs themselves stay local and bounded
+  hostile-magnitude placed coefficients); and the framework-facing
+  `registry_stream` target (`make_decoder` / `make_svq3_decoder` handles over
+  arbitrary packetisations, including SVQ3 extradata-at-construction). A
+  `fuzz-check` CI job type-checks the harness so it cannot rot; fuzz runs
+  themselves stay local and bounded
 
 ### Fixed
 
