@@ -223,6 +223,30 @@ pub const CHROMA_DC_PRE_SHIFT: u32 = 3;
 /// shift balances the `8 8 / 8 -8` chroma transform's pre-scaling.
 pub const CHROMA_DC_POST_SHIFT: u32 = 1;
 
+/// Saturate a 64-bit intermediate back into the `i32` value domain.
+///
+/// The dequantization / transform helpers in this module compute
+/// their products and sums in 64-bit and saturate the result to
+/// `i32` on return. Every coefficient magnitude a conforming stream
+/// carries keeps the whole pipeline far inside the `i32` domain, so
+/// in-domain results are bit-identical to a plain 32-bit evaluation
+/// of the spec formulas; the widening only guarantees that HOSTILE
+/// coefficient magnitudes (the Golomb walkers in
+/// [`crate::svq3_coeff`] admit values up to `code >> 4` ≈ 2^28 from
+/// untrusted bits) cannot overflow — the residual is bounded by the
+/// `Clip1` writeback downstream regardless.
+#[inline]
+#[must_use]
+const fn sat_i32(v: i64) -> i32 {
+    if v > i32::MAX as i64 {
+        i32::MAX
+    } else if v < i32::MIN as i64 {
+        i32::MIN
+    } else {
+        v as i32
+    }
+}
+
 /// Apply the wiki spec's intra-luma DC expression `dc = 13 * 13 *
 /// 1538 * block[0]` to the single argument `block_zero`.
 ///
@@ -240,7 +264,7 @@ pub const CHROMA_DC_POST_SHIFT: u32 = 1;
 #[inline]
 #[must_use]
 pub const fn dequantize_intra_luma_dc(block_zero: i32) -> i32 {
-    INTRA_LUMA_DC_SCALE * block_zero
+    sat_i32(INTRA_LUMA_DC_SCALE as i64 * block_zero as i64)
 }
 
 /// Apply the wiki spec's chroma DC dequantization expression
@@ -261,8 +285,8 @@ pub const fn dequantize_intra_luma_dc(block_zero: i32) -> i32 {
 #[inline]
 #[must_use]
 pub const fn dequantize_chroma_dc(q: u32, block_zero: i32) -> i32 {
-    let coeff = DEQUANT_COEFF_TABLE[q as usize] as i32;
-    (coeff * (block_zero >> CHROMA_DC_PRE_SHIFT)) >> CHROMA_DC_POST_SHIFT
+    let coeff = DEQUANT_COEFF_TABLE[q as usize] as i64;
+    sat_i32((coeff * (block_zero >> CHROMA_DC_PRE_SHIFT) as i64) >> CHROMA_DC_POST_SHIFT)
 }
 
 /// Apply the wiki spec's general per-coefficient dequantization
@@ -285,8 +309,8 @@ pub const fn dequantize_chroma_dc(q: u32, block_zero: i32) -> i32 {
 #[inline]
 #[must_use]
 pub const fn dequantize_coefficient(q: u32, coeff: i32, dc: i32) -> i32 {
-    let q_scale = DEQUANT_COEFF_TABLE[q as usize] as i32;
-    (coeff * q_scale + dc + DEQUANT_ROUND) >> DEQUANT_SHIFT
+    let q_scale = DEQUANT_COEFF_TABLE[q as usize] as i64;
+    sat_i32((coeff as i64 * q_scale + dc as i64 + DEQUANT_ROUND as i64) >> DEQUANT_SHIFT)
 }
 
 /// Apply the standard rounding finalisation `(x + DEQUANT_ROUND) >>
@@ -298,7 +322,7 @@ pub const fn dequantize_coefficient(q: u32, coeff: i32, dc: i32) -> i32 {
 #[inline]
 #[must_use]
 pub const fn finalise_dc(dc: i32) -> i32 {
-    (dc + DEQUANT_ROUND) >> DEQUANT_SHIFT
+    sat_i32((dc as i64 + DEQUANT_ROUND as i64) >> DEQUANT_SHIFT)
 }
 
 /// Apply one 1-D row of the 2×2 chroma DC transform matrix to a 2-point
@@ -350,7 +374,7 @@ pub const fn finalise_dc(dc: i32) -> i32 {
 #[inline]
 #[must_use]
 pub const fn apply_chroma_dc_transform_row(matrix_row: [i32; 2], a: i32, b: i32) -> i32 {
-    matrix_row[0] * a + matrix_row[1] * b
+    sat_i32(matrix_row[0] as i64 * a as i64 + matrix_row[1] as i64 * b as i64)
 }
 
 /// Apply the 2×2 chroma DC transform matrix to a row-major 2×2 input
@@ -463,7 +487,12 @@ pub const fn apply_chroma_dc_2x2_columns(block: [i32; 4]) -> [i32; 4] {
 #[inline]
 #[must_use]
 pub const fn apply_luma_transform_row(matrix_row: [i32; 4], a: i32, b: i32, c: i32, d: i32) -> i32 {
-    matrix_row[0] * a + matrix_row[1] * b + matrix_row[2] * c + matrix_row[3] * d
+    sat_i32(
+        matrix_row[0] as i64 * a as i64
+            + matrix_row[1] as i64 * b as i64
+            + matrix_row[2] as i64 * c as i64
+            + matrix_row[3] as i64 * d as i64,
+    )
 }
 
 /// Apply the 4×4 luma transform matrix to a row-major 4×4 input block by
@@ -863,11 +892,11 @@ pub const fn dequantize_chroma_dc_block(q: u32, block: [i32; 4]) -> [i32; 4] {
 #[inline]
 #[must_use]
 pub const fn scale_luma_block_by_quantiser(q: u32, block: [i32; 16]) -> [i32; 16] {
-    let scale = DEQUANT_COEFF_TABLE[q as usize] as i32;
+    let scale = DEQUANT_COEFF_TABLE[q as usize] as i64;
     let mut out = [0i32; 16];
     let mut i = 0;
     while i < 16 {
-        out[i] = block[i] * scale;
+        out[i] = sat_i32(block[i] as i64 * scale);
         i += 1;
     }
     out
@@ -923,7 +952,8 @@ pub const fn dequantize_transform_luma_block_with_dc(
     let mut out = [0i32; 16];
     let mut i = 0;
     while i < 16 {
-        out[i] = (transformed[i] + dc + DEQUANT_ROUND) >> DEQUANT_SHIFT;
+        out[i] =
+            sat_i32((transformed[i] as i64 + dc as i64 + DEQUANT_ROUND as i64) >> DEQUANT_SHIFT);
         i += 1;
     }
     out
@@ -2303,5 +2333,64 @@ mod tests {
         });
         // Pure intra-DC → flat block.
         assert_eq!(OUT[0], OUT[15]);
+    }
+
+    /// Hostile-magnitude coefficients (wire-reachable: the Golomb
+    /// walkers admit values up to `code >> 4` ≈ 2^28, and placed
+    /// grids are arbitrary `i32` at the API boundary) must saturate
+    /// through every dequant / transform helper instead of
+    /// overflowing. Found by `fuzz/fuzz_targets/svq3_mb_layer` (i32
+    /// multiply overflow in the dequant-scale pass).
+    #[test]
+    fn hostile_coefficients_saturate_instead_of_overflowing() {
+        // Direct helper domains at the i32 extremes.
+        assert_eq!(dequantize_intra_luma_dc(i32::MAX), i32::MAX);
+        assert_eq!(dequantize_intra_luma_dc(i32::MIN), i32::MIN);
+        // The >>20 shift precedes the saturation, so even i32-extreme
+        // inputs land back in-domain — exactly the widened evaluation
+        // of the spec formula (a 32-bit evaluation would overflow).
+        let scale31 = DEQUANT_COEFF_TABLE[31] as i64;
+        assert_eq!(
+            dequantize_coefficient(31, i32::MAX, i32::MAX),
+            ((i32::MAX as i64 * scale31 + i32::MAX as i64 + DEQUANT_ROUND as i64) >> DEQUANT_SHIFT)
+                as i32
+        );
+        assert_eq!(
+            dequantize_coefficient(31, i32::MIN, i32::MIN),
+            ((i32::MIN as i64 * scale31 + i32::MIN as i64 + DEQUANT_ROUND as i64) >> DEQUANT_SHIFT)
+                as i32
+        );
+        assert_eq!(
+            finalise_dc(i32::MAX),
+            ((i32::MAX as i64 + DEQUANT_ROUND as i64) >> DEQUANT_SHIFT) as i32
+        );
+        assert_eq!(dequantize_chroma_dc(31, i32::MIN), i32::MIN);
+        assert_eq!(
+            apply_luma_transform_row(LUMA_TRANSFORM_MATRIX[0], i32::MAX, i32::MAX, 0, 0),
+            i32::MAX
+        );
+        assert_eq!(
+            apply_chroma_dc_transform_row(CHROMA_DC_TRANSFORM_MATRIX[1], i32::MIN, i32::MAX),
+            i32::MIN
+        );
+
+        // Full block pipelines at the extremes stay panic-free and
+        // land saturated (the downstream Clip1 writeback bounds the
+        // reconstruction regardless of the exact saturated value).
+        let hostile = [i32::MAX; 16];
+        let _ = dequantize_transform_luma_block(31, hostile);
+        let _ = dequantize_transform_luma_block_with_dc(31, hostile, i32::MIN);
+        let _ = dequantize_transform_intra_luma_block(31, [i32::MIN; 16]);
+        let _ = dequantize_chroma_dc_block(31, [i32::MIN, i32::MAX, i32::MIN, i32::MAX]);
+
+        // In-domain results are bit-identical to the plain 32-bit
+        // evaluation of the spec formulas.
+        let q = 17;
+        let coeff = 1023;
+        let scale = DEQUANT_COEFF_TABLE[q as usize] as i32;
+        assert_eq!(
+            dequantize_coefficient(q, coeff, 0),
+            (coeff * scale + DEQUANT_ROUND) >> DEQUANT_SHIFT
+        );
     }
 }
