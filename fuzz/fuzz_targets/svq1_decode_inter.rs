@@ -9,7 +9,9 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_svq::svq1_enc::{encode_intra_frame, Svq1EncoderMode, Svq1PlaneRef};
-use oxideav_svq::svq1_plane::{chroma_dim, decode_frame, Svq1DecodedFrame};
+use oxideav_svq::svq1_plane::{
+    chroma_dim, decode_frame, decode_frame_with_stats, Svq1DecodedFrame,
+};
 use std::sync::OnceLock;
 
 /// The committed 176×144 intra fixture (a real reference-encoder
@@ -69,11 +71,32 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     let reference = &references()[(data[0] & 1) as usize];
-    if let Ok(frame) = decode_frame(&data[1..], Some(reference)) {
+    if let Ok((frame, stats)) = decode_frame_with_stats(&data[1..], Some(reference)) {
         // Successful P/B decode inherits the reference geometry;
         // intra frames in the input carry their own.
         assert_eq!(frame.y.samples.len(), frame.y.stride * frame.y.rows);
         assert_eq!(frame.u.width, chroma_dim(frame.width()));
         assert_eq!(frame.v.height, chroma_dim(frame.height()));
+
+        // The wire mode census must account for every macroblock of
+        // every plane, exactly once.
+        for (plane, census) in [
+            (&frame.y, stats.y),
+            (&frame.u, stats.u),
+            (&frame.v, stats.v),
+        ] {
+            let (mb_cols, mb_rows) = plane.mb_grid();
+            assert_eq!(
+                census.total(),
+                mb_cols * mb_rows,
+                "census must cover the MB grid"
+            );
+        }
+
+        // Chain: re-decode the same untrusted bytes against OUR
+        // freshly-decoded frame as the reference — exercises decoded
+        // output (including stored overhang samples) as reference
+        // data, the P-after-P state the multi-frame decoder runs.
+        let _ = decode_frame(&data[1..], Some(&frame));
     }
 });

@@ -5,7 +5,9 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_svq::svq3::{parse_wire_slice, unpermute_slice_payload};
+use oxideav_svq::svq3::{
+    parse_slice_header, parse_wire_slice, unpermute_slice_payload, SliceVersion,
+};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 2 {
@@ -24,6 +26,17 @@ fuzz_target!(|data: &[u8]| {
     // Drive the permutation reversal directly across all legal
     // slice-size-size values too (parse_wire_slice only reaches it
     // through a well-formed prefix).
-    let sss = 1 + (data[1] >> 6); // 1..=3 (value 4 never generated: 2 bits)
-    let _ = unpermute_slice_payload(wire, sss.min(3));
+    let sss = (1 + (data[1] >> 6)).min(3); // 1..=3
+    let _ = unpermute_slice_payload(wire, sss);
+
+    // And the slice-header field walk directly on arbitrary
+    // "already-unpermuted" bytes, sweeping both header versions and
+    // the protected flag independent of envelope validity (the V2
+    // arm reads a num_mbs-derived mb-offset width).
+    let version = if data[1] & 2 != 0 {
+        SliceVersion::V2
+    } else {
+        SliceVersion::V1
+    };
+    let _ = parse_slice_header(wire, version, sss, wire.len() as u32, num_mbs, protected);
 });
