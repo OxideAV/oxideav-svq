@@ -23,6 +23,16 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `fuzz-check` CI job type-checks the harness so it cannot rot; fuzz runs
   themselves stay local and bounded
 
+### Changed
+
+- docs: the internal decode/encode/plumbing modules (all `svq1_*` layers and
+  the `svq3_*` helpers, plus the low-level SVQ3 parser helpers in `svq3`) are
+  now `#[doc(hidden)]` — they remain `pub` for the crate's own tests/fuzz but
+  are no longer part of the documented, semver-tracked public API. The stable
+  surface (frame-header parser, `BitReader`, `Error`, the registry
+  encode/decode entry points, and the SVQ3 `Svq3SequenceHeader` /
+  `Svq3SliceHeader` accessor types) is unchanged
+
 ### Fixed
 
 - svq3_coeff: the chroma-DC closed-form extension `((code + 9) >> 2) - run`

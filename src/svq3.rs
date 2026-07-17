@@ -48,11 +48,15 @@ use crate::header::FRAME_SIZE_TABLE;
 /// is referenced in §"Packetization" where it notes "SVQ3 decoders
 /// expect extradata to be prefixed with the marker bytes 'SEQH',
 /// followed by another 4 bytes indicating the length of the extradata".
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const SVQ3_SEQH_MAGIC: [u8; 4] = *b"SEQH";
 
 /// SVQ3 frame-data sentinel: a single `0xFF` byte at the position
 /// where the next slice header would be indicates frame-data end (per
 /// the wiki spec's §"Slice Header" opening sentence).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const SVQ3_FRAME_END: u8 = 0xFF;
 
 /// Decoded SVQ3 sequence header (`SEQH` extradata payload).
@@ -217,6 +221,8 @@ impl Svq3SliceHeader {
 /// 6)` bits wide where `num_mbs` is the total picture macroblock count;
 /// this helper derives that count from a parsed
 /// [`Svq3SequenceHeader`].
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn num_macroblocks(seqh: &Svq3SequenceHeader) -> u32 {
     let (mb_w, mb_h) = mb_grid_dims(seqh);
     mb_w * mb_h
@@ -228,6 +234,8 @@ pub fn num_macroblocks(seqh: &Svq3SequenceHeader) -> u32 {
 /// still occupies a full grid cell).
 ///
 /// `mb_cols * mb_rows == num_macroblocks(seqh)`.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn mb_grid_dims(seqh: &Svq3SequenceHeader) -> (u32, u32) {
     let mb_w = (seqh.width as u32).div_ceil(16);
     let mb_h = (seqh.height as u32).div_ceil(16);
@@ -248,6 +256,8 @@ pub fn mb_grid_dims(seqh: &Svq3SequenceHeader) -> (u32, u32) {
 /// Slice boundaries may further restrict availability — that is the
 /// caller's concern once the slice-level walk threads slice membership;
 /// this helper provides the picture-grid geometry.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Svq3MacroblockPosition {
     /// Macroblock column (`0..mb_cols`).
@@ -277,6 +287,8 @@ impl Svq3MacroblockPosition {
 /// bottom). Returns [`Error::BadBitWidth`] (re-used as a generic
 /// argument-domain error) when `mb_cols == 0`; the caller is
 /// responsible for keeping `mb_index < mb_cols * mb_rows`.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn macroblock_position(mb_index: u32, mb_cols: u32) -> Result<Svq3MacroblockPosition> {
     if mb_cols == 0 {
         return Err(Error::BadBitWidth(0));
@@ -315,6 +327,8 @@ fn ceil_log2(value: u32) -> u32 {
 /// invariant) when the magic does not match, and [`Error::Truncated`]
 /// when the length prefix or declared payload runs off the end of the
 /// input.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn strip_seqh_prefix(extradata: &[u8]) -> Result<&[u8]> {
     if extradata.len() < 8 {
         return Err(Error::Truncated);
@@ -339,6 +353,8 @@ pub fn strip_seqh_prefix(extradata: &[u8]) -> Result<&[u8]> {
 /// **past** the `"SEQH"` marker + 4-byte length prefix).
 ///
 /// See [`strip_seqh_prefix`] for a helper that handles the prefix.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn parse_sequence_header(payload: &[u8]) -> Result<Svq3SequenceHeader> {
     let mut br = BitReader::new(payload);
 
@@ -402,6 +418,8 @@ pub fn parse_sequence_header(payload: &[u8]) -> Result<Svq3SequenceHeader> {
 
 /// Convenience: combine [`strip_seqh_prefix`] + [`parse_sequence_header`]
 /// for callers that hold the raw extradata blob.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn parse_extradata(extradata: &[u8]) -> Result<Svq3SequenceHeader> {
     let payload = strip_seqh_prefix(extradata)?;
     parse_sequence_header(payload)
@@ -427,6 +445,8 @@ pub fn parse_extradata(extradata: &[u8]) -> Result<Svq3SequenceHeader> {
 /// The `body` argument is the slice payload **excluding** the 1-byte
 /// version/size-size prefix and the 1-3 byte slice-size field — i.e.
 /// the `slice_size` bytes that immediately follow the header.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn unpermute_slice_payload(body: &[u8], slice_size_size: u8) -> Result<Vec<u8>> {
     if !(1..=3).contains(&slice_size_size) {
         return Err(Error::BadBitWidth(slice_size_size as u32));
@@ -455,6 +475,8 @@ pub fn unpermute_slice_payload(body: &[u8], slice_size_size: u8) -> Result<Vec<u
 /// wiki page references via "based on an early H.264 draft": read
 /// leading zero bits, then `leading_zeros + 1` bits of code value,
 /// then result = `(1 << leading_zeros) + value - 1`.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn read_ue_golomb(br: &mut BitReader<'_>) -> Result<u32> {
     let mut leading_zeros: u32 = 0;
     while br.read_bit()? == 0 {
@@ -483,6 +505,8 @@ pub fn read_ue_golomb(br: &mut BitReader<'_>) -> Result<u32> {
 /// `protected` flag.
 ///
 /// Returns the populated [`Svq3SliceHeader`].
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn parse_slice_header(
     unpermuted_body: &[u8],
     version: SliceVersion,
@@ -566,6 +590,8 @@ pub fn parse_slice_header(
 /// "`0xFF` means frame data end" rule). For typed end-of-frame
 /// signalling callers should check `wire_slice[0] == SVQ3_FRAME_END`
 /// before invoking this function.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn parse_wire_slice(
     wire_slice: &[u8],
     num_mbs: u32,

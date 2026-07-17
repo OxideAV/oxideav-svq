@@ -512,30 +512,64 @@
 mod bitreader;
 mod error;
 mod header;
+// The modules below are internal — exposed only so the crate's own
+// tests / benches / fuzz harness can reach the staged decode+encode
+// layers directly. They are NOT part of the stable public API, so they
+// are `#[doc(hidden)]` to keep them out of the rendered docs and out of
+// cargo-semver-checks' public-API surface. `svq3` is the one exception:
+// it *defines* the stable `Svq3SequenceHeader` / `Svq3SliceHeader`
+// types the registry `Svq3DecoderHandle` accessors return, so it stays
+// visible and hides its internal items individually.
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq1_blocktree;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq1_codebook;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq1_enc;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq1_enc_inter;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq1_enc_leaf;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq1_enc_tree;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq1_helper_luts;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq1_mc;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq1_mean;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq1_motion_predictor;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq1_mv_cache;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq1_plane;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq1_reconstruct;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq1_stage_indices;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq1_vlc;
+// Mixed module — defines the stable SVQ3 header types (kept visible) plus
+// internal helpers (hidden individually inside the module).
 pub mod svq3;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq3_coeff;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq3_dequant;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq3_mb;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq3_mc;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq3_mv;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq3_picture;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq3_pred;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq3_recon;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq3_scan;
 
 #[cfg(feature = "registry")]
