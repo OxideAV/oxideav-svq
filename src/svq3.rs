@@ -128,8 +128,8 @@ pub enum SliceVersion {
 /// Per `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Slice Header"
 /// the first variable-length code in the slice payload disambiguates
 /// the slice's enclosing frame type: `0 = P`, `1 = B`, `2 = I`. The
-/// wiki notes "Golomb" coding for the entire codec, and the values
-/// 0/1/2 are emitted under unsigned exp-Golomb (`ue`) as
+/// values 0/1/2 are carried in the universal code of
+/// `docs/video/svq3/spec/06-residual-coefficient-coding.md` §1 as
 /// `1`, `010`, `011` respectively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Svq3FrameType {
@@ -465,31 +465,57 @@ pub fn unpermute_slice_payload(body: &[u8], slice_size_size: u8) -> Result<Vec<u
     Ok(out)
 }
 
-/// Decode an unsigned exp-Golomb code (`ue(v)` in H.264 / SVQ3 spec
-/// dialect).
+/// Decode one codeword of SVQ3's single universal variable-length
+/// code, returning its non-negative **code number**.
 ///
-/// Per `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Decoding Process"
-/// the codec "extensively uses Golomb coding". The variable-length
-/// codes named in the slice header (frame-code field, watermark fields,
-/// MV residual signs) follow the H.264 exp-Golomb construction the
-/// wiki page references via "based on an early H.264 draft": read
-/// leading zero bits, then `leading_zeros + 1` bits of code value,
-/// then result = `(1 << leading_zeros) + value - 1`.
+/// Per `docs/video/svq3/spec/06-residual-coefficient-coding.md` §1,
+/// SVQ3 carries every variable-length element — macroblock type,
+/// coded-block pattern, quantiser delta, motion-vector components, and
+/// every residual symbol — as a code number in one and the same code.
+/// The code is read MSB-first and is `2·n + 1` bits long; it carries
+/// `n` data bits and
+///
+/// ```text
+/// code_number = 2ⁿ − 1 + value      (value = the n data bits, MSB first)
+/// ```
+///
+/// The bit layout interleaves terminator bits among the data bits (so
+/// a decoder never looks further ahead than the next bit):
+///
+/// 1. one bit; `1` ⇒ `n = 0`, code number 0, done.
+/// 2. one more bit; `1` ⇒ `n = 1`: one data bit follows (3 bits total).
+/// 3. otherwise (`n ≥ 2`) two data bits, then a terminator bit; a `1`
+///    terminator ends the code, a `0` extends it by one more data bit
+///    and one more terminator, raising `n` by one each time.
+///
+/// For `n ≤ 1` this coincides bit-for-bit with the familiar
+/// exp-Golomb layout (so the 0/1/2 alphabet of the slice frame-code
+/// field is unchanged); from `n = 2` upward the two layouts differ,
+/// which is why this reader — not a standard exp-Golomb reader — must
+/// be used for every macroblock-layer element.
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub fn read_ue_golomb(br: &mut BitReader<'_>) -> Result<u32> {
-    let mut leading_zeros: u32 = 0;
-    while br.read_bit()? == 0 {
-        leading_zeros += 1;
-        if leading_zeros > 31 {
-            return Err(Error::BadBitWidth(leading_zeros));
-        }
-    }
-    if leading_zeros == 0 {
+pub fn read_universal_code(br: &mut BitReader<'_>) -> Result<u32> {
+    if br.read_bit()? == 1 {
         return Ok(0);
     }
-    let tail = br.read_bits(leading_zeros)?;
-    Ok((1u32 << leading_zeros) - 1 + tail)
+    if br.read_bit()? == 1 {
+        let d = br.read_bit()? as u32;
+        return Ok(1 + d);
+    }
+    // n >= 2: two data bits, then terminator-interleaved extensions.
+    let mut value = ((br.read_bit()? as u32) << 1) | br.read_bit()? as u32;
+    let mut n: u32 = 2;
+    while br.read_bit()? == 0 {
+        n += 1;
+        if n > 31 {
+            // A 32-data-bit code cannot be represented in the u32 code
+            // number space; treat it as a malformed stream.
+            return Err(Error::BadBitWidth(n));
+        }
+        value = (value << 1) | br.read_bit()? as u32;
+    }
+    Ok((1u32 << n) - 1 + value)
 }
 
 /// Parse a single SVQ3 slice header from the start of `unpermuted_body`.
@@ -517,8 +543,8 @@ pub fn parse_slice_header(
 ) -> Result<Svq3SliceHeader> {
     let mut br = BitReader::new(unpermuted_body);
 
-    // Variable-length frame-code field (Golomb-coded; 0=P, 1=B, 2=I).
-    let frame_code = read_ue_golomb(&mut br)?;
+    // Variable-length frame-code field (universal code; 0=P, 1=B, 2=I).
+    let frame_code = read_universal_code(&mut br)?;
     let frame_type = Svq3FrameType::from_code(frame_code)?;
 
     // Version-dependent field after frame code.
@@ -687,6 +713,37 @@ mod tests {
         out
     }
 
+    /// Encode one universal-code codeword (spec/06 §1 interleaved
+    /// layout) as a `(width, value)` pack item.
+    fn uvlc(code: u32) -> (u32, u32) {
+        // n = floor(log2(code + 1)); value = code + 1 - 2^n.
+        let n = 31 - (code + 1).leading_zeros();
+        let value = code + 1 - (1u32 << n);
+        match n {
+            0 => (1, 1),
+            1 => (3, 0b010 | value),
+            _ => {
+                // 0 0 d1 d2 [0 d]* 1 — data bits MSB first.
+                let mut bits: u64 = 0;
+                let mut len: u32 = 0;
+                let push = |b: u32, bits: &mut u64, len: &mut u32| {
+                    *bits = (*bits << 1) | b as u64;
+                    *len += 1;
+                };
+                push(0, &mut bits, &mut len);
+                push(0, &mut bits, &mut len);
+                push((value >> (n - 1)) & 1, &mut bits, &mut len);
+                push((value >> (n - 2)) & 1, &mut bits, &mut len);
+                for i in (0..n - 2).rev() {
+                    push(0, &mut bits, &mut len);
+                    push((value >> i) & 1, &mut bits, &mut len);
+                }
+                push(1, &mut bits, &mut len);
+                (len, bits as u32)
+            }
+        }
+    }
+
     /// Wrap a payload bit-string in the `"SEQH"` 4-byte marker + 4-byte
     /// big-endian length prefix.
     fn wrap_seqh(payload: &[u8]) -> Vec<u8> {
@@ -713,33 +770,55 @@ mod tests {
     }
 
     #[test]
-    fn ue_golomb_round_trip() {
-        // ue(0) = "1", ue(1) = "010", ue(2) = "011", ue(3) = "00100",
-        // ue(4) = "00101", ue(5) = "00110", ue(6) = "00111",
-        // ue(7) = "0001000", ue(8) = "0001001".
-        let cases: &[(u32, &[u8], u32)] = &[
-            (1, &[0b1000_0000], 0),
-            (3, &[0b0100_0000], 1),
-            (3, &[0b0110_0000], 2),
-            (5, &[0b0010_0000], 3),
-            (5, &[0b0010_1000], 4),
-            (5, &[0b0011_0000], 5),
-            (5, &[0b0011_1000], 6),
-            (7, &[0b0001_0000], 7),
-            (7, &[0b0001_0010], 8),
+    fn universal_code_round_trip() {
+        // spec/06 §1 interleaved layout:
+        //   0 = "1", 1 = "010", 2 = "011" (identical to the n ≤ 1
+        //   exp-Golomb layout), then n = 2: "00 d1 d2 1" so
+        //   3 = "00001", 4 = "00011", 5 = "00101", 6 = "00111",
+        //   and n = 3: "00 d1 d2 0 d3 1" so 7 = "0000001",
+        //   8 = "0000011", 10 = "0001011", 14 = "0011011".
+        let cases: &[(&[u8], u32)] = &[
+            (&[0b1000_0000], 0),
+            (&[0b0100_0000], 1),
+            (&[0b0110_0000], 2),
+            (&[0b0000_1000], 3),
+            (&[0b0001_1000], 4),
+            (&[0b0010_1000], 5),
+            (&[0b0011_1000], 6),
+            (&[0b0000_0010], 7),
+            (&[0b0000_0110], 8),
+            (&[0b0001_0110], 10),
+            (&[0b0011_0110], 14),
         ];
-        for &(_bits, bytes, expected) in cases {
+        for &(bytes, expected) in cases {
             let mut br = BitReader::new(bytes);
-            assert_eq!(read_ue_golomb(&mut br).unwrap(), expected);
+            assert_eq!(read_universal_code(&mut br).unwrap(), expected, "{bytes:?}");
+        }
+    }
+
+    /// Cross-check the reader against the closed form for every code
+    /// number the `uvlc` test encoder can produce in `0..=2000`.
+    #[test]
+    fn universal_code_encoder_decoder_agree() {
+        for code in 0..=2000u32 {
+            let bytes = pack(&[uvlc(code)]);
+            let mut br = BitReader::new(&bytes);
+            assert_eq!(read_universal_code(&mut br).unwrap(), code, "code {code}");
+            // The code is 2n+1 bits: reconstruct n from the closed form.
+            let n = 31 - (code + 1).leading_zeros();
+            assert_eq!(br.bits_consumed() as u32, 2 * n + 1, "code {code} length");
         }
     }
 
     #[test]
-    fn ue_golomb_truncated_input_errors() {
-        // All-zero input → infinite leading zeros. The reader will
-        // run out of bits before the implied "1" arrives.
+    fn universal_code_truncated_input_errors() {
+        // All-zero input → the terminator-extension loop runs out of
+        // bits before a `1` terminator arrives.
         let mut br = BitReader::new(&[0x00]);
-        assert!(matches!(read_ue_golomb(&mut br), Err(Error::Truncated)));
+        assert!(matches!(
+            read_universal_code(&mut br),
+            Err(Error::Truncated)
+        ));
     }
 
     #[test]
@@ -1134,20 +1213,12 @@ mod tests {
         assert_eq!(hdr.optional_bytes, vec![0x5A, 0xA5]);
     }
 
-    /// Slice-header rejects a Golomb-coded frame-code that decodes to
-    /// a value outside 0..=2.
+    /// Slice-header rejects a frame-code codeword that decodes to a
+    /// value outside 0..=2.
     #[test]
     fn parse_slice_header_rejects_invalid_frame_code() {
-        // ue(3) = "00100" → frame code 3, outside the 0..=2 range.
-        let unpermuted = pack(&[
-            (5, 0b0_0100),
-            (1, 0),
-            (8, 0),
-            (5, 0),
-            (1, 0),
-            (1, 0),
-            (1, 0),
-        ]);
+        // Universal code 3 = "00001" → frame code 3, outside 0..=2.
+        let unpermuted = pack(&[uvlc(3), (1, 0), (8, 0), (5, 0), (1, 0), (1, 0), (1, 0)]);
         let err = parse_slice_header(&unpermuted, SliceVersion::V1, 1, 0, 99, false).unwrap_err();
         assert!(matches!(err, Error::InvalidFrameCode(3)));
     }

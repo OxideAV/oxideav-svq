@@ -43,7 +43,7 @@
 
 use crate::bitreader::BitReader;
 use crate::error::{Error, Result};
-use crate::svq3::read_ue_golomb;
+use crate::svq3::read_universal_code;
 
 /// Run-correction table used by the alternative-scan coefficient walker.
 ///
@@ -184,7 +184,7 @@ pub struct Coefficient {
 /// * `Err(Error::Truncated)` — the bit-reader ran out of bits before
 ///   the Golomb code or the trailing sign bit could be read.
 pub fn read_chroma_dc_coefficient(br: &mut BitReader<'_>) -> Result<Option<Coefficient>> {
-    let code = read_ue_golomb(br)?;
+    let code = read_universal_code(br)?;
     if code == 0 {
         return Ok(None);
     }
@@ -224,7 +224,7 @@ pub fn read_chroma_dc_coefficient(br: &mut BitReader<'_>) -> Result<Option<Coeff
 /// Returns the same end-of-block / non-zero / truncated signalling as
 /// [`read_chroma_dc_coefficient`].
 pub fn read_alt_scan_coefficient(br: &mut BitReader<'_>) -> Result<Option<Coefficient>> {
-    let code = read_ue_golomb(br)?;
+    let code = read_universal_code(br)?;
     if code == 0 {
         return Ok(None);
     }
@@ -261,7 +261,7 @@ pub fn read_alt_scan_coefficient(br: &mut BitReader<'_>) -> Result<Option<Coeffi
 /// Returns the same end-of-block / non-zero / truncated signalling as
 /// [`read_chroma_dc_coefficient`].
 pub fn read_normal_scan_coefficient(br: &mut BitReader<'_>) -> Result<Option<Coefficient>> {
-    let code = read_ue_golomb(br)?;
+    let code = read_universal_code(br)?;
     if code == 0 {
         return Ok(None);
     }
@@ -501,13 +501,26 @@ mod tests {
         out
     }
 
-    /// `ue(n)` exp-Golomb encoding helper — produces a `(width,
-    /// value)` pack item that decodes to `n`.
+    /// Universal-code encoding helper (spec/06 §1 interleaved layout) —
+    /// produces a `(width, value)` pack item that decodes to `n`.
     fn ue(n: u32) -> (u32, u32) {
-        let p = n + 1;
-        let leading = 31 - p.leading_zeros();
-        let width = 2 * leading + 1;
-        (width, p)
+        let exp = 31 - (n + 1).leading_zeros();
+        let data = n + 1 - (1u32 << exp);
+        match exp {
+            0 => (1, 1),
+            1 => (3, 0b010 | data),
+            _ => {
+                let mut bits: u32 = 0b00;
+                bits = (bits << 1) | ((data >> (exp - 1)) & 1);
+                bits = (bits << 1) | ((data >> (exp - 2)) & 1);
+                let mut width = 4;
+                for i in (0..exp - 2).rev() {
+                    bits = (bits << 2) | ((data >> i) & 1);
+                    width += 2;
+                }
+                (width + 1, (bits << 1) | 1)
+            }
+        }
     }
 
     // ---- Constants / table-shape invariants ----------------------------
@@ -1137,16 +1150,26 @@ mod tests {
         );
     }
 
-    /// The largest Golomb code `read_ue_golomb` can emit (31 leading
-    /// zeros + all-ones tail = `u32::MAX - 1`) must flow through the
-    /// chroma-DC closed-form extension `((code + 9) >> 2) - run`
+    /// The largest code number `read_universal_code` can emit
+    /// (`n = 31`, all data bits set = `u32::MAX - 1`) must flow through
+    /// the chroma-DC closed-form extension `((code + 9) >> 2) - run`
     /// without wrapping on the `+ 9`. Found by
     /// `fuzz/fuzz_targets/svq3_mb_layer` (u32 add overflow).
     #[test]
     fn chroma_dc_extension_survives_maximum_golomb_code() {
-        // 31 zero bits + '1' + 31 one bits (tail) + '0' (sign bit).
-        let bits = [0x00, 0x00, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFE];
-        let mut br = BitReader::new(&bits);
+        // n = 31, value = 2^31 - 1 (all data bits 1):
+        // "0 0 1 1" + "0 1" × 29 + "1", then a '0' sign bit.
+        let mut bitvec: Vec<u8> = vec![0, 0, 1, 1];
+        for _ in 0..29 {
+            bitvec.extend_from_slice(&[0, 1]);
+        }
+        bitvec.push(1);
+        bitvec.push(0); // sign bit
+        let mut bytes = vec![0u8; bitvec.len().div_ceil(8)];
+        for (i, &b) in bitvec.iter().enumerate() {
+            bytes[i / 8] |= b << (7 - (i % 8));
+        }
+        let mut br = BitReader::new(&bytes);
         let coeff = read_chroma_dc_coefficient(&mut br)
             .expect("read succeeds")
             .expect("non-zero coefficient");

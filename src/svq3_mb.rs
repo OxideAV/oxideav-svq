@@ -10,8 +10,8 @@
 //!
 //! ## Scope
 //!
-//! Round 4 is **structural**: this module walks the unsigned
-//! exp-Golomb code at the start of each macroblock body, classifies it
+//! Round 4 is **structural**: this module walks the universal-code
+//! codeword at the start of each macroblock body, classifies it
 //! by the per-slice MB-type table the wiki spec enumerates, and
 //! exposes the typed [`Svq3MbType`] result. It also lands the two
 //! fixed tables documented in §"Intra macroblock information
@@ -43,7 +43,7 @@
 
 use crate::bitreader::BitReader;
 use crate::error::{Error, Result};
-use crate::svq3::{read_ue_golomb, Svq3FrameType};
+use crate::svq3::{read_universal_code, Svq3FrameType};
 
 /// Macroblock-type code-value range for an I-frame slice — the wiki
 /// spec's §"Macroblock layer" enumerates codes `0`, `1..24`, `25`
@@ -335,15 +335,15 @@ pub fn classify_mb_type(frame_type: Svq3FrameType, code: u32) -> Result<Svq3MbTy
     }
 }
 
-/// Read an unsigned exp-Golomb code from the bit-reader and classify
+/// Read one universal-code codeword from the bit-reader and classify
 /// it against the supplied slice frame type. Equivalent to calling
-/// [`read_ue_golomb`] followed by [`classify_mb_type`].
+/// [`read_universal_code`] followed by [`classify_mb_type`].
 ///
 /// Returns [`Error::InvalidFrameCode`] when the decoded code value
 /// is outside the per-slice valid range and [`Error::Truncated`]
 /// when the bit-reader runs out of bits mid-code.
 pub fn read_mb_type(br: &mut BitReader<'_>, frame_type: Svq3FrameType) -> Result<Svq3MbType> {
-    let code = read_ue_golomb(br)?;
+    let code = read_universal_code(br)?;
     classify_mb_type(frame_type, code)
 }
 
@@ -779,19 +779,20 @@ pub const INTRA_PRED_PAIRS_LEN: u32 = INTRA_PRED_PAIRS.len() as u32;
 /// "reading a variable-length code which corresponds to one of the
 /// following pairs". The 25 pairs are listed in a single contiguous
 /// `0..=24` enumeration (`{0,0}; {1,0},{0,1}; {0,2},{1,1},{2,0}; …;
-/// {4,4}`), i.e. the listing order is the code-number ordering an
-/// unsigned exp-Golomb `ue(v)` code produces. This is the same
-/// Golomb-indexed-listing convention the macroblock-type code uses
-/// ([`read_mb_type`] reads `ue(v)` then indexes the per-frame MB-type
-/// enumeration). The decoded code number indexes [`INTRA_PRED_PAIRS`]
-/// directly.
+/// {4,4}`), i.e. the listing order is the code-number ordering of the
+/// universal code
+/// (`docs/video/svq3/spec/06-residual-coefficient-coding.md` §1). This
+/// is the same code-number-indexed-listing convention the
+/// macroblock-type code uses ([`read_mb_type`] reads one universal
+/// codeword then indexes the per-frame MB-type enumeration). The
+/// decoded code number indexes [`INTRA_PRED_PAIRS`] directly.
 ///
 /// Returns the `(idx_a, idx_b)` pair on success. Returns
 /// [`Error::InvalidFrameCode`] when the decoded code number is `>= 25`
 /// (outside the 25-pair alphabet) and propagates [`Error::Truncated`]
 /// from the underlying bit-reader.
 pub fn read_intra_4x4_pred_pair(br: &mut BitReader<'_>) -> Result<(u8, u8)> {
-    let code = read_ue_golomb(br)?;
+    let code = read_universal_code(br)?;
     if code >= INTRA_PRED_PAIRS_LEN {
         return Err(Error::InvalidFrameCode(code));
     }
@@ -975,17 +976,31 @@ mod tests {
         out
     }
 
-    /// `ue(n)` exp-Golomb encoding helper — produces a `(width,
-    /// value)` pack item that decodes to `n`.
+    /// Universal-code encoding helper (spec/06 §1 interleaved layout) —
+    /// produces a `(width, value)` pack item that decodes to `n`.
     ///
     /// `ue(0) = "1"`, `ue(1) = "010"`, `ue(2) = "011"`,
-    /// `ue(3) = "00100"`, …, `ue(n) = leading_zeros(p) zero bits +
-    /// "1" + suffix` where `p = n + 1`.
+    /// `ue(3) = "00001"`, `ue(7) = "0000001"`, … — codes 0..=2 match
+    /// the familiar exp-Golomb layout, higher codes interleave
+    /// terminator bits among the data bits.
     fn ue(n: u32) -> (u32, u32) {
-        let p = n + 1;
-        let leading = 31 - p.leading_zeros();
-        let width = 2 * leading + 1;
-        (width, p)
+        let exp = 31 - (n + 1).leading_zeros();
+        let data = n + 1 - (1u32 << exp);
+        match exp {
+            0 => (1, 1),
+            1 => (3, 0b010 | data),
+            _ => {
+                let mut bits: u32 = 0b00;
+                bits = (bits << 1) | ((data >> (exp - 1)) & 1);
+                bits = (bits << 1) | ((data >> (exp - 2)) & 1);
+                let mut width = 4;
+                for i in (0..exp - 2).rev() {
+                    bits = (bits << 2) | ((data >> i) & 1);
+                    width += 2;
+                }
+                (width + 1, (bits << 1) | 1)
+            }
+        }
     }
 
     #[test]
@@ -1199,12 +1214,11 @@ mod tests {
         let mb = read_mb_type(&mut br, Svq3FrameType::Intra).unwrap();
         assert_eq!(mb, Svq3MbType::IIntra(IFrameMbType::LumaDcSeparate));
 
-        // ue(25) = a 5-bit prefix of leading zeros + 1 followed by 4
-        // suffix bits. p = 26 = 0b11010, leading=4, width=9 → bits
-        // "00001 1010" → 0b000011010 = 0x1A.
+        // Universal code 25: n = 4, value = 10 = 0b1010 → bits
+        // "0 0 1 0 0 1 0 0 1" (0 0 d1 d2 0 d3 0 d4 1) = 0b001001001.
         let (w, v) = ue(25);
         assert_eq!(w, 9);
-        assert_eq!(v, 26);
+        assert_eq!(v, 0b001001001);
         let bytes = pack(&[(w, v)]);
         let mut br = BitReader::new(&bytes);
         let mb = read_mb_type(&mut br, Svq3FrameType::Intra).unwrap();
