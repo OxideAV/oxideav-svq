@@ -13,12 +13,12 @@ use oxideav_svq::svq3::Svq3FrameType;
 use oxideav_svq::svq3_coeff::{
     decode_chroma_dc_2x2, decode_residual_4x4_alt, decode_residual_4x4_normal,
 };
-use oxideav_svq::svq3_scan::{ALT_SCAN_4X4_SCAN, NORMAL_ZIGZAG_4X4_SCAN};
 use oxideav_svq::svq3_mb::{decode_intra_4x4_modes, read_mb_type};
 use oxideav_svq::svq3_mv::{read_inter_macroblock_header, read_quantiser_delta};
 use oxideav_svq::svq3_recon::{
     decode_and_reconstruct_intra_luma_macroblock, LumaMacroblock, MB_LUMA_BLOCKS,
 };
+use oxideav_svq::svq3_scan::{ALT_SCAN_4X4_SCAN, NORMAL_ZIGZAG_4X4_SCAN};
 use oxideav_svq::BitReader;
 
 const FRAME_TYPES: [Svq3FrameType; 3] = [
