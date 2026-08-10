@@ -8,6 +8,27 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- svq3: the coded-block-pattern element (`svq3_cbp`, spec/03 + tables/01) —
+  `cbp_luma` (one bit per 8×8 quadrant, raster order) + `cbp_chroma` (the
+  shared 3-valued class), carried as one universal-code code number through
+  the 48-entry intra or inter mapping table (decode direction), plus the
+  `CodedBlockPattern` split/predicates
+- svq3: the intra-16×16 macroblock-type factorisation
+  (`svq3_mb::Intra16x16Params`, spec/04 §4.5 + tables/03) —
+  `9 + pred_mode + 4·cbp_chroma + 12·luma_ac`, and the standard 16×16
+  vertical / horizontal luma predictors alongside plane/DC
+  (`svq3_pred::predict_vertical_16x16` / `_horizontal_16x16`,
+  `svq3_recon::Svq3Luma16x16Mode::{Vertical, Horizontal}` +
+  `from_pred_mode`)
+- svq3: the luma DC secondary transform
+  (`svq3_dequant::luma_dc_secondary_transform`, spec/04 §4) and the chroma DC
+  secondary transform in its authoritative form
+  (`chroma_dc_secondary_transform` / `dequantize_chroma_dc_levels`, spec/04
+  §2) — the 2×2 Hadamard halved with truncation toward zero — plus the chroma
+  quantiser remap (`CHROMA_QUANTISER_INDEX` / `chroma_quantiser_index`,
+  spec/04 §3, tables/02). The spec/04 §1 measured basis is pinned by
+  single-coefficient response tests
+
 - fuzz: eight-target bounded libFuzzer harness (`fuzz/`) — SVQ1 frame-header
   parse, whole-frame intra decode, P/B decode against held references
   (committed 176×144 fixture + synthesised 160×120 overhang geometry), and a
@@ -25,6 +46,28 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- svq3: every macroblock-layer variable-length element now reads through the
+  spec/06 §1 universal code (`svq3::read_universal_code`) instead of the
+  earlier exp-Golomb reader — the two agree for code numbers 0…2 (so the
+  slice frame-code alphabet is unchanged) but diverge from code 3 up, where
+  the universal code interleaves terminator bits among the data bits; the
+  signed reader (`svq3_mv::read_signed_code`) folds it per spec/06 §1.1
+- svq3: the residual entropy layer is rebuilt from the staged binary-anchored
+  tables — the three `(level, run)` code books (tables/05) with their escape
+  constructions (tables/06) replace the earlier wiki run-correction arrays,
+  and the block decoders (`svq3_coeff::decode_residual_4x4_normal` /
+  `_alt` / `decode_chroma_dc_2x2`) place raw levels through the staged scan
+  orders, with the spec/06 §5 bounds behaviour (an over-long run is a
+  bitstream error)
+- svq3: the 4×4 core inverse transform basis third column is corrected to
+  `13, −13, −13, 13` (spec/04 §1 measured; the wiki snapshot's `1, −1, −1, 1`
+  gave the wrong norm), and the chroma DC path is rebuilt to the spec/04 §2/§3
+  authoritative form (chroma-remapped dequant → 2×2 Hadamard halved with
+  truncation toward zero → additive `169·B_k`), replacing the wiki-era
+  `[[8,8],[8,−8]]` matrix + `(x>>3)>>1` pipeline
+- svq3: `IFrameMbType` reworked to the spec/04 §4.5 unified numbering —
+  `Intra4x4` / `Intra16x16(Intra16x16Params)` / `Unpinned8` (see the
+  known-gaps note below)
 - docs: the internal decode/encode/plumbing modules (all `svq1_*` layers and
   the `svq3_*` helpers, plus the low-level SVQ3 parser helpers in `svq3`) are
   now `#[doc(hidden)]` — they remain `pub` for the crate's own tests/fuzz but
