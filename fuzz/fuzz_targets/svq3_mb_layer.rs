@@ -10,7 +10,10 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_svq::svq3::Svq3FrameType;
-use oxideav_svq::svq3_coeff::{read_alt_scan_block, read_chroma_dc_block, read_normal_scan_block};
+use oxideav_svq::svq3_coeff::{
+    decode_chroma_dc_2x2, decode_residual_4x4_alt, decode_residual_4x4_normal,
+};
+use oxideav_svq::svq3_scan::{ALT_SCAN_4X4_SCAN, NORMAL_ZIGZAG_4X4_SCAN};
 use oxideav_svq::svq3_mb::{decode_intra_4x4_modes, read_mb_type};
 use oxideav_svq::svq3_mv::{read_inter_macroblock_header, read_quantiser_delta};
 use oxideav_svq::svq3_recon::{
@@ -50,13 +53,23 @@ fuzz_target!(|data: &[u8]| {
             let _ = decode_intra_4x4_modes(&mut br, top_avail, left_avail);
         }
         2 => {
-            // Coefficient walkers over the same bits, independently.
+            // Residual block decoders over the same bits, independently.
+            let mut dc = [0i32; 4];
             let mut br = BitReader::new(bits);
-            while read_chroma_dc_block(&mut br).is_ok() && br.bits_consumed() < bits.len() * 8 {}
+            while decode_chroma_dc_2x2(&mut br, &mut dc).is_ok()
+                && br.bits_consumed() < bits.len() * 8
+            {}
+            let mut block = [0i32; 16];
             let mut br = BitReader::new(bits);
-            while read_alt_scan_block(&mut br).is_ok() && br.bits_consumed() < bits.len() * 8 {}
+            while decode_residual_4x4_alt(&mut br, &ALT_SCAN_4X4_SCAN, &mut block).is_ok()
+                && br.bits_consumed() < bits.len() * 8
+            {}
+            let start = (data[3] & 1) as usize;
             let mut br = BitReader::new(bits);
-            while read_normal_scan_block(&mut br).is_ok() && br.bits_consumed() < bits.len() * 8 {}
+            while decode_residual_4x4_normal(&mut br, &NORMAL_ZIGZAG_4X4_SCAN, start, &mut block)
+                .is_ok()
+                && br.bits_consumed() < bits.len() * 8
+            {}
         }
         3 => {
             // Inter-MB envelope: type, precision selector, MV
