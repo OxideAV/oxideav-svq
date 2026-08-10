@@ -72,7 +72,7 @@ use crate::svq3_coeff::Coefficient;
 
 /// Number of coefficients in a 2×2 chroma DC block.
 ///
-/// Mirrors [`crate::svq3_coeff::COEFFS_PER_CHROMA_DC_BLOCK`]; surfaced
+/// Mirrors the 2×2 chroma-DC block capacity; surfaced
 /// here as a placement-side capacity constant so consumers of the
 /// scan module do not need to depend on the coefficient-walker module
 /// for the same length.
@@ -80,7 +80,7 @@ pub const CHROMA_DC_2X2_LEN: usize = 4;
 
 /// Number of coefficients in a 4×4 (luma / chroma AC) block.
 ///
-/// Mirrors [`crate::svq3_coeff::COEFFS_PER_4X4_BLOCK`]; surfaced here
+/// Mirrors the 4×4 block capacity; surfaced here
 /// as a placement-side capacity constant for consistency with
 /// [`CHROMA_DC_2X2_LEN`].
 pub const FULL_4X4_LEN: usize = 16;
@@ -318,7 +318,7 @@ pub fn place_coefficients_in_scan_order<const DEST_LEN: usize>(
 /// the 4-entry block in row-major order (so `block[0]` is `(0,0)`,
 /// `block[1]` is `(0,1)`, `block[2]` is `(1,0)`, `block[3]` is
 /// `(1,1)`), suitable for feeding directly into the
-/// [`crate::svq3_dequant::CHROMA_DC_TRANSFORM_MATRIX`] application.
+/// [`crate::svq3_dequant::chroma_dc_secondary_transform`] pipeline.
 pub fn place_chroma_dc_2x2(coeffs: &[Coefficient]) -> Result<[i32; CHROMA_DC_2X2_LEN], ScanError> {
     place_coefficients_in_scan_order::<CHROMA_DC_2X2_LEN>(coeffs, &CHROMA_DC_2X2_SCAN)
 }

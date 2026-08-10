@@ -3,116 +3,101 @@
 //!
 //! ## Provenance
 //!
-//! Round 230 lands the per-coefficient dequantization arithmetic
-//! described in `docs/video/svq3/wiki/Sorenson_Video_3.wiki`
-//! §"Macroblock transform and dequantization" (verbatim local mirror
-//! of the multimedia.cx `Sorenson_Video_3` wiki page). The section
-//! enumerates four pieces of data the macroblock pipeline needs:
+//! This module carries the transform / dequantisation arithmetic of
+//! `docs/video/svq3/spec/04-dc-secondary-transform.md` and
+//! `docs/video/svq3/spec/01-reconstruction-composition.md` Gap 2:
 //!
-//! * The 4×4 luma transform coefficient matrix:
+//! * The 4×4 core inverse transform basis (spec/04 §1, **measured**):
 //!
 //!   ```text
-//!     13  17   1   7
-//!     13   7  -1 -17
-//!     13  -7  -1  17
-//!     13 -17   1  -7
+//!     13  17  13   7
+//!     13   7 -13 -17
+//!     13  -7 -13  17
+//!     13 -17  13  -7
 //!   ```
 //!
-//! * The 2×2 chroma DC transform matrix the chroma DCs are first
-//!   transformed with:
+//!   The in-repo wiki snapshot prints the third column as `1, −1,
+//!   −1, 1`; spec/04 §1 corrects it to `13, −13, −13, 13` — all four
+//!   basis vectors then share the squared norm `676`, and the measured
+//!   input→output relations (a `2²⁰` coefficient at position 2 yields
+//!   `±169`, not `±13`) pin the corrected column.
 //!
-//!   ```text
-//!     8  8
-//!     8 -8
-//!   ```
+//! * A 32-entry quantiser ladder indexed by the quantiser `Q ∈ 0..32`
+//!   — exposed as [`DEQUANT_COEFF_TABLE`] — and the 32-entry **chroma
+//!   quantiser remap** of spec/04 §3 ([`CHROMA_QUANTISER_INDEX`]):
+//!   chroma blocks (DC and AC) index the ladder through the remap,
+//!   luma blocks index it directly.
 //!
-//! * A 32-entry quantizer table indexed by the slice quantiser `Q ∈
-//!   0..32` — exposed as [`DEQUANT_COEFF_TABLE`].
+//! * The 2×2 **chroma DC secondary transform** of spec/04 §2: the four
+//!   dequantised chroma DC values pass through the unnormalised 2×2
+//!   Hadamard and are halved with **truncation toward zero**
+//!   ([`chroma_dc_secondary_transform`]), then scatter to coefficient
+//!   position 0 of the four 4×4 chroma blocks in raster order.
 //!
-//! * Three dequantization closed-form expressions:
-//!     * For intra luma blocks without separate DC coefficients:
-//!       `dc = 13 * 13 * 1538 * block[0]`
-//!     * For chroma blocks:
-//!       `dc = (DEQUANT_COEFF_TABLE[Q] * (block[0] >> 3)) >> 1`
-//!     * General per-coefficient dequant:
+//! * The **luma DC secondary transform** of spec/04 §4
+//!   ([`luma_dc_secondary_transform`]): the separate luma DC block of
+//!   an intra 16×16 macroblock is dequantised with the **luma**
+//!   quantiser, run through the ordinary core transform (fused
+//!   `+0x80000 >> 20`), and each of the sixteen results is multiplied
+//!   by the literal `1538`; result *k* becomes coefficient 0 of luma
+//!   block *k* in raster order.
+//!
+//! * The dequantisation closed forms:
+//!     * intra luma without separate DC block:
+//!       `dc = 13 * 13 * 1538 * block[0]` (additive, post-transform)
+//!     * general per-coefficient dequant (Gap 2):
 //!       `out = (coeff * DEQUANT_COEFF_TABLE[Q] + dc + 0x80000) >> 20`
 //!       where `dc = 0` if not defined otherwise.
 //!
-//! All four pieces of data land here as `pub const` arrays / scalars
-//! plus three `const fn` helpers that apply the three closed-form
-//! expressions verbatim. The constants are surfaced with neutral
-//! identifiers ([`DEQUANT_COEFF_TABLE`], [`INTRA_LUMA_DC_SCALE`],
-//! [`DEQUANT_ROUND`], [`DEQUANT_SHIFT`], [`LUMA_TRANSFORM_MATRIX`],
-//! [`CHROMA_DC_TRANSFORM_MATRIX`]) so the spec's identifier choices
-//! stay descriptive in the wiki without leaking into our public
-//! surface.
+//! ## Residual interleave (spec/01 Gap 2)
 //!
-//! ## Numerical interpretation (informative)
-//!
-//! Round 230 does NOT mirror this as a spec claim — the wiki spec
-//! simply lists the formulas — but `1538` in the intra-luma-DC scale
-//! is suggestive of a fixed-point reciprocal derivation. The spec
-//! does not derive it; round 230 transcribes the constant verbatim
-//! and leaves the closed-form rationale to consumers.
-//!
-//! The general dequantization shift of `20` combined with the `+
-//! 0x80000` (`= 1 << 19`) additive bias is the standard
-//! `(x + 2^{n-1}) >> n` round-half-up step.
-//!
-//! ## Residual interleave (spec/01 Gap 2 — now pinned)
-//!
-//! Round 230 landed the four data tables and the three closed-form
-//! dequant helpers; later rounds added the single-sided column-multiply
-//! passes ([`apply_luma_transform_columns`] / [`apply_chroma_dc_2x2_columns`],
-//! i.e. `M · X`) and the matching single-sided row-multiply passes
-//! ([`apply_luma_transform_rows`] / [`apply_chroma_dc_2x2_rows`], i.e.
-//! `X · M^T`), then composed them into the two-sided `M · X · M^T`
-//! transform ([`apply_luma_transform_2d`] / [`apply_chroma_dc_2x2_2d`]).
-//!
-//! `docs/video/svq3/spec/01-reconstruction-composition.md` **Gap 2**
-//! now pins the previously-deferred facts: the transform is the
-//! **two-sided** `M · X · M^T` (rows pass then columns pass over the
-//! same kernel), and the dequantisation is **fused into the same pass**
-//! as the inverse transform — the per-element store is
-//! `out = (coeff·DEQUANT_COEFF_TABLE[Q] + dc + 0x80000) >> 20`, with the
-//! single `>> 20` ([`DEQUANT_SHIFT`]) being the *only* post-transform
-//! shift (there is **no** additional H.264-style `>> 6` normalisation).
-//! This module now wires those facts into the luma residual-interleave
-//! pipeline [`dequantize_transform_luma_block`] (and its separate-DC
-//! variant [`dequantize_transform_luma_block_with_dc`]): place →
+//! The transform is the **two-sided** `M · X · Mᵀ` (a rows pass then a
+//! columns pass over the same kernel), and the dequantisation is
+//! **fused into the same pass** as the inverse transform — the
+//! per-element store is
+//! `out = (coeff·DEQUANT_COEFF_TABLE[Q] + dc + 0x80000) >> 20`, with
+//! the single `>> 20` ([`DEQUANT_SHIFT`]) being the *only*
+//! post-transform shift. The luma residual-interleave pipeline is
+//! [`dequantize_transform_luma_block`] (and its additive-DC variant
+//! [`dequantize_transform_luma_block_with_dc`]): place →
 //! per-coefficient dequant-scale → two-sided transform → fused
-//! `+ 0x80000 >> 20`.
+//! `+ dc + 0x80000 >> 20`. The general dequantization shift of `20`
+//! combined with the `+ 0x80000` (`= 1 << 19`) additive bias is the
+//! standard `(x + 2^{n-1}) >> n` round-half-up step.
 //!
-//! The wire-format decode that *feeds* this pipeline (the intra-mode
-//! VLC, the CBP enumeration deciding which sub-blocks carry residual,
-//! and the inter motion-vector VLC) is **not** pinned by spec/01 — the
-//! wiki states only "CBP is coded the same way as in H.264" / "motion
-//! vector differences are coded as signed variable-length codes" without
-//! enumerating the H.264 CBP code-number mapping or the MV-VLC bit
-//! layout — so those stay deferred docs-gaps and
-//! `Svq3DecoderHandle::receive_frame` continues to return
-//! `oxideav_core::Error::Unsupported` for full-frame decode.
+//! An additive post-transform `dc` of `169 · v` is arithmetically
+//! identical to placing `v` at coefficient position 0 before the
+//! transform (column 0 of the basis is uniformly 13, so a position-0
+//! coefficient contributes `13 · 13 · v` to every pre-shift element);
+//! the reconstruction layer uses the additive form for both secondary
+//! transforms’ scattered DC terms.
 
 use core::ops::Range;
 
-/// The 4×4 luma transform coefficient matrix the wiki spec enumerates
-/// verbatim under §"Macroblock transform and dequantization":
+/// The 4×4 core inverse transform basis, per
+/// `docs/video/svq3/spec/04-dc-secondary-transform.md` §1 (measured):
 ///
 /// ```text
-///   13  17   1   7
-///   13   7  -1 -17
-///   13  -7  -1  17
-///   13 -17   1  -7
+///   13  17  13   7
+///   13   7 -13 -17
+///   13  -7 -13  17
+///   13 -17  13  -7
 /// ```
+///
+/// The wiki snapshot prints the third column as `1, −1, −1, 1`;
+/// spec/04 §1 corrects it to `13, −13, −13, 13` (measured: a `2²⁰`
+/// coefficient at position 2 produces `±169 = ±13·13`, and only the
+/// corrected column gives all four basis vectors the shared squared
+/// norm `4·13² = 17² + 2·7² + 17² = 676`).
 ///
 /// Indexed `[row][col]` so `LUMA_TRANSFORM_MATRIX[0][0] = 13`,
 /// `LUMA_TRANSFORM_MATRIX[3][3] = -7`. The four rows share the
 /// constant column-0 value `13` — see [`LUMA_TRANSFORM_DC_COLUMN`].
 pub const LUMA_TRANSFORM_MATRIX: [[i32; 4]; 4] = [
-    [13, 17, 1, 7],
-    [13, 7, -1, -17],
-    [13, -7, -1, 17],
-    [13, -17, 1, -7],
+    [13, 17, 13, 7],
+    [13, 7, -13, -17],
+    [13, -7, -13, 17],
+    [13, -17, 13, -7],
 ];
 
 /// The column-0 value of [`LUMA_TRANSFORM_MATRIX`].
@@ -123,17 +108,35 @@ pub const LUMA_TRANSFORM_MATRIX: [[i32; 4]; 4] = [
 /// [`INTRA_LUMA_DC_SCALE`] folds it in as `13 * 13 * 1538`.
 pub const LUMA_TRANSFORM_DC_COLUMN: i32 = 13;
 
-/// The 2×2 chroma DC transform matrix the wiki spec quotes verbatim:
+/// The 32-entry chroma quantiser remap of
+/// `docs/video/svq3/spec/04-dc-secondary-transform.md` §3
+/// (`docs/video/svq3/tables/02-chroma-quantiser-index.csv`).
 ///
-/// ```text
-///   8  8
-///   8 -8
-/// ```
+/// Luma coefficient blocks index [`DEQUANT_COEFF_TABLE`] with the
+/// macroblock quantiser directly; **chroma blocks — both the 2×2 DC
+/// block and the AC coefficients — index it with this remapped
+/// value**: the identity for quantisers 0…17, then a compression that
+/// saturates at ladder entry 25 (`68745`).
+pub const CHROMA_QUANTISER_INDEX: [u32; 32] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, // identity 0..=17
+    17, 18, 19, 20, 20, 21, 22, 22, 23, 23, 24, 24, 25, 25,
+];
+
+/// Remap a macroblock quantiser to the chroma quantiser index
+/// (spec/04 §3): `chroma_index = CHROMA_QUANTISER_INDEX[q]`.
 ///
-/// Per the spec, "chroma DCs need to be transformed first using the
-/// following matrix" before the dequantization formula for chroma
-/// blocks ([`dequantize_chroma_dc`]) is applied.
-pub const CHROMA_DC_TRANSFORM_MATRIX: [[i32; 2]; 2] = [[8, 8], [8, -8]];
+/// The returned index is what chroma blocks (DC and AC) use to index
+/// [`DEQUANT_COEFF_TABLE`]; pass it wherever a dequant helper takes a
+/// quantiser argument for a chroma block.
+///
+/// # Panics
+///
+/// Panics if `q >= DEQUANT_COEFF_TABLE_LEN`.
+#[inline]
+#[must_use]
+pub const fn chroma_quantiser_index(q: u32) -> u32 {
+    CHROMA_QUANTISER_INDEX[q as usize]
+}
 
 /// Number of entries in [`DEQUANT_COEFF_TABLE`].
 ///
@@ -207,22 +210,6 @@ pub const DEQUANT_ROUND: i32 = 0x80000;
 /// * INTRA_LUMA_DC_SCALE_TAIL`).
 pub const INTRA_LUMA_DC_SCALE_TAIL: i32 = 1538;
 
-/// The chroma-DC pre-multiply shift the wiki spec's chroma expression
-/// `dc = (DEQUANT_COEFF_TABLE[Q] * (block[0] >> 3)) >> 1` applies
-/// before its trailing right-shift.
-///
-/// Equal to `3`. Combined with [`CHROMA_DC_POST_SHIFT`] the total
-/// `>> 4` shift moves the chroma DC into the same fixed-point
-/// register the general dequant formula consumes.
-pub const CHROMA_DC_PRE_SHIFT: u32 = 3;
-
-/// The chroma-DC post-multiply shift the wiki spec's chroma
-/// expression applies after the multiplication.
-///
-/// Equal to `1`. Combined with [`CHROMA_DC_PRE_SHIFT`] the total
-/// shift balances the `8 8 / 8 -8` chroma transform's pre-scaling.
-pub const CHROMA_DC_POST_SHIFT: u32 = 1;
-
 /// Saturate a 64-bit intermediate back into the `i32` value domain.
 ///
 /// The dequantization / transform helpers in this module compute
@@ -231,10 +218,10 @@ pub const CHROMA_DC_POST_SHIFT: u32 = 1;
 /// carries keeps the whole pipeline far inside the `i32` domain, so
 /// in-domain results are bit-identical to a plain 32-bit evaluation
 /// of the spec formulas; the widening only guarantees that HOSTILE
-/// coefficient magnitudes (the Golomb walkers in
-/// [`crate::svq3_coeff`] admit values up to `code >> 4` ≈ 2^28 from
-/// untrusted bits) cannot overflow — the residual is bounded by the
-/// `Clip1` writeback downstream regardless.
+/// coefficient magnitudes (the escape constructions in
+/// [`crate::svq3_coeff`] admit levels up to ≈ 2^27 from untrusted
+/// bits) cannot overflow — the residual is bounded by the `Clip1`
+/// writeback downstream regardless.
 #[inline]
 #[must_use]
 const fn sat_i32(v: i64) -> i32 {
@@ -256,37 +243,76 @@ const fn sat_i32(v: i64) -> i32 {
 /// (code 0) / [`crate::svq3_mb::IFrameMbType::LumaDcSeparateNoOthers`]
 /// (code 25) branch.
 ///
-/// Returns the intermediate DC value before the trailing `+
-/// DEQUANT_ROUND >> DEQUANT_SHIFT` finalisation; chain with
-/// [`finalise_dc`] to recover the spec's full
-/// `out = (coeff * DEQUANT_COEFF_TABLE[Q] + dc + 0x80000) >> 20`
-/// expression with `coeff = 0` (no per-coefficient AC contribution).
+/// Returns the intermediate (64-bit) DC value before the trailing
+/// `+ DEQUANT_ROUND >> DEQUANT_SHIFT` finalisation; feed it to
+/// [`dequantize_transform_luma_block_with_dc`] as the additive `dc`
+/// term of the fused store.
 #[inline]
 #[must_use]
-pub const fn dequantize_intra_luma_dc(block_zero: i32) -> i32 {
-    sat_i32(INTRA_LUMA_DC_SCALE as i64 * block_zero as i64)
+pub const fn dequantize_intra_luma_dc(block_zero: i32) -> i64 {
+    INTRA_LUMA_DC_SCALE as i64 * block_zero as i64
 }
 
-/// Apply the wiki spec's chroma DC dequantization expression
-/// `dc = (DEQUANT_COEFF_TABLE[Q] * (block[0] >> 3)) >> 1` for the
-/// quantiser `q` and block sample `block_zero`.
+/// The 2×2 chroma DC secondary transform of
+/// `docs/video/svq3/spec/04-dc-secondary-transform.md` §2.2, applied
+/// to the four **already-dequantised** chroma DC values `c0 c1 c2 c3`
+/// in coded order (the 2×2 raster `[[c0, c1], [c2, c3]]`):
 ///
-/// The caller must ensure `q < DEQUANT_COEFF_TABLE_LEN`; this helper
-/// is `const fn` and so cannot validate the index dynamically. The
-/// returned `i32` is the pre-finalisation chroma DC value; chain
-/// with [`finalise_dc`] to recover the full `(coeff * DEQUANT_COEFF_TABLE[Q]
-/// + dc + 0x80000) >> 20` expression for the chroma block.
+/// ```text
+///   B0 = (c0 + c1 + c2 + c3) / 2
+///   B1 = (c0 - c1 + c2 - c3) / 2
+///   B2 = (c0 + c1 - c2 - c3) / 2
+///   B3 = (c0 - c1 - c2 + c3) / 2
+/// ```
+///
+/// — the unnormalised 2×2 Hadamard `H·X·Hᵀ` followed by a division by
+/// two that **truncates toward zero** (spec/04 §2.2: input
+/// `(−3, 0, 0, 0)` produces `(−1, −1, −1, −1)`, not the `−2`s an
+/// arithmetic shift would give). `B_k` becomes coefficient position 0
+/// of chroma 4×4 block *k* in raster order (§2.3), which in the fused
+/// per-element store is the additive term `169 · B_k`.
+///
+/// Sums are computed in 64-bit and saturated back to `i32`, keeping
+/// hostile magnitudes safe while leaving every conforming value
+/// bit-identical.
+#[inline]
+#[must_use]
+pub const fn chroma_dc_secondary_transform(c: [i32; 4]) -> [i32; 4] {
+    let (c0, c1, c2, c3) = (c[0] as i64, c[1] as i64, c[2] as i64, c[3] as i64);
+    [
+        sat_i32((c0 + c1 + c2 + c3) / 2),
+        sat_i32((c0 - c1 + c2 - c3) / 2),
+        sat_i32((c0 + c1 - c2 - c3) / 2),
+        sat_i32((c0 - c1 - c2 + c3) / 2),
+    ]
+}
+
+/// Run spec/04 §2.1 steps 2–3 on the four decoded chroma DC levels:
+/// dequantise each level with the **chroma** quantiser index
+/// (`dc_j = level_j × DEQUANT_COEFF_TABLE[chroma_quantiser_index(q)]`,
+/// no rounding term — the value stays at the 2²⁰ scale), then apply
+/// the [`chroma_dc_secondary_transform`] butterfly.
+///
+/// `q` is the **macroblock quantiser** — the remap is applied
+/// internally. The returned `[B0, B1, B2, B3]` are the raster-order
+/// per-block DC terms of §2.3 (each destined for coefficient position
+/// 0 of its 4×4 chroma block, i.e. the additive term `169 · B_k` in
+/// the fused store).
 ///
 /// # Panics
 ///
-/// Panics if `q >= DEQUANT_COEFF_TABLE_LEN`. (`const fn` array index
-/// out-of-bounds is a compile-time error for static `q`, a runtime
-/// panic otherwise.)
+/// Panics if `q >= DEQUANT_COEFF_TABLE_LEN`.
 #[inline]
 #[must_use]
-pub const fn dequantize_chroma_dc(q: u32, block_zero: i32) -> i32 {
-    let coeff = DEQUANT_COEFF_TABLE[q as usize] as i64;
-    sat_i32((coeff * (block_zero >> CHROMA_DC_PRE_SHIFT) as i64) >> CHROMA_DC_POST_SHIFT)
+pub const fn dequantize_chroma_dc_levels(q: u32, levels: [i32; 4]) -> [i32; 4] {
+    let scale = DEQUANT_COEFF_TABLE[chroma_quantiser_index(q) as usize] as i64;
+    let deq = [
+        sat_i32(levels[0] as i64 * scale),
+        sat_i32(levels[1] as i64 * scale),
+        sat_i32(levels[2] as i64 * scale),
+        sat_i32(levels[3] as i64 * scale),
+    ];
+    chroma_dc_secondary_transform(deq)
 }
 
 /// Apply the wiki spec's general per-coefficient dequantization
@@ -297,11 +323,9 @@ pub const fn dequantize_chroma_dc(q: u32, block_zero: i32) -> i32 {
 /// separate DC stream and the spec's "if not defined otherwise"
 /// branch applies).
 ///
-/// The `coeff` argument is the residual produced by the
-/// [`crate::svq3_coeff`] walker after dezigzag; `dc` is the
-/// pre-finalisation DC value from [`dequantize_intra_luma_dc`] or
-/// [`dequantize_chroma_dc`] (or `0` when no separate DC term
-/// applies).
+/// The `coeff` argument is a placed residual level from the
+/// [`crate::svq3_coeff`] block decoders; `dc` is a pre-finalisation
+/// additive DC term (or `0` when no separate DC term applies).
 ///
 /// # Panics
 ///
@@ -314,8 +338,7 @@ pub const fn dequantize_coefficient(q: u32, coeff: i32, dc: i32) -> i32 {
 }
 
 /// Apply the standard rounding finalisation `(x + DEQUANT_ROUND) >>
-/// DEQUANT_SHIFT` to a pre-finalisation DC contribution from
-/// [`dequantize_intra_luma_dc`] / [`dequantize_chroma_dc`].
+/// DEQUANT_SHIFT` to a pre-finalisation DC contribution.
 ///
 /// Useful when the caller wants the DC value alone (no AC contribution)
 /// — equivalent to [`dequantize_coefficient`] with `coeff = 0`.
@@ -325,133 +348,21 @@ pub const fn finalise_dc(dc: i32) -> i32 {
     sat_i32((dc as i64 + DEQUANT_ROUND as i64) >> DEQUANT_SHIFT)
 }
 
-/// Apply one 1-D row of the 2×2 chroma DC transform matrix to a 2-point
-/// column of samples.
-///
-/// The wiki spec's §"Macroblock transform and dequantization" pins the
-/// 2×2 chroma DC transform matrix as
-///
-/// ```text
-///   8  8
-///   8 -8
-/// ```
-///
-/// (also exposed verbatim as [`CHROMA_DC_TRANSFORM_MATRIX`]). The spec
-/// states "chroma DCs need to be transformed first using the following
-/// matrix" before the [`dequantize_chroma_dc`] expression is applied.
-///
-/// This helper carries out **one row's** dot product against a 2-point
-/// column `[a, b]`, using `matrix_row` as the row of weights. For the
-/// first matrix row `[8, 8]` the result is `8 * (a + b)`; for the second
-/// matrix row `[8, -8]` the result is `8 * (a - b)`. The two matrix rows
-/// are accessible as `CHROMA_DC_TRANSFORM_MATRIX[0]` and
-/// `CHROMA_DC_TRANSFORM_MATRIX[1]`.
-///
-/// Returns the unrounded i32 dot product; subsequent dequantisation /
-/// finalisation is the caller's responsibility (see
-/// [`dequantize_chroma_dc`] / [`finalise_dc`]).
-///
-/// # Examples
-///
-/// Apply both rows of the matrix to the same input pair:
-///
-/// ```
-/// use oxideav_svq::svq3_dequant::{
-///     apply_chroma_dc_transform_row, CHROMA_DC_TRANSFORM_MATRIX,
-/// };
-/// let pair = (3, 1);
-/// // Row 0 = sum-of-pair × 8.
-/// assert_eq!(
-///     apply_chroma_dc_transform_row(CHROMA_DC_TRANSFORM_MATRIX[0], pair.0, pair.1),
-///     32,
-/// );
-/// // Row 1 = difference-of-pair × 8.
-/// assert_eq!(
-///     apply_chroma_dc_transform_row(CHROMA_DC_TRANSFORM_MATRIX[1], pair.0, pair.1),
-///     16,
-/// );
-/// ```
-#[inline]
-#[must_use]
-pub const fn apply_chroma_dc_transform_row(matrix_row: [i32; 2], a: i32, b: i32) -> i32 {
-    sat_i32(matrix_row[0] as i64 * a as i64 + matrix_row[1] as i64 * b as i64)
-}
-
-/// Apply the 2×2 chroma DC transform matrix to a row-major 2×2 input
-/// block by multiplying the matrix into the block's columns (`M · X`).
-///
-/// The wiki spec's §"Macroblock transform and dequantization" pins the
-/// transform matrix [`CHROMA_DC_TRANSFORM_MATRIX`] = `[[8, 8], [8, -8]]`
-/// but does not enumerate the full `M · X · M^T` two-sided transform
-/// expression; only `M` itself is quoted alongside the remark "chroma
-/// DCs need to be transformed first using the following matrix". This
-/// helper applies `M` against the input's columns and returns the result
-/// in row-major order — the single-sided transform pass that is
-/// unambiguously what `M` alone produces against a column vector.
-///
-/// The input `block` is laid out row-major: `block[0]` = `(0, 0)`,
-/// `block[1]` = `(0, 1)`, `block[2]` = `(1, 0)`, `block[3]` = `(1, 1)`.
-/// This matches [`crate::svq3_scan::place_chroma_dc_2x2`]'s output. The
-/// returned `[i32; 4]` is laid out the same way.
-///
-/// Per-position output (where `(r, c)` = row, column):
-///
-/// * `out[0, 0] = M[0, :] · X[:, 0] = 8 * (block[0, 0] + block[1, 0])`
-/// * `out[0, 1] = M[0, :] · X[:, 1] = 8 * (block[0, 1] + block[1, 1])`
-/// * `out[1, 0] = M[1, :] · X[:, 0] = 8 * (block[0, 0] - block[1, 0])`
-/// * `out[1, 1] = M[1, :] · X[:, 1] = 8 * (block[0, 1] - block[1, 1])`
-///
-/// The unrounded i32 outputs feed directly into [`dequantize_chroma_dc`]
-/// for the per-sample dequant step; this helper does NOT apply any
-/// shift, bias, or quantiser scaling.
-///
-/// The full two-sided `M · X · M^T` transform (which the wiki spec does
-/// NOT spell out explicitly) is deliberately NOT folded in here — that
-/// derivation belongs in a future round once the docs pin it.
-///
-/// # Examples
-///
-/// Apply the transform to an identity-like input:
-///
-/// ```
-/// use oxideav_svq::svq3_dequant::apply_chroma_dc_2x2_columns;
-/// let block = [1, 0, 0, 1];
-/// // out[0,0] = 8 * (1 + 0) = 8;  out[0,1] = 8 * (0 + 1) = 8.
-/// // out[1,0] = 8 * (1 - 0) = 8;  out[1,1] = 8 * (0 - 1) = -8.
-/// assert_eq!(apply_chroma_dc_2x2_columns(block), [8, 8, 8, -8]);
-/// ```
-#[inline]
-#[must_use]
-pub const fn apply_chroma_dc_2x2_columns(block: [i32; 4]) -> [i32; 4] {
-    // block layout: row-major 2×2.
-    //   block[0] = (0, 0)   block[1] = (0, 1)
-    //   block[2] = (1, 0)   block[3] = (1, 1)
-    let row0 = CHROMA_DC_TRANSFORM_MATRIX[0];
-    let row1 = CHROMA_DC_TRANSFORM_MATRIX[1];
-    // Output rows, column by column.
-    let out_00 = apply_chroma_dc_transform_row(row0, block[0], block[2]);
-    let out_01 = apply_chroma_dc_transform_row(row0, block[1], block[3]);
-    let out_10 = apply_chroma_dc_transform_row(row1, block[0], block[2]);
-    let out_11 = apply_chroma_dc_transform_row(row1, block[1], block[3]);
-    [out_00, out_01, out_10, out_11]
-}
-
 /// Apply one 1-D row of the 4×4 luma transform matrix to a 4-point
 /// column of samples.
 ///
-/// The wiki spec's §"Macroblock transform and dequantization" pins the
-/// 4×4 luma transform matrix as
+/// `docs/video/svq3/spec/04-dc-secondary-transform.md` §1 pins the 4×4
+/// core inverse transform basis (measured) as
 ///
 /// ```text
-///   13  17   1   7
-///   13   7  -1 -17
-///   13  -7  -1  17
-///   13 -17   1  -7
+///   13  17  13   7
+///   13   7 -13 -17
+///   13  -7 -13  17
+///   13 -17  13  -7
 /// ```
 ///
-/// (also exposed verbatim as [`LUMA_TRANSFORM_MATRIX`]). The spec lists
-/// these coefficients under "Transform coefficients" preceding the
-/// dequantization expressions.
+/// (exposed as [`LUMA_TRANSFORM_MATRIX`], including the spec/04 §1
+/// third-column correction over the wiki snapshot).
 ///
 /// This helper carries out **one row's** dot product against a 4-point
 /// column `[a, b, c, d]`, using `matrix_row` as the row of weights:
@@ -473,10 +384,10 @@ pub const fn apply_chroma_dc_2x2_columns(block: [i32; 4]) -> [i32; 4] {
 /// use oxideav_svq::svq3_dequant::{
 ///     apply_luma_transform_row, LUMA_TRANSFORM_MATRIX,
 /// };
-/// // Row 0 = [13, 17, 1, 7] applied to [1, 1, 1, 1] sums the weights.
+/// // Row 0 = [13, 17, 13, 7] applied to [1, 1, 1, 1] sums the weights.
 /// assert_eq!(
 ///     apply_luma_transform_row(LUMA_TRANSFORM_MATRIX[0], 1, 1, 1, 1),
-///     13 + 17 + 1 + 7,
+///     13 + 17 + 13 + 7,
 /// );
 /// // A pure-DC column [a, 0, 0, 0] yields 13 * a for every row.
 /// assert_eq!(
@@ -503,9 +414,7 @@ pub const fn apply_luma_transform_row(matrix_row: [i32; 4], a: i32, b: i32, c: i
 /// full `M · X · M^T` two-sided transform expression; only `M` itself is
 /// quoted under "Transform coefficients". This helper applies `M` against
 /// the input's columns and returns the result in row-major order — the
-/// single-sided transform pass that is unambiguously what `M` alone
-/// produces against a column vector. It mirrors
-/// [`apply_chroma_dc_2x2_columns`] for the 4×4 luma case.
+/// single-sided `M · X` pass of the two-sided transform.
 ///
 /// The input `block` is laid out row-major: `block[r * 4 + c]` is the
 /// sample at row `r`, column `c` (`r, c ∈ 0..4`). The returned `[i32; 16]`
@@ -689,183 +598,58 @@ pub const fn apply_luma_transform_2d(block: [i32; 16]) -> [i32; 16] {
     apply_luma_transform_columns(apply_luma_transform_rows(block))
 }
 
-/// Apply the 2×2 chroma DC transform matrix to a row-major 2×2 input block by
-/// multiplying the matrix into the block's **rows** (`X · M^T`).
+/// The literal `1538` multiplier of the luma DC secondary transform
+/// (`docs/video/svq3/spec/04-dc-secondary-transform.md` §4.1 step 3).
 ///
-/// This is the right-side mirror of [`apply_chroma_dc_2x2_columns`]: it applies
-/// the *same* pinned matrix [`CHROMA_DC_TRANSFORM_MATRIX`] = `[[8, 8], [8, -8]]`
-/// against the block's rows instead of its columns. Output position `(r, c)` is
-/// the dot product of block row `r` with matrix row `c`:
-///
-/// * `out[0, 0] = X[0, :] · M[0, :] = 8 * (block[0, 0] + block[0, 1])`
-/// * `out[0, 1] = X[0, :] · M[1, :] = 8 * (block[0, 0] - block[0, 1])`
-/// * `out[1, 0] = X[1, :] · M[0, :] = 8 * (block[1, 0] + block[1, 1])`
-/// * `out[1, 1] = X[1, :] · M[1, :] = 8 * (block[1, 0] - block[1, 1])`
-///
-/// (which equals `(X · M^T)[r, c]`, since column `c` of `M^T` is row `c` of
-/// `M`, and this matrix is symmetric). Like its column-side sibling this is a
-/// **single** matrix pass — only `M` (pinned by the wiki spec under "chroma DCs
-/// need to be transformed first using the following matrix") is involved. The
-/// full two-sided `M · X · M^T` composition stays deferred until the docs pin
-/// it.
-///
-/// The input `block` is laid out row-major (`block[0]` = `(0, 0)`, `block[1]` =
-/// `(0, 1)`, `block[2]` = `(1, 0)`, `block[3]` = `(1, 1)`); the returned
-/// `[i32; 4]` is laid out the same way. This helper applies no shift, bias, or
-/// quantiser scaling.
-///
-/// # Examples
-///
-/// ```
-/// use oxideav_svq::svq3_dequant::apply_chroma_dc_2x2_rows;
-/// let block = [1, 0, 0, 1];
-/// // out[0,0] = 8 * (1 + 0) = 8;  out[0,1] = 8 * (1 - 0) = 8.
-/// // out[1,0] = 8 * (0 + 1) = 8;  out[1,1] = 8 * (0 - 1) = -8.
-/// assert_eq!(apply_chroma_dc_2x2_rows(block), [8, 8, 8, -8]);
-/// ```
-#[inline]
-#[must_use]
-pub const fn apply_chroma_dc_2x2_rows(block: [i32; 4]) -> [i32; 4] {
-    // block layout: row-major 2×2.
-    //   block[0] = (0, 0)   block[1] = (0, 1)
-    //   block[2] = (1, 0)   block[3] = (1, 1)
-    let row0 = CHROMA_DC_TRANSFORM_MATRIX[0];
-    let row1 = CHROMA_DC_TRANSFORM_MATRIX[1];
-    // out[r, c] = X[r, :] · M[c, :]: block row r against matrix row c.
-    let out_00 = apply_chroma_dc_transform_row(row0, block[0], block[1]);
-    let out_01 = apply_chroma_dc_transform_row(row1, block[0], block[1]);
-    let out_10 = apply_chroma_dc_transform_row(row0, block[2], block[3]);
-    let out_11 = apply_chroma_dc_transform_row(row1, block[2], block[3]);
-    [out_00, out_01, out_10, out_11]
-}
+/// spec/04 §4.2: 1538 is the value on the wire-format side of the
+/// contract and must be used verbatim (it is 0.9 % away from the 1551
+/// an exactly orthonormal secondary transform would need — that
+/// observation explains the constant's size, it is not a formula to
+/// re-derive it from).
+pub const LUMA_DC_SECONDARY_SCALE: i32 = 1538;
 
-/// Apply the full **two-sided** 2×2 chroma DC transform `M · X · M^T` to a
-/// row-major 2×2 input block.
+/// The luma DC secondary transform of
+/// `docs/video/svq3/spec/04-dc-secondary-transform.md` §4: given the
+/// sixteen decoded levels of the separate luma DC block of an intra
+/// 16×16 macroblock (already placed through the normal zigzag into
+/// row-major order), produce the sixteen per-block DC terms `v_k`.
 ///
-/// This composes the two pinned single-sided chroma DC passes:
+/// The pipeline is, verbatim from §4.1:
 ///
-/// * [`apply_chroma_dc_2x2_rows`] performs the right-side pass `X · M^T`, and
-/// * [`apply_chroma_dc_2x2_columns`] performs the left-side pass `M · (·)`.
+/// 1. dequantise with the **luma** quantiser (`level ×
+///    DEQUANT_COEFF_TABLE[q]` — no chroma remap, no separate ladder);
+/// 2. apply the ordinary core 4×4 inverse transform of §1 —
+///    the same [`apply_luma_transform_2d`] kernel with its fused
+///    `+0x80000, >> 20` normalisation (**not** a Hadamard: spec/04
+///    §4.1 pins that no 4×4 Hadamard exists in the codec);
+/// 3. multiply each of the sixteen results by
+///    [`LUMA_DC_SECONDARY_SCALE`] = `1538`.
 ///
-/// Chaining them realises `M · (X · M^T) = M · X · M^T`, where `M` is the
-/// pinned [`CHROMA_DC_TRANSFORM_MATRIX`] = `[[8, 8], [8, -8]]` (wiki spec:
-/// "chroma DCs need to be transformed first using the following matrix").
-/// No new matrix or constant is introduced; the composition order is matrix
-/// associativity of two already-pinned passes.
-///
-/// Consistent with both single-sided passes, **no inter-pass shift, bias, or
-/// quantiser scaling is applied** — the wiki spec does not enumerate a
-/// normalisation between the two passes. The unrounded i32 outputs feed
-/// [`dequantize_chroma_dc`]. Because `M` is symmetric, `(M · X) · M^T`
-/// (columns then rows) yields the same result, which the [`tests`] module
-/// corroborates.
-///
-/// The input `block` is laid out row-major (`block[0]` = `(0, 0)`, `block[1]`
-/// = `(0, 1)`, `block[2]` = `(1, 0)`, `block[3]` = `(1, 1)`); the returned
-/// `[i32; 4]` is laid out the same way.
-///
-/// # Examples
-///
-/// A pure-DC block (only `(0, 0)` non-zero) yields every output element equal
-/// to `8 * 8 * block[0]`, since column 0 of `M` is `[8, 8]`:
-///
-/// ```
-/// use oxideav_svq::svq3_dequant::apply_chroma_dc_2x2_2d;
-/// let block = [1, 0, 0, 0];
-/// assert_eq!(apply_chroma_dc_2x2_2d(block), [64, 64, 64, 64]);
-/// ```
-#[inline]
-#[must_use]
-pub const fn apply_chroma_dc_2x2_2d(block: [i32; 4]) -> [i32; 4] {
-    // M · (X · M^T): right-side rows pass first, then the left-side columns
-    // pass. Both passes use the same pinned CHROMA_DC_TRANSFORM_MATRIX.
-    apply_chroma_dc_2x2_columns(apply_chroma_dc_2x2_rows(block))
-}
-
-/// Run the full chroma DC dequantization pipeline on a row-major 2×2 chroma
-/// DC block: **transform first, then per-sample dequantize, then finalise**.
-///
-/// The wiki spec's §"Macroblock transform and dequantization" pins this
-/// ordering explicitly. It gives the chroma DC dequantization expression
-///
-/// ```text
-///   dc = (svq3_dequant_coeff[Q] * (block[0] >> 3)) >> 1;
-/// ```
-///
-/// and immediately notes: "Please note that chroma DCs need to be
-/// **transformed first** using the following matrix" — the 2×2
-/// [`CHROMA_DC_TRANSFORM_MATRIX`] = `[[8, 8], [8, -8]]`. The shared
-/// dequantization formula (`out = (... + 0x80000) >> 20`) then finalises
-/// every coefficient.
-///
-/// This helper composes the three already-pinned stages in the order the
-/// spec mandates, introducing no new constant or arithmetic:
-///
-/// 1. [`apply_chroma_dc_2x2_2d`] applies the two-sided `M · X · M^T`
-///    transform to the input block (the "transformed first" step);
-/// 2. [`dequantize_chroma_dc`] applies `(svq3_dequant_coeff[Q] *
-///    (sample >> 3)) >> 1` to each transformed sample, where the spec's
-///    `block[0]` is the per-sample placeholder; and
-/// 3. [`finalise_dc`] applies the shared `(x + 0x80000) >> 20` rounding
-///    finalisation to each result.
-///
-/// The input `block` is laid out row-major (`block[0]` = `(0, 0)`,
-/// `block[1]` = `(0, 1)`, `block[2]` = `(1, 0)`, `block[3]` = `(1, 1)`);
-/// the returned `[i32; 4]` carries the four fully dequantized chroma DC
-/// values in the same layout, ready for the per-block reconstruction
-/// writeback.
-///
-/// The caller must ensure `q < DEQUANT_COEFF_TABLE_LEN`; this helper is
-/// `const fn` and so cannot validate the index dynamically.
+/// Result `v_k` (raster order `k = y·4 + x` over the transform
+/// output) becomes coefficient position 0 of the *k*-th 4×4 luma
+/// block, in raster order across the macroblock — equivalently, the
+/// additive post-transform term `169 · v_k` in the fused store
+/// ([`dequantize_transform_luma_block_with_dc`]).
 ///
 /// # Panics
 ///
-/// Panics if `q >= DEQUANT_COEFF_TABLE_LEN`. (`const fn` array index
-/// out-of-bounds is a compile-time error for static `q`, a runtime panic
-/// otherwise.)
-///
-/// # Examples
-///
-/// A pure-DC input block (only `(0, 0)` non-zero) transforms to four equal
-/// samples `8 * 8 * block[0]`, each of which is then dequantized and
-/// finalised identically:
-///
-/// ```
-/// use oxideav_svq::svq3_dequant::{
-///     apply_chroma_dc_2x2_2d, dequantize_chroma_dc, finalise_dc,
-///     dequantize_chroma_dc_block,
-/// };
-///
-/// let q = 12;
-/// let block = [1, 0, 0, 0];
-/// let out = dequantize_chroma_dc_block(q, block);
-///
-/// // Equivalent to the explicit stage-by-stage composition.
-/// let transformed = apply_chroma_dc_2x2_2d(block);
-/// let expected = [
-///     finalise_dc(dequantize_chroma_dc(q, transformed[0])),
-///     finalise_dc(dequantize_chroma_dc(q, transformed[1])),
-///     finalise_dc(dequantize_chroma_dc(q, transformed[2])),
-///     finalise_dc(dequantize_chroma_dc(q, transformed[3])),
-/// ];
-/// assert_eq!(out, expected);
-/// // All four are equal for a pure-DC input.
-/// assert_eq!(out[0], out[1]);
-/// assert_eq!(out[1], out[2]);
-/// assert_eq!(out[2], out[3]);
-/// ```
+/// Panics if `q >= DEQUANT_COEFF_TABLE_LEN`.
 #[inline]
 #[must_use]
-pub const fn dequantize_chroma_dc_block(q: u32, block: [i32; 4]) -> [i32; 4] {
-    // Stage 1: transform the 2×2 chroma DC block first (spec mandate).
-    let transformed = apply_chroma_dc_2x2_2d(block);
-    // Stages 2+3: per-sample chroma DC dequant, then shared finalisation.
-    [
-        finalise_dc(dequantize_chroma_dc(q, transformed[0])),
-        finalise_dc(dequantize_chroma_dc(q, transformed[1])),
-        finalise_dc(dequantize_chroma_dc(q, transformed[2])),
-        finalise_dc(dequantize_chroma_dc(q, transformed[3])),
-    ]
+pub const fn luma_dc_secondary_transform(q: u32, dc_block: [i32; 16]) -> [i32; 16] {
+    // Step 1: luma-quantiser dequant, no rounding (2²⁰ scale).
+    let scaled = scale_luma_block_by_quantiser(q, dc_block);
+    // Step 2: the core transform with its fused +0x80000 >> 20 store.
+    let transformed = apply_luma_transform_2d(scaled);
+    let mut out = [0i32; 16];
+    let mut i = 0;
+    while i < 16 {
+        let t = (transformed[i] as i64 + DEQUANT_ROUND as i64) >> DEQUANT_SHIFT;
+        // Step 3: the literal 1538 (spec/04 §4.2 — verbatim contract).
+        out[i] = sat_i32(t * LUMA_DC_SECONDARY_SCALE as i64);
+        i += 1;
+    }
+    out
 }
 
 /// Scale a placed 4×4 luma coefficient block by the per-quantiser
@@ -942,7 +726,7 @@ pub const fn scale_luma_block_by_quantiser(q: u32, block: [i32; 16]) -> [i32; 16
 pub const fn dequantize_transform_luma_block_with_dc(
     q: u32,
     block: [i32; 16],
-    dc: i32,
+    dc: i64,
 ) -> [i32; 16] {
     // Stage 1: per-coefficient dequant multiply (same pass as transform).
     let scaled = scale_luma_block_by_quantiser(q, block);
@@ -952,8 +736,7 @@ pub const fn dequantize_transform_luma_block_with_dc(
     let mut out = [0i32; 16];
     let mut i = 0;
     while i < 16 {
-        out[i] =
-            sat_i32((transformed[i] as i64 + dc as i64 + DEQUANT_ROUND as i64) >> DEQUANT_SHIFT);
+        out[i] = sat_i32((transformed[i] as i64 + dc + DEQUANT_ROUND as i64) >> DEQUANT_SHIFT);
         i += 1;
     }
     out
@@ -1043,16 +826,31 @@ mod tests {
 
     #[test]
     fn luma_transform_matrix_verbatim_rows() {
-        // Row-by-row verbatim corroboration against the wiki spec's
-        // four-row enumeration:
-        //   13  17   1   7
-        //   13   7  -1 -17
-        //   13  -7  -1  17
-        //   13 -17   1  -7
-        assert_eq!(LUMA_TRANSFORM_MATRIX[0], [13, 17, 1, 7]);
-        assert_eq!(LUMA_TRANSFORM_MATRIX[1], [13, 7, -1, -17]);
-        assert_eq!(LUMA_TRANSFORM_MATRIX[2], [13, -7, -1, 17]);
-        assert_eq!(LUMA_TRANSFORM_MATRIX[3], [13, -17, 1, -7]);
+        // Row-by-row corroboration against the spec/04 §1 measured
+        // basis (third column ±13, the correction over the wiki
+        // snapshot's ±1):
+        //   13  17  13   7
+        //   13   7 -13 -17
+        //   13  -7 -13  17
+        //   13 -17  13  -7
+        assert_eq!(LUMA_TRANSFORM_MATRIX[0], [13, 17, 13, 7]);
+        assert_eq!(LUMA_TRANSFORM_MATRIX[1], [13, 7, -13, -17]);
+        assert_eq!(LUMA_TRANSFORM_MATRIX[2], [13, -7, -13, 17]);
+        assert_eq!(LUMA_TRANSFORM_MATRIX[3], [13, -17, 13, -7]);
+    }
+
+    #[test]
+    fn luma_transform_basis_vectors_share_squared_norm() {
+        // spec/04 §1: every basis vector (matrix column) has squared
+        // norm 4·13² = 17² + 2·7² + 17² = 676 — which the wiki's ±1
+        // third column would violate (it gives 4).
+        for col in 0..4 {
+            let norm: i32 = LUMA_TRANSFORM_MATRIX
+                .iter()
+                .map(|row| row[col] * row[col])
+                .sum();
+            assert_eq!(norm, 676, "column {col}");
+        }
     }
 
     #[test]
@@ -1069,27 +867,6 @@ mod tests {
             total += row.iter().sum::<i32>();
         }
         assert_eq!(total, 4 * LUMA_TRANSFORM_DC_COLUMN);
-    }
-
-    #[test]
-    fn chroma_dc_transform_matrix_verbatim() {
-        // Verbatim corroboration against the wiki spec's "8 8 / 8 -8"
-        // chroma DC transform matrix.
-        assert_eq!(CHROMA_DC_TRANSFORM_MATRIX, [[8, 8], [8, -8]]);
-    }
-
-    #[test]
-    fn chroma_dc_transform_matrix_row_zero_sums_sixteen() {
-        // The first row sums to 16 (the chroma DC's "16 *
-        // average-of-pair" component).
-        assert_eq!(CHROMA_DC_TRANSFORM_MATRIX[0].iter().sum::<i32>(), 16);
-    }
-
-    #[test]
-    fn chroma_dc_transform_matrix_row_one_sums_zero() {
-        // The second row sums to zero (the chroma DC's
-        // "difference-of-pair" component cancels out at row level).
-        assert_eq!(CHROMA_DC_TRANSFORM_MATRIX[1].iter().sum::<i32>(), 0);
     }
 
     #[test]
@@ -1188,15 +965,6 @@ mod tests {
     }
 
     #[test]
-    fn chroma_dc_shifts_sum_to_four() {
-        // The total `>> 4` shift the chroma DC formula imposes
-        // matches the chroma transform matrix's `8` scale factor.
-        assert_eq!(CHROMA_DC_PRE_SHIFT + CHROMA_DC_POST_SHIFT, 4);
-        assert_eq!(CHROMA_DC_PRE_SHIFT, 3);
-        assert_eq!(CHROMA_DC_POST_SHIFT, 1);
-    }
-
-    #[test]
     fn dequantize_intra_luma_dc_zero_input_is_zero() {
         assert_eq!(dequantize_intra_luma_dc(0), 0);
     }
@@ -1206,57 +974,87 @@ mod tests {
         // The bare wiki-spec expression `13 * 13 * 1538 * block[0]`
         // with `block[0] = 1` returns the scale value itself
         // (= 259_922).
-        assert_eq!(dequantize_intra_luma_dc(1), INTRA_LUMA_DC_SCALE);
+        assert_eq!(dequantize_intra_luma_dc(1), INTRA_LUMA_DC_SCALE as i64);
         assert_eq!(dequantize_intra_luma_dc(1), 259_922);
     }
 
     #[test]
     fn dequantize_intra_luma_dc_negative_one_input_is_negative_scale() {
-        assert_eq!(dequantize_intra_luma_dc(-1), -INTRA_LUMA_DC_SCALE);
+        assert_eq!(dequantize_intra_luma_dc(-1), -(INTRA_LUMA_DC_SCALE as i64));
     }
 
     #[test]
     fn dequantize_intra_luma_dc_two_input_doubles_scale() {
-        assert_eq!(dequantize_intra_luma_dc(2), 2 * INTRA_LUMA_DC_SCALE);
+        assert_eq!(dequantize_intra_luma_dc(2), 2 * INTRA_LUMA_DC_SCALE as i64);
     }
 
     #[test]
-    fn dequantize_chroma_dc_zero_input_is_zero() {
-        for q in 0..DEQUANT_COEFF_TABLE_LEN as u32 {
-            assert_eq!(dequantize_chroma_dc(q, 0), 0);
+    fn chroma_quantiser_index_verbatim() {
+        // tables/02-chroma-quantiser-index.csv: identity for 0..=17,
+        // then 17,18,19,20,20,21,22,22,23,23,24,24,25,25.
+        for q in 0..=17u32 {
+            assert_eq!(chroma_quantiser_index(q), q, "identity at {q}");
+        }
+        let tail = [17, 18, 19, 20, 20, 21, 22, 22, 23, 23, 24, 24, 25, 25];
+        for (i, &want) in tail.iter().enumerate() {
+            let q = 18 + i as u32;
+            assert_eq!(chroma_quantiser_index(q), want, "remap at {q}");
         }
     }
 
     #[test]
-    fn dequantize_chroma_dc_at_q_zero_block_eight() {
-        // For q=0, table[0]=3881, block_zero=8:
-        // (3881 * (8 >> 3)) >> 1 = (3881 * 1) >> 1 = 1940.
-        assert_eq!(dequantize_chroma_dc(0, 8), 1940);
+    fn chroma_quantiser_index_saturates_at_25() {
+        // spec/04 §3: the effective chroma multiplier saturates at
+        // ladder entry 25 (68745) while luma continues to 141533.
+        assert_eq!(chroma_quantiser_index(31), 25);
+        assert_eq!(
+            DEQUANT_COEFF_TABLE[chroma_quantiser_index(31) as usize],
+            68745
+        );
+        assert_eq!(DEQUANT_COEFF_TABLE[31], 141533);
     }
 
     #[test]
-    fn dequantize_chroma_dc_at_q_zero_block_seven() {
-        // For q=0, table[0]=3881, block_zero=7:
-        // (3881 * (7 >> 3)) >> 1 = (3881 * 0) >> 1 = 0. The chroma
-        // formula's `>> 3` discards the low 3 bits of block_zero, so
-        // any sub-eight value vanishes.
-        assert_eq!(dequantize_chroma_dc(0, 7), 0);
+    fn chroma_dc_secondary_transform_measured_examples() {
+        // spec/04 §2.2 measured input→output relations. The division
+        // truncates toward zero: (−3, 0, 0, 0) gives −1s, not the −2s
+        // an arithmetic shift would give.
+        assert_eq!(
+            chroma_dc_secondary_transform([-3, 0, 0, 0]),
+            [-1, -1, -1, -1]
+        );
+        assert_eq!(chroma_dc_secondary_transform([3, 0, 0, 0]), [1, 1, 1, 1]);
+        // (100, 20, −8, 3) → (115/2, 69/2, 125/2, 91/2) = (57, 34, 62, 45).
+        assert_eq!(
+            chroma_dc_secondary_transform([100, 20, -8, 3]),
+            [57, 34, 62, 45]
+        );
     }
 
     #[test]
-    fn dequantize_chroma_dc_at_q_thirty_one_block_sixteen() {
-        // For q=31, table[31]=141533, block_zero=16:
-        // (141533 * (16 >> 3)) >> 1 = (141533 * 2) >> 1 = 141533.
-        assert_eq!(dequantize_chroma_dc(31, 16), 141_533);
+    fn chroma_dc_secondary_transform_is_hadamard_halved() {
+        // Cross-check against the H·X·Hᵀ closed form for even sums
+        // (where truncation is exact).
+        let c = [10, -4, 6, 2];
+        let expected = [
+            (c[0] + c[1] + c[2] + c[3]) / 2,
+            (c[0] - c[1] + c[2] - c[3]) / 2,
+            (c[0] + c[1] - c[2] - c[3]) / 2,
+            (c[0] - c[1] - c[2] + c[3]) / 2,
+        ];
+        assert_eq!(chroma_dc_secondary_transform(c), expected);
     }
 
     #[test]
-    fn dequantize_chroma_dc_negative_block_negates_result() {
-        // The arithmetic-right-shift of a negative integer rounds
-        // toward negative infinity, so `(-8) >> 3 = -1`. Then
-        // (3881 * -1) >> 1 = -3881 >> 1 = -1941 (arithmetic shift
-        // rounds toward negative infinity for odd negatives).
-        assert_eq!(dequantize_chroma_dc(0, -8), -1941);
+    fn dequantize_chroma_dc_levels_applies_remap_then_butterfly() {
+        // q = 31 remaps to ladder entry 25 (68745). A single level at
+        // c0 spreads uniformly: B_k = (level · 68745) / 2.
+        let out = dequantize_chroma_dc_levels(31, [2, 0, 0, 0]);
+        let expected = (2 * 68745) / 2;
+        assert_eq!(out, [expected; 4]);
+        // In the identity range the ladder entry is the luma one.
+        let out0 = dequantize_chroma_dc_levels(0, [2, 0, 0, 0]);
+        assert_eq!(out0, [3881; 4]);
     }
 
     #[test]
@@ -1298,7 +1096,7 @@ mod tests {
         // The intra-luma DC formula doesn't "round up" a single
         // block_zero=1 to anything; sample-level reconstruction will
         // need the full sum across the 4×4 block.
-        let dc = dequantize_intra_luma_dc(1);
+        let dc = dequantize_intra_luma_dc(1) as i32;
         assert_eq!(dequantize_coefficient(0, 0, dc), 0);
     }
 
@@ -1386,201 +1184,6 @@ mod tests {
         }
     }
 
-    // ---- 2×2 chroma DC transform application ---------------------------
-
-    #[test]
-    fn chroma_dc_transform_row_zero_is_sum_times_eight() {
-        // Row 0 of the matrix is `[8, 8]`; the dot product against any
-        // 2-point column `[a, b]` is `8 * (a + b)`.
-        let row0 = CHROMA_DC_TRANSFORM_MATRIX[0];
-        for &(a, b) in &[(0i32, 0i32), (1, 0), (0, 1), (3, 5), (-2, 7), (-4, -1)] {
-            assert_eq!(
-                apply_chroma_dc_transform_row(row0, a, b),
-                8 * (a + b),
-                "row 0 mismatch for ({a}, {b})"
-            );
-        }
-    }
-
-    #[test]
-    fn chroma_dc_transform_row_one_is_difference_times_eight() {
-        // Row 1 of the matrix is `[8, -8]`; the dot product against any
-        // 2-point column `[a, b]` is `8 * (a - b)`.
-        let row1 = CHROMA_DC_TRANSFORM_MATRIX[1];
-        for &(a, b) in &[(0i32, 0i32), (1, 0), (0, 1), (3, 5), (-2, 7), (-4, -1)] {
-            assert_eq!(
-                apply_chroma_dc_transform_row(row1, a, b),
-                8 * (a - b),
-                "row 1 mismatch for ({a}, {b})"
-            );
-        }
-    }
-
-    #[test]
-    fn chroma_dc_transform_row_zero_at_known_pair() {
-        // Worked example: row 0 dot (3, 1) = 8 * 3 + 8 * 1 = 32.
-        assert_eq!(
-            apply_chroma_dc_transform_row(CHROMA_DC_TRANSFORM_MATRIX[0], 3, 1),
-            32
-        );
-    }
-
-    #[test]
-    fn chroma_dc_transform_row_one_at_known_pair() {
-        // Worked example: row 1 dot (3, 1) = 8 * 3 + (-8) * 1 = 16.
-        assert_eq!(
-            apply_chroma_dc_transform_row(CHROMA_DC_TRANSFORM_MATRIX[1], 3, 1),
-            16
-        );
-    }
-
-    #[test]
-    fn chroma_dc_2x2_columns_all_zero_block_yields_all_zero_output() {
-        // Identity for the additive zero input.
-        assert_eq!(apply_chroma_dc_2x2_columns([0, 0, 0, 0]), [0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn chroma_dc_2x2_columns_top_row_one_zero_block() {
-        // Input:
-        //   1 0
-        //   0 0
-        // out[0,0] = 8 * (1 + 0) = 8.   out[0,1] = 8 * (0 + 0) = 0.
-        // out[1,0] = 8 * (1 - 0) = 8.   out[1,1] = 8 * (0 - 0) = 0.
-        assert_eq!(apply_chroma_dc_2x2_columns([1, 0, 0, 0]), [8, 0, 8, 0]);
-    }
-
-    #[test]
-    fn chroma_dc_2x2_columns_bottom_row_one_zero_block() {
-        // Input:
-        //   0 0
-        //   1 0
-        // out[0,0] = 8 * (0 + 1) = 8.   out[0,1] = 8 * (0 + 0) = 0.
-        // out[1,0] = 8 * (0 - 1) = -8.  out[1,1] = 8 * (0 - 0) = 0.
-        assert_eq!(apply_chroma_dc_2x2_columns([0, 0, 1, 0]), [8, 0, -8, 0]);
-    }
-
-    #[test]
-    fn chroma_dc_2x2_columns_diagonal_one_zero_block() {
-        // Input:
-        //   1 0
-        //   0 1
-        // out[0,0] = 8 * (1 + 0) = 8.   out[0,1] = 8 * (0 + 1) = 8.
-        // out[1,0] = 8 * (1 - 0) = 8.   out[1,1] = 8 * (0 - 1) = -8.
-        assert_eq!(apply_chroma_dc_2x2_columns([1, 0, 0, 1]), [8, 8, 8, -8]);
-    }
-
-    #[test]
-    fn chroma_dc_2x2_columns_anti_diagonal_one_zero_block() {
-        // Input:
-        //   0 1
-        //   1 0
-        // out[0,0] = 8 * (0 + 1) = 8.   out[0,1] = 8 * (1 + 0) = 8.
-        // out[1,0] = 8 * (0 - 1) = -8.  out[1,1] = 8 * (1 - 0) = 8.
-        assert_eq!(apply_chroma_dc_2x2_columns([0, 1, 1, 0]), [8, 8, -8, 8]);
-    }
-
-    #[test]
-    fn chroma_dc_2x2_columns_all_ones_block_doubles_dc_and_cancels_diff() {
-        // Input:
-        //   1 1
-        //   1 1
-        // out[0,0] = 8 * (1 + 1) = 16.  out[0,1] = 8 * (1 + 1) = 16.
-        // out[1,0] = 8 * (1 - 1) = 0.   out[1,1] = 8 * (1 - 1) = 0.
-        assert_eq!(apply_chroma_dc_2x2_columns([1, 1, 1, 1]), [16, 16, 0, 0]);
-    }
-
-    #[test]
-    fn chroma_dc_2x2_columns_is_linear_in_input() {
-        // Doubling every input position doubles every output position.
-        let block = [3, -2, 5, 1];
-        let doubled = [6, -4, 10, 2];
-        let out = apply_chroma_dc_2x2_columns(block);
-        let out_doubled = apply_chroma_dc_2x2_columns(doubled);
-        for (o, od) in out.iter().zip(out_doubled.iter()) {
-            assert_eq!(2 * o, *od);
-        }
-    }
-
-    #[test]
-    fn chroma_dc_2x2_columns_negation_negates_output() {
-        // f(-X) = -f(X) — the transform is linear.
-        let block = [3, -2, 5, 1];
-        let negated = [-3, 2, -5, -1];
-        let out = apply_chroma_dc_2x2_columns(block);
-        let out_negated = apply_chroma_dc_2x2_columns(negated);
-        for (o, on) in out.iter().zip(out_negated.iter()) {
-            assert_eq!(-*o, *on);
-        }
-    }
-
-    #[test]
-    fn chroma_dc_2x2_columns_top_row_only_carries_to_both_output_rows() {
-        // Only top-row input → both output rows are non-zero with the
-        // same magnitudes (sum and difference of the top-row pair both
-        // collapse to the top-row pair when bottom is zero).
-        let block = [2, 5, 0, 0];
-        // out[0,0] = 8 * (2 + 0) = 16. out[0,1] = 8 * (5 + 0) = 40.
-        // out[1,0] = 8 * (2 - 0) = 16. out[1,1] = 8 * (5 - 0) = 40.
-        assert_eq!(apply_chroma_dc_2x2_columns(block), [16, 40, 16, 40]);
-    }
-
-    #[test]
-    fn chroma_dc_2x2_columns_bottom_row_only_signs_second_output_row() {
-        // Only bottom-row input → first output row carries the bottom
-        // values verbatim (sum) and second output row carries their
-        // negations (difference 0 - x = -x).
-        let block = [0, 0, 3, -1];
-        // out[0,0] = 8 * (0 + 3) = 24.  out[0,1] = 8 * (0 - 1) = -8.
-        // out[1,0] = 8 * (0 - 3) = -24. out[1,1] = 8 * (0 - -1) = 8.
-        assert_eq!(apply_chroma_dc_2x2_columns(block), [24, -8, -24, 8]);
-    }
-
-    #[test]
-    fn chroma_dc_2x2_columns_output_row_zero_is_column_wise_sum_times_eight() {
-        // Output row 0 column c = 8 * (block top-row c + block bottom-row c).
-        let block = [7, -3, 2, 4];
-        let out = apply_chroma_dc_2x2_columns(block);
-        assert_eq!(out[0], 8 * (block[0] + block[2]));
-        assert_eq!(out[1], 8 * (block[1] + block[3]));
-    }
-
-    #[test]
-    fn chroma_dc_2x2_columns_output_row_one_is_column_wise_difference_times_eight() {
-        // Output row 1 column c = 8 * (block top-row c - block bottom-row c).
-        let block = [7, -3, 2, 4];
-        let out = apply_chroma_dc_2x2_columns(block);
-        assert_eq!(out[2], 8 * (block[0] - block[2]));
-        assert_eq!(out[3], 8 * (block[1] - block[3]));
-    }
-
-    #[test]
-    fn chroma_dc_2x2_columns_const_evaluable_in_static_context() {
-        // The `const fn` annotation lets the helper be used at const
-        // evaluation time.
-        const OUT: [i32; 4] = apply_chroma_dc_2x2_columns([1, 2, 3, 4]);
-        // out[0,0] = 8*(1+3)=32. out[0,1] = 8*(2+4)=48.
-        // out[1,0] = 8*(1-3)=-16. out[1,1] = 8*(2-4)=-16.
-        assert_eq!(OUT, [32, 48, -16, -16]);
-    }
-
-    #[test]
-    fn chroma_dc_2x2_columns_chains_with_place_chroma_dc_2x2() {
-        // Cross-module sanity: feed a placement output through the
-        // transform to confirm the row-major flat layout is compatible.
-        // A single coefficient at scan position 0 with value 1 places at
-        // flat index 0 of the 4-entry block — the (0, 0) position. The
-        // transformed output's column 0 sums (top + bottom) and
-        // differences (top - bottom) collapse to (1, 1) and (1, -1)
-        // times 8 = (8, 8). Column 1 is all zeros.
-        use crate::svq3_coeff::Coefficient;
-        use crate::svq3_scan::place_chroma_dc_2x2;
-        let block = place_chroma_dc_2x2(&[Coefficient { run: 0, value: 1 }]).unwrap();
-        assert_eq!(block, [1, 0, 0, 0]);
-        let transformed = apply_chroma_dc_2x2_columns(block);
-        assert_eq!(transformed, [8, 0, 8, 0]);
-    }
-
     // ---- 4×4 luma transform application ----
 
     #[test]
@@ -1609,25 +1212,25 @@ mod tests {
     #[test]
     fn luma_transform_row_explicit_dot_products() {
         // Worked examples against the column [1, 2, 3, 4].
-        // Row 0 [13,17,1,7]:  13 + 34 + 3 + 28 = 78.
+        // Row 0 [13,17,13,7]:  13 + 34 + 39 + 28 = 114.
         assert_eq!(
             apply_luma_transform_row(LUMA_TRANSFORM_MATRIX[0], 1, 2, 3, 4),
-            78,
+            114,
         );
-        // Row 1 [13,7,-1,-17]: 13 + 14 - 3 - 68 = -44.
+        // Row 1 [13,7,-13,-17]: 13 + 14 - 39 - 68 = -80.
         assert_eq!(
             apply_luma_transform_row(LUMA_TRANSFORM_MATRIX[1], 1, 2, 3, 4),
-            -44,
+            -80,
         );
-        // Row 2 [13,-7,-1,17]: 13 - 14 - 3 + 68 = 64.
+        // Row 2 [13,-7,-13,17]: 13 - 14 - 39 + 68 = 28.
         assert_eq!(
             apply_luma_transform_row(LUMA_TRANSFORM_MATRIX[2], 1, 2, 3, 4),
-            64,
+            28,
         );
-        // Row 3 [13,-17,1,-7]: 13 - 34 + 3 - 28 = -46.
+        // Row 3 [13,-17,13,-7]: 13 - 34 + 39 - 28 = -10.
         assert_eq!(
             apply_luma_transform_row(LUMA_TRANSFORM_MATRIX[3], 1, 2, 3, 4),
-            -46,
+            -10,
         );
     }
 
@@ -1848,54 +1451,6 @@ mod tests {
         assert_eq!(OUT[4], 0);
     }
 
-    #[test]
-    fn chroma_dc_rows_doc_example() {
-        // out[0,0] = 8*(1+0)=8; out[0,1] = 8*(1-0)=8;
-        // out[1,0] = 8*(0+1)=8; out[1,1] = 8*(0-1)=-8.
-        assert_eq!(apply_chroma_dc_2x2_rows([1, 0, 0, 1]), [8, 8, 8, -8]);
-    }
-
-    #[test]
-    fn chroma_dc_rows_matches_explicit_x_mt_definition() {
-        for block in [
-            [1, 2, 3, 4],
-            [-3, 5, -7, 11],
-            [0, 0, 5, -5],
-            [127, -128, 64, -64],
-        ] {
-            let out = apply_chroma_dc_2x2_rows(block);
-            // out[r, c] = sum_k block[r*2 + k] * M[c][k]; M = [[8,8],[8,-8]].
-            for r in 0..2 {
-                for c in 0..2 {
-                    let expected = block[r * 2] * CHROMA_DC_TRANSFORM_MATRIX[c][0]
-                        + block[r * 2 + 1] * CHROMA_DC_TRANSFORM_MATRIX[c][1];
-                    assert_eq!(out[r * 2 + c], expected, "({r}, {c})");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn chroma_dc_rows_is_columns_of_the_transposed_input() {
-        // Same transpose relation as the luma case, on the 2×2 block.
-        for block in [[1, 2, 3, 4], [-9, 4, 6, -2]] {
-            let transposed = [block[0], block[2], block[1], block[3]];
-            let rows_out = apply_chroma_dc_2x2_rows(block);
-            let cols_of_transpose = apply_chroma_dc_2x2_columns(transposed);
-            // rows_out[r][c] = cols_of_transpose[c][r].
-            assert_eq!(rows_out[0], cols_of_transpose[0]); // (0,0)=(0,0)
-            assert_eq!(rows_out[1], cols_of_transpose[2]); // (0,1)=(1,0)
-            assert_eq!(rows_out[2], cols_of_transpose[1]); // (1,0)=(0,1)
-            assert_eq!(rows_out[3], cols_of_transpose[3]); // (1,1)=(1,1)
-        }
-    }
-
-    #[test]
-    fn chroma_dc_rows_const_evaluable_in_static_context() {
-        const OUT: [i32; 4] = apply_chroma_dc_2x2_rows([1, 0, 0, 1]);
-        assert_eq!(OUT, [8, 8, 8, -8]);
-    }
-
     // ----- Two-sided luma transform M · X · M^T -----------------------------
 
     /// Brute-force reference: triple-loop `M · X · M^T` for a row-major 4×4
@@ -1999,177 +1554,6 @@ mod tests {
         assert_eq!(OUT[15], 13 * 13);
     }
 
-    // ----- Two-sided chroma DC transform M · X · M^T ------------------------
-
-    /// Brute-force reference for the 2×2 chroma DC two-sided transform.
-    fn reference_chroma_2d(block: [i32; 4]) -> [i32; 4] {
-        let m = CHROMA_DC_TRANSFORM_MATRIX;
-        let mut out = [0i32; 4];
-        for i in 0..2 {
-            for j in 0..2 {
-                let mut acc = 0i32;
-                for p in 0..2 {
-                    for q in 0..2 {
-                        acc += m[i][p] * block[p * 2 + q] * m[j][q];
-                    }
-                }
-                out[i * 2 + j] = acc;
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn chroma_2d_doc_example_pure_dc() {
-        assert_eq!(apply_chroma_dc_2x2_2d([1, 0, 0, 0]), [64, 64, 64, 64]);
-    }
-
-    #[test]
-    fn chroma_2d_matches_brute_force_reference() {
-        for block in [
-            [1, 2, 3, 4],
-            [-3, 5, -7, 11],
-            [0, 0, 5, -5],
-            [127, -128, 64, -64],
-        ] {
-            assert_eq!(apply_chroma_dc_2x2_2d(block), reference_chroma_2d(block));
-        }
-    }
-
-    #[test]
-    fn chroma_2d_order_independent_columns_then_rows() {
-        // M is symmetric, so columns-then-rows equals rows-then-columns.
-        for block in [[1, 2, 3, 4], [-9, 4, 6, -2], [100, -100, 50, -50]] {
-            let rows_then_cols = apply_chroma_dc_2x2_2d(block);
-            let cols_then_rows = apply_chroma_dc_2x2_rows(apply_chroma_dc_2x2_columns(block));
-            assert_eq!(rows_then_cols, cols_then_rows);
-        }
-    }
-
-    #[test]
-    fn chroma_2d_const_evaluable_in_static_context() {
-        const OUT: [i32; 4] = apply_chroma_dc_2x2_2d([1, 0, 0, 0]);
-        assert_eq!(OUT, [64, 64, 64, 64]);
-    }
-
-    // --- chroma DC full pipeline (transform → dequant → finalise) ---
-
-    /// Independent re-derivation of the chroma DC pipeline: transform the
-    /// 2×2 block with the brute-force `M · X · M^T` reference, then apply
-    /// the spec's per-sample chroma DC dequant and the shared finalisation,
-    /// using none of the production helpers under test.
-    fn reference_chroma_dc_pipeline(q: u32, block: [i32; 4]) -> [i32; 4] {
-        let transformed = reference_chroma_2d(block);
-        let coeff = DEQUANT_COEFF_TABLE[q as usize] as i32;
-        let mut out = [0i32; 4];
-        let mut i = 0;
-        while i < 4 {
-            // (svq3_dequant_coeff[Q] * (sample >> 3)) >> 1
-            let dc = (coeff * (transformed[i] >> 3)) >> 1;
-            // shared finalisation (x + 0x80000) >> 20
-            out[i] = (dc + 0x80000) >> 20;
-            i += 1;
-        }
-        out
-    }
-
-    #[test]
-    fn chroma_dc_block_matches_independent_reference() {
-        for q in [0u32, 1, 12, 24, 31] {
-            for block in [
-                [1, 0, 0, 0],
-                [1, 2, 3, 4],
-                [-3, 5, -7, 11],
-                [0, 0, 5, -5],
-                [127, -128, 64, -64],
-            ] {
-                assert_eq!(
-                    dequantize_chroma_dc_block(q, block),
-                    reference_chroma_dc_pipeline(q, block),
-                    "mismatch for q={q}, block={block:?}",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn chroma_dc_block_equals_explicit_staged_composition() {
-        // The helper must equal: transform (production 2d helper) → dequant
-        // each sample → finalise each sample, in that exact order.
-        for q in [0u32, 7, 31] {
-            for block in [[1, 2, 3, 4], [-9, 4, 6, -2], [100, -100, 50, -50]] {
-                let transformed = apply_chroma_dc_2x2_2d(block);
-                let expected = [
-                    finalise_dc(dequantize_chroma_dc(q, transformed[0])),
-                    finalise_dc(dequantize_chroma_dc(q, transformed[1])),
-                    finalise_dc(dequantize_chroma_dc(q, transformed[2])),
-                    finalise_dc(dequantize_chroma_dc(q, transformed[3])),
-                ];
-                assert_eq!(dequantize_chroma_dc_block(q, block), expected);
-            }
-        }
-    }
-
-    #[test]
-    fn chroma_dc_block_pure_dc_yields_four_equal_samples() {
-        // A pure-DC input transforms to four equal samples, so the whole
-        // pipeline must produce four identical outputs regardless of Q.
-        for q in [0u32, 5, 18, 31] {
-            for v in [1i32, 7, 64, -64, 255, -255] {
-                let out = dequantize_chroma_dc_block(q, [v, 0, 0, 0]);
-                assert_eq!(out[0], out[1], "q={q}, v={v}");
-                assert_eq!(out[1], out[2], "q={q}, v={v}");
-                assert_eq!(out[2], out[3], "q={q}, v={v}");
-            }
-        }
-    }
-
-    #[test]
-    fn chroma_dc_block_transforms_before_dequantizing() {
-        // Order matters: dequantizing the raw (untransformed) block first
-        // and then transforming would generally differ from the spec order.
-        // Pick a block where the two orders diverge to lock the ordering in.
-        let q = 24;
-        let block = [37, -11, 5, 23];
-        let spec_order = dequantize_chroma_dc_block(q, block);
-
-        // Wrong order: dequant+finalise the raw samples, then transform.
-        let mut wrong = [0i32; 4];
-        let mut i = 0;
-        while i < 4 {
-            wrong[i] = finalise_dc(dequantize_chroma_dc(q, block[i]));
-            i += 1;
-        }
-        let wrong_then_transform = apply_chroma_dc_2x2_2d(wrong);
-
-        assert_ne!(
-            spec_order, wrong_then_transform,
-            "transform-first ordering is not observable on this fixture"
-        );
-    }
-
-    #[test]
-    fn chroma_dc_block_zero_input_is_zero() {
-        for q in [0u32, 15, 31] {
-            assert_eq!(dequantize_chroma_dc_block(q, [0, 0, 0, 0]), [0, 0, 0, 0]);
-        }
-    }
-
-    #[test]
-    fn chroma_dc_block_const_evaluable_in_static_context() {
-        const OUT: [i32; 4] = dequantize_chroma_dc_block(12, [1, 0, 0, 0]);
-        // Pure-DC: all four equal.
-        assert_eq!(OUT[0], OUT[1]);
-        assert_eq!(OUT[1], OUT[2]);
-        assert_eq!(OUT[2], OUT[3]);
-    }
-
-    #[test]
-    #[should_panic]
-    fn chroma_dc_block_panics_on_out_of_range_quantiser() {
-        let _ = dequantize_chroma_dc_block(DEQUANT_COEFF_TABLE_LEN as u32, [1, 2, 3, 4]);
-    }
-
     // ---- Luma residual interleave (spec/01 Gap 2) ----------------------
 
     #[test]
@@ -2241,9 +1625,9 @@ mod tests {
         // (zero coefficients) the residual is uniformly
         // (dc + 0x80000) >> 20.
         let q = 3;
-        let dc = 7 << 20; // a clean multiple to make the shift exact
+        let dc = 7i64 << 20; // a clean multiple to make the shift exact
         let out = dequantize_transform_luma_block_with_dc(q, [0i32; 16], dc);
-        let expected = (dc + DEQUANT_ROUND) >> DEQUANT_SHIFT;
+        let expected = ((dc + DEQUANT_ROUND as i64) >> DEQUANT_SHIFT) as i32;
         for w in out.iter() {
             assert_eq!(*w, expected);
         }
@@ -2289,8 +1673,8 @@ mod tests {
         let mut block = [0i32; 16];
         block[0] = block0;
         let out = dequantize_transform_intra_luma_block(q, block);
-        let dc = INTRA_LUMA_DC_SCALE * block0;
-        let expected = (dc + DEQUANT_ROUND) >> DEQUANT_SHIFT;
+        let dc = (INTRA_LUMA_DC_SCALE * block0) as i64;
+        let expected = ((dc + DEQUANT_ROUND as i64) >> DEQUANT_SHIFT) as i32;
         for w in out.iter() {
             assert_eq!(*w, expected);
         }
@@ -2343,9 +1727,12 @@ mod tests {
     /// multiply overflow in the dequant-scale pass).
     #[test]
     fn hostile_coefficients_saturate_instead_of_overflowing() {
-        // Direct helper domains at the i32 extremes.
-        assert_eq!(dequantize_intra_luma_dc(i32::MAX), i32::MAX);
-        assert_eq!(dequantize_intra_luma_dc(i32::MIN), i32::MIN);
+        // The intra-luma DC scale is exact in 64-bit even at the i32
+        // extremes.
+        assert_eq!(
+            dequantize_intra_luma_dc(i32::MAX),
+            INTRA_LUMA_DC_SCALE as i64 * i32::MAX as i64
+        );
         // The >>20 shift precedes the saturation, so even i32-extreme
         // inputs land back in-domain — exactly the widened evaluation
         // of the spec formula (a 32-bit evaluation would overflow).
@@ -2364,14 +1751,9 @@ mod tests {
             finalise_dc(i32::MAX),
             ((i32::MAX as i64 + DEQUANT_ROUND as i64) >> DEQUANT_SHIFT) as i32
         );
-        assert_eq!(dequantize_chroma_dc(31, i32::MIN), i32::MIN);
         assert_eq!(
             apply_luma_transform_row(LUMA_TRANSFORM_MATRIX[0], i32::MAX, i32::MAX, 0, 0),
             i32::MAX
-        );
-        assert_eq!(
-            apply_chroma_dc_transform_row(CHROMA_DC_TRANSFORM_MATRIX[1], i32::MIN, i32::MAX),
-            i32::MIN
         );
 
         // Full block pipelines at the extremes stay panic-free and
@@ -2379,9 +1761,10 @@ mod tests {
         // reconstruction regardless of the exact saturated value).
         let hostile = [i32::MAX; 16];
         let _ = dequantize_transform_luma_block(31, hostile);
-        let _ = dequantize_transform_luma_block_with_dc(31, hostile, i32::MIN);
+        let _ = dequantize_transform_luma_block_with_dc(31, hostile, i64::MIN / 4);
         let _ = dequantize_transform_intra_luma_block(31, [i32::MIN; 16]);
-        let _ = dequantize_chroma_dc_block(31, [i32::MIN, i32::MAX, i32::MIN, i32::MAX]);
+        let _ = dequantize_chroma_dc_levels(31, [i32::MIN, i32::MAX, i32::MIN, i32::MAX]);
+        let _ = luma_dc_secondary_transform(31, hostile);
 
         // In-domain results are bit-identical to the plain 32-bit
         // evaluation of the spec formulas.
@@ -2392,5 +1775,136 @@ mod tests {
             dequantize_coefficient(q, coeff, 0),
             (coeff * scale + DEQUANT_ROUND) >> DEQUANT_SHIFT
         );
+    }
+
+    // ---- spec/04 §1 measured basis + §4 luma DC secondary transform ----
+
+    /// Run one dequantised block through the core transform's fused
+    /// `+0x80000 >> 20` store (the spec/04 §1 measurement harness).
+    fn transform_and_round(block: [i32; 16]) -> [i32; 16] {
+        let t = apply_luma_transform_2d(block);
+        core::array::from_fn(|i| ((t[i] as i64 + DEQUANT_ROUND as i64) >> DEQUANT_SHIFT) as i32)
+    }
+
+    #[test]
+    fn measured_basis_single_coefficient_responses() {
+        // spec/04 §1: feeding a single coefficient of value 2²⁰ into
+        // the transform and reading back all sixteen outputs.
+        let unit = 1i32 << 20;
+
+        // Position 0 → uniform 169 = 13·13.
+        let mut b = [0i32; 16];
+        b[0] = unit;
+        assert_eq!(transform_and_round(b), [169; 16]);
+
+        // Position 1 → rows all 221, 91, −91, −221 = 13·(17, 7, −7, −17).
+        let mut b = [0i32; 16];
+        b[1] = unit;
+        let out = transform_and_round(b);
+        for r in 0..4 {
+            assert_eq!(&out[r * 4..r * 4 + 4], &[221, 91, -91, -221], "row {r}");
+        }
+
+        // Position 2 → rows all 169, −169, −169, 169 = 13·13·(1, −1, −1, 1)
+        // — the direct measurement that the third basis vector is
+        // 13·(1, −1, −1, 1), not (1, −1, −1, 1).
+        let mut b = [0i32; 16];
+        b[2] = unit;
+        let out = transform_and_round(b);
+        for r in 0..4 {
+            assert_eq!(&out[r * 4..r * 4 + 4], &[169, -169, -169, 169], "row {r}");
+        }
+
+        // Position 3 → rows all 91, −221, 221, −91 = 13·(7, −17, 17, −7).
+        let mut b = [0i32; 16];
+        b[3] = unit;
+        let out = transform_and_round(b);
+        for r in 0..4 {
+            assert_eq!(&out[r * 4..r * 4 + 4], &[91, -221, 221, -91], "row {r}");
+        }
+
+        // Position 5 → outer product of (17, 7, −7, −17) with itself.
+        let mut b = [0i32; 16];
+        b[5] = unit;
+        let out = transform_and_round(b);
+        let v = [17i32, 7, -7, -17];
+        for r in 0..4 {
+            for c in 0..4 {
+                assert_eq!(out[r * 4 + c], v[r] * v[c], "({r},{c})");
+            }
+        }
+
+        // Position 15 → outer product of (7, −17, 17, −7) with itself.
+        let mut b = [0i32; 16];
+        b[15] = unit;
+        let out = transform_and_round(b);
+        let w = [7i32, -17, 17, -7];
+        for r in 0..4 {
+            for c in 0..4 {
+                assert_eq!(out[r * 4 + c], w[r] * w[c], "({r},{c})");
+            }
+        }
+    }
+
+    #[test]
+    fn luma_dc_secondary_scale_is_verbatim_1538() {
+        // spec/04 §4.2: 1538 is the wire-format contract, used verbatim
+        // (not the 1551 an exactly orthonormal cascade would need).
+        assert_eq!(LUMA_DC_SECONDARY_SCALE, 1538);
+        assert_eq!(LUMA_DC_SECONDARY_SCALE, INTRA_LUMA_DC_SCALE_TAIL);
+    }
+
+    #[test]
+    fn luma_dc_secondary_transform_zero_is_zero() {
+        for q in [0u32, 15, 31] {
+            assert_eq!(luma_dc_secondary_transform(q, [0; 16]), [0; 16]);
+        }
+    }
+
+    #[test]
+    fn luma_dc_secondary_transform_single_dc_level() {
+        // A single level at position 0: T is uniform
+        // (169·level·dequant[q] + 0x80000) >> 20, and v = 1538·T.
+        let q = 4u32;
+        let level = 3i32;
+        let mut b = [0i32; 16];
+        b[0] = level;
+        let out = luma_dc_secondary_transform(q, b);
+        let scale = DEQUANT_COEFF_TABLE[q as usize] as i64;
+        let t = ((169 * level as i64 * scale + DEQUANT_ROUND as i64) >> DEQUANT_SHIFT) as i32;
+        assert_eq!(out, [1538 * t; 16]);
+    }
+
+    #[test]
+    fn luma_dc_secondary_transform_uses_luma_quantiser() {
+        // spec/04 §4.1: the DC block is dequantised with the luma
+        // quantiser — no chroma remap. At q = 31 the luma ladder entry
+        // (141533) differs from the remapped chroma one (68745), so the
+        // two paths must diverge.
+        let mut b = [0i32; 16];
+        b[0] = 2;
+        let luma = luma_dc_secondary_transform(31, b);
+        let mut remapped = [0i32; 16];
+        remapped[0] = 2;
+        let chroma_style = luma_dc_secondary_transform(chroma_quantiser_index(31), remapped);
+        assert_ne!(luma, chroma_style);
+    }
+
+    #[test]
+    fn dc_additive_form_equals_position_zero_placement() {
+        // The reconstruction layer's additive form 169·v must equal
+        // placing v at coefficient position 0 of a dequantised block
+        // and running the transform (column 0 of the basis is
+        // uniformly 13).
+        for v in [1i32, -7, 260, 1538] {
+            let mut placed = [0i32; 16];
+            placed[0] = v;
+            let via_placement = transform_and_round(placed);
+            let via_additive = dequantize_transform_luma_block_with_dc(0, [0; 16], 169 * v as i64);
+            // The placement path multiplies by no quantiser scale
+            // (already dequantised), so compare against the additive
+            // path with zero coefficients (scale irrelevant).
+            assert_eq!(via_placement, via_additive, "v = {v}");
+        }
     }
 }
