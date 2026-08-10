@@ -745,6 +745,49 @@ pub fn predict_dc_16x16(
     [dc as u8; PRED_16X16_SAMPLES]
 }
 
+/// The 16×16 luma **vertical** predictor — the standard H.264 16×16
+/// vertical mode: the 16-sample above row is repeated down every row.
+///
+/// The wiki snapshot states SVQ3's intra prediction "is the same as in
+/// H.264 except for" its enumerated quirks (transposed plane,
+/// chroma-DC-only); vertical is not quirk-listed, so the standard
+/// definition applies. The binding of the intra 16×16 `pred_mode`
+/// values `0..=3` to the four predictors is not pinned by the staged
+/// docs (`docs/video/svq3/provenance/05` "What was NOT established");
+/// this predictor is provided for the standard-numbering reading.
+#[must_use]
+pub const fn predict_vertical_16x16(top: [u8; PRED_16X16_DIM]) -> [u8; PRED_16X16_SAMPLES] {
+    let mut out = [0u8; PRED_16X16_SAMPLES];
+    let mut y = 0;
+    while y < PRED_16X16_DIM {
+        let mut x = 0;
+        while x < PRED_16X16_DIM {
+            out[y * PRED_16X16_DIM + x] = top[x];
+            x += 1;
+        }
+        y += 1;
+    }
+    out
+}
+
+/// The 16×16 luma **horizontal** predictor — the standard H.264 16×16
+/// horizontal mode: the 16-sample left column is repeated across every
+/// column. See [`predict_vertical_16x16`] for the provenance note.
+#[must_use]
+pub const fn predict_horizontal_16x16(left: [u8; PRED_16X16_DIM]) -> [u8; PRED_16X16_SAMPLES] {
+    let mut out = [0u8; PRED_16X16_SAMPLES];
+    let mut y = 0;
+    while y < PRED_16X16_DIM {
+        let mut x = 0;
+        while x < PRED_16X16_DIM {
+            out[y * PRED_16X16_DIM + x] = left[y];
+            x += 1;
+        }
+        y += 1;
+    }
+    out
+}
+
 /// Width / height of one 8×8 chroma prediction block (one chroma
 /// plane of a macroblock).
 pub const PRED_CHROMA_DIM: usize = 8;

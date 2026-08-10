@@ -61,9 +61,10 @@ use crate::svq3_dequant::{
     dequantize_transform_luma_block, dequantize_transform_luma_block_with_dc,
 };
 use crate::svq3_pred::{
-    predict_chroma_dc_8x8, predict_dc_16x16, predict_intra_4x4, predict_plane_16x16,
-    reconstruct_4x4, reconstruct_sample, Intra4x4Neighbours, Svq3IntraMode, PRED_16X16_DIM,
-    PRED_4X4_DIM, PRED_4X4_SAMPLES, PRED_CHROMA_DIM, PRED_CHROMA_SAMPLES,
+    predict_chroma_dc_8x8, predict_dc_16x16, predict_horizontal_16x16, predict_intra_4x4,
+    predict_plane_16x16, predict_vertical_16x16, reconstruct_4x4, reconstruct_sample,
+    Intra4x4Neighbours, Svq3IntraMode, PRED_16X16_DIM, PRED_4X4_DIM, PRED_4X4_SAMPLES,
+    PRED_CHROMA_DIM, PRED_CHROMA_SAMPLES,
 };
 
 /// Side length of a luma macroblock in pixels.
@@ -494,6 +495,14 @@ pub fn decode_and_reconstruct_intra_luma_macroblock(
 /// reconstruction entry point takes the resolved mode directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Svq3Luma16x16Mode {
+    /// The standard 16×16 vertical predictor
+    /// ([`crate::svq3_pred::predict_vertical_16x16`]): the above row
+    /// repeated down every row. Requires the above row.
+    Vertical,
+    /// The standard 16×16 horizontal predictor
+    /// ([`crate::svq3_pred::predict_horizontal_16x16`]): the left
+    /// column repeated across every column. Requires the left column.
+    Horizontal,
     /// The SVQ3 transposed-plane predictor
     /// ([`crate::svq3_pred::predict_plane_16x16`], Gap 4). Requires both
     /// the above row and left column to be available.
@@ -503,6 +512,30 @@ pub enum Svq3Luma16x16Mode {
     /// average used at macroblock edges where the plane predictor's
     /// neighbours are not both present.
     Dc,
+}
+
+impl Svq3Luma16x16Mode {
+    /// Resolve an intra 16×16 `pred_mode` selector (`0..=3`, from
+    /// [`crate::svq3_mb::Intra16x16Params`]) to a predictor, falling
+    /// back to DC when a required neighbour row/column is unavailable.
+    ///
+    /// The numbering follows the standard H.264 16×16 mode order
+    /// (0 = vertical, 1 = horizontal, 2 = DC, 3 = plane); the wiki
+    /// snapshot says SVQ3 intra prediction "is the same as in H.264"
+    /// apart from its enumerated quirks, but the binding of the four
+    /// selector values to the four predictors is **not pinned** by the
+    /// staged docs (`docs/video/svq3/provenance/05` "What was NOT
+    /// established") — this resolver carries the standard-numbering
+    /// reading.
+    #[must_use]
+    pub const fn from_pred_mode(mode: u8, top_available: bool, left_available: bool) -> Self {
+        match mode {
+            0 if top_available => Self::Vertical,
+            1 if left_available => Self::Horizontal,
+            3 if top_available && left_available => Self::Plane,
+            _ => Self::Dc,
+        }
+    }
 }
 
 impl LumaMacroblock {
@@ -516,6 +549,8 @@ impl LumaMacroblock {
     #[must_use]
     fn predict_16x16(&self, mode: Svq3Luma16x16Mode) -> [u8; MB_LUMA_DIM * MB_LUMA_DIM] {
         match mode {
+            Svq3Luma16x16Mode::Vertical => predict_vertical_16x16(self.above),
+            Svq3Luma16x16Mode::Horizontal => predict_horizontal_16x16(self.leftcol),
             Svq3Luma16x16Mode::Plane => predict_plane_16x16(self.above, self.leftcol),
             Svq3Luma16x16Mode::Dc => predict_dc_16x16(
                 self.above,

@@ -71,28 +71,93 @@ pub const B_FRAME_MB_TYPE_MAX: u32 = 29;
 /// macroblock-type space.
 pub const B_FRAME_INTRA_OFFSET: u32 = 4;
 
-/// I-frame macroblock-type classification (codes `0..=25`).
+/// The decoded parameter triple of an intra 16×16 macroblock type.
 ///
-/// Per `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Macroblock
-/// layer":
+/// Per `docs/video/svq3/spec/04-dc-secondary-transform.md` §4.5 (and
+/// `docs/video/svq3/tables/03-intra16x16-macroblock-types.csv`) the
+/// twenty-four unified macroblock type code numbers 9…32 factor
+/// exactly as
 ///
-/// * `0` — macroblock with luma DCs coded in a separate 4×4 block.
-/// * `1..=24` — macroblock with a predefined coded-block-pattern and
-///   intra-prediction mode (the 24 enumerated `(CBP, mode)`
-///   combinations the wiki spec attaches to the H.264-style intra
-///   16×16 modes).
-/// * `25` — macroblock with luma DCs coded in a separate 4×4 block
-///   and no other blocks coded.
+/// ```text
+/// mb_type = 9 + intra16x16_pred_mode + 4 · cbp_chroma + 12 · luma_ac
+/// ```
+///
+/// There is **no coded-block-pattern element on the wire** for these
+/// types: the luma pattern is the single bit `luma_ac` (all sixteen
+/// blocks or none) and the chroma pattern is the three-valued class of
+/// spec/03 §1.2, both carried by the type itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Intra16x16Params {
+    /// The 16×16 luma prediction mode selector, `0..=3`. (The binding
+    /// of the four values to the four predictors is not pinned by the
+    /// staged docs — see `docs/video/svq3/provenance/05` "What was NOT
+    /// established".)
+    pub pred_mode: u8,
+    /// The chroma class of spec/03 §1.2: 0 = no chroma residual,
+    /// 1 = chroma DC only, 2 = chroma DC and AC.
+    pub cbp_chroma: u8,
+    /// Whether the sixteen luma 4×4 blocks carry AC coefficients
+    /// (spec/04 §4.3). The separate luma DC block is present either
+    /// way.
+    pub luma_ac: bool,
+}
+
+impl Intra16x16Params {
+    /// Factor a unified macroblock type code number `9..=32` into its
+    /// parameter triple. Returns `None` outside that range.
+    #[must_use]
+    pub const fn from_unified_type(t: u32) -> Option<Self> {
+        if t < 9 || t > 32 {
+            return None;
+        }
+        let idx = t - 9;
+        Some(Self {
+            pred_mode: (idx % 4) as u8,
+            cbp_chroma: ((idx / 4) % 3) as u8,
+            luma_ac: idx / 12 == 1,
+        })
+    }
+
+    /// The inverse of [`Self::from_unified_type`].
+    #[must_use]
+    pub const fn unified_type(self) -> u32 {
+        9 + self.pred_mode as u32 + 4 * self.cbp_chroma as u32 + 12 * self.luma_ac as u32
+    }
+}
+
+/// Intra macroblock-type classification, shared by all three frame
+/// types' intra code ranges.
+///
+/// The wire code spaces map into the unified type numbering of
+/// `docs/video/svq3/spec/04-dc-secondary-transform.md` §4.5 (below 9
+/// inter, 9…32 intra 16×16, 33 intra 4×4) at a per-frame-type offset:
+/// I-frame wire codes are `0..=25` at offset +8, P-frame intra codes
+/// are `8..=33` at offset 0, B-frame intra codes are `4..=29` at
+/// offset +4 (the wiki §"Macroblock layer" per-frame enumerations all
+/// name the same 26-entry list).
+///
+/// * Unified `33` — the **intra 4×4** type: sixteen per-sub-block
+///   prediction modes on the wire, an explicit coded-block-pattern
+///   (spec/03 §2, intra mapping table), luma DCs inline in each 4×4
+///   block.
+/// * Unified `9..=32` — the **intra 16×16** types: one predictor for
+///   the whole macroblock, no CBP element, luma DCs gathered in a
+///   separate 4×4 block (spec/04 §4).
+/// * Unified `8` — first entry of the wiki's 26-entry intra list
+///   ("luma DCs coded in a separate 4×4 block"), which the staged
+///   binary-anchored chapters do **not** pin (spec/04 §4.5 enumerates
+///   9…32 and 33 only; the decoder's jump table for values below 9 is
+///   documented as the inter dispatch). Classified structurally so a
+///   caller can stop with a docs-gap error rather than desynchronise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IFrameMbType {
-    /// Code `0` — luma DCs in a separate 4×4 block.
-    LumaDcSeparate,
-    /// Codes `1..=24` — predefined CBP + intra-prediction mode
-    /// combination. The raw code value is preserved for the residual
-    /// decoder to look up the matching CBP / mode pair.
-    PredefinedCbpMode(u32),
-    /// Code `25` — luma DCs separate, no other blocks coded.
-    LumaDcSeparateNoOthers,
+    /// Unified type `33` — per-4×4 intra modes + explicit CBP.
+    Intra4x4,
+    /// Unified types `9..=32` — implied CBP, separate luma DC block.
+    Intra16x16(Intra16x16Params),
+    /// Unified type `8` — enumerated by the wiki snapshot but not
+    /// pinned by the staged docs; decoding it is a docs gap.
+    Unpinned8,
 }
 
 /// P-frame inter macroblock-type classification (codes `0..=7`).
@@ -256,9 +321,15 @@ impl Svq3MbType {
 /// re-classify the residue against the I-frame code space.
 fn classify_i_code(code: u32) -> Result<IFrameMbType> {
     match code {
-        0 => Ok(IFrameMbType::LumaDcSeparate),
-        1..=24 => Ok(IFrameMbType::PredefinedCbpMode(code)),
-        25 => Ok(IFrameMbType::LumaDcSeparateNoOthers),
+        0 => Ok(IFrameMbType::Unpinned8),
+        1..=24 => Ok(IFrameMbType::Intra16x16(
+            match Intra16x16Params::from_unified_type(code + 8) {
+                Some(p) => p,
+                // code + 8 is always in 9..=32 here.
+                None => return Err(Error::InvalidFrameCode(code)),
+            },
+        )),
+        25 => Ok(IFrameMbType::Intra4x4),
         other => Err(Error::InvalidFrameCode(other)),
     }
 }
@@ -1005,23 +1076,23 @@ mod tests {
 
     #[test]
     fn i_frame_code_table() {
-        // Code 0 → LumaDcSeparate.
+        // Code 0 → the unpinned unified-8 slot.
         assert_eq!(
             classify_mb_type(Svq3FrameType::Intra, 0).unwrap(),
-            Svq3MbType::IIntra(IFrameMbType::LumaDcSeparate)
+            Svq3MbType::IIntra(IFrameMbType::Unpinned8)
         );
-        // Codes 1..=24 → PredefinedCbpMode.
+        // Codes 1..=24 → intra 16×16 with the tables/03 factorisation
+        // of unified type code + 8.
         for code in 1..=24u32 {
             let got = classify_mb_type(Svq3FrameType::Intra, code).unwrap();
-            assert_eq!(
-                got,
-                Svq3MbType::IIntra(IFrameMbType::PredefinedCbpMode(code))
-            );
+            let params = Intra16x16Params::from_unified_type(code + 8).unwrap();
+            assert_eq!(got, Svq3MbType::IIntra(IFrameMbType::Intra16x16(params)));
+            assert_eq!(params.unified_type(), code + 8);
         }
-        // Code 25 → LumaDcSeparateNoOthers.
+        // Code 25 → intra 4×4 (unified 33).
         assert_eq!(
             classify_mb_type(Svq3FrameType::Intra, 25).unwrap(),
-            Svq3MbType::IIntra(IFrameMbType::LumaDcSeparateNoOthers)
+            Svq3MbType::IIntra(IFrameMbType::Intra4x4)
         );
     }
 
@@ -1055,25 +1126,29 @@ mod tests {
 
     #[test]
     fn p_frame_intra_codes_offset_correctly() {
-        // P-frame code 8 ↔ I-frame code 0 (LumaDcSeparate).
+        // P-frame code 8 ↔ I-frame code 0 (the unpinned slot).
         assert_eq!(
             classify_mb_type(Svq3FrameType::Predicted, 8).unwrap(),
-            Svq3MbType::PIntra(IFrameMbType::LumaDcSeparate)
+            Svq3MbType::PIntra(IFrameMbType::Unpinned8)
         );
-        // P-frame code 9 ↔ I-frame code 1.
+        // P-frame code 9 = unified 9 = the first intra 16×16 type.
         assert_eq!(
             classify_mb_type(Svq3FrameType::Predicted, 9).unwrap(),
-            Svq3MbType::PIntra(IFrameMbType::PredefinedCbpMode(1))
+            Svq3MbType::PIntra(IFrameMbType::Intra16x16(
+                Intra16x16Params::from_unified_type(9).unwrap()
+            ))
         );
-        // P-frame code 32 ↔ I-frame code 24.
+        // P-frame code 32 = unified 32 = the last intra 16×16 type.
         assert_eq!(
             classify_mb_type(Svq3FrameType::Predicted, 32).unwrap(),
-            Svq3MbType::PIntra(IFrameMbType::PredefinedCbpMode(24))
+            Svq3MbType::PIntra(IFrameMbType::Intra16x16(
+                Intra16x16Params::from_unified_type(32).unwrap()
+            ))
         );
-        // P-frame code 33 ↔ I-frame code 25 (LumaDcSeparateNoOthers).
+        // P-frame code 33 = unified 33 = intra 4×4.
         assert_eq!(
             classify_mb_type(Svq3FrameType::Predicted, 33).unwrap(),
-            Svq3MbType::PIntra(IFrameMbType::LumaDcSeparateNoOthers)
+            Svq3MbType::PIntra(IFrameMbType::Intra4x4)
         );
     }
 
@@ -1104,12 +1179,12 @@ mod tests {
         // B-frame code 4 ↔ I-frame code 0.
         assert_eq!(
             classify_mb_type(Svq3FrameType::Bidirectional, 4).unwrap(),
-            Svq3MbType::BIntra(IFrameMbType::LumaDcSeparate)
+            Svq3MbType::BIntra(IFrameMbType::Unpinned8)
         );
-        // B-frame code 29 ↔ I-frame code 25.
+        // B-frame code 29 ↔ I-frame code 25 = intra 4×4.
         assert_eq!(
             classify_mb_type(Svq3FrameType::Bidirectional, 29).unwrap(),
-            Svq3MbType::BIntra(IFrameMbType::LumaDcSeparateNoOthers)
+            Svq3MbType::BIntra(IFrameMbType::Intra4x4)
         );
     }
 
@@ -1141,12 +1216,12 @@ mod tests {
 
     #[test]
     fn predicates_match_intra_inter_skip() {
-        let intra = Svq3MbType::IIntra(IFrameMbType::LumaDcSeparate);
+        let intra = Svq3MbType::IIntra(IFrameMbType::Intra4x4);
         assert!(intra.is_intra());
         assert!(!intra.is_inter());
         assert!(!intra.is_skip());
 
-        let p_intra = Svq3MbType::PIntra(IFrameMbType::LumaDcSeparate);
+        let p_intra = Svq3MbType::PIntra(IFrameMbType::Intra4x4);
         assert!(p_intra.is_intra());
         assert!(!p_intra.is_inter());
 
@@ -1167,12 +1242,13 @@ mod tests {
 
     #[test]
     fn intra_helper_extracts_underlying_i_type() {
-        let i = Svq3MbType::IIntra(IFrameMbType::PredefinedCbpMode(7));
-        assert_eq!(i.intra(), Some(IFrameMbType::PredefinedCbpMode(7)));
-        let p_i = Svq3MbType::PIntra(IFrameMbType::PredefinedCbpMode(7));
-        assert_eq!(p_i.intra(), Some(IFrameMbType::PredefinedCbpMode(7)));
-        let b_i = Svq3MbType::BIntra(IFrameMbType::PredefinedCbpMode(7));
-        assert_eq!(b_i.intra(), Some(IFrameMbType::PredefinedCbpMode(7)));
+        let sixteen = IFrameMbType::Intra16x16(Intra16x16Params::from_unified_type(16).unwrap());
+        let i = Svq3MbType::IIntra(sixteen);
+        assert_eq!(i.intra(), Some(sixteen));
+        let p_i = Svq3MbType::PIntra(sixteen);
+        assert_eq!(p_i.intra(), Some(sixteen));
+        let b_i = Svq3MbType::BIntra(sixteen);
+        assert_eq!(b_i.intra(), Some(sixteen));
         let p_inter = Svq3MbType::PInter(PFrameInterMode::Inter16x16);
         assert_eq!(p_inter.intra(), None);
         let b_inter = Svq3MbType::BInter(BFrameInterMode::Forward);
@@ -1208,11 +1284,11 @@ mod tests {
 
     #[test]
     fn read_mb_type_decodes_golomb_for_i_frame() {
-        // ue(0) = "1" → code 0 → LumaDcSeparate
+        // ue(0) = "1" → code 0 → the unpinned unified-8 slot.
         let bytes = pack(&[(1, 0b1)]);
         let mut br = BitReader::new(&bytes);
         let mb = read_mb_type(&mut br, Svq3FrameType::Intra).unwrap();
-        assert_eq!(mb, Svq3MbType::IIntra(IFrameMbType::LumaDcSeparate));
+        assert_eq!(mb, Svq3MbType::IIntra(IFrameMbType::Unpinned8));
 
         // Universal code 25: n = 4, value = 10 = 0b1010 → bits
         // "0 0 1 0 0 1 0 0 1" (0 0 d1 d2 0 d3 0 d4 1) = 0b001001001.
@@ -1222,7 +1298,7 @@ mod tests {
         let bytes = pack(&[(w, v)]);
         let mut br = BitReader::new(&bytes);
         let mb = read_mb_type(&mut br, Svq3FrameType::Intra).unwrap();
-        assert_eq!(mb, Svq3MbType::IIntra(IFrameMbType::LumaDcSeparateNoOthers));
+        assert_eq!(mb, Svq3MbType::IIntra(IFrameMbType::Intra4x4));
     }
 
     #[test]
@@ -1239,11 +1315,11 @@ mod tests {
         let mb = read_mb_type(&mut br, Svq3FrameType::Predicted).unwrap();
         assert_eq!(mb, Svq3MbType::PInter(PFrameInterMode::Inter4x4));
 
-        // ue(8) → P-intra of code 0 (LumaDcSeparate).
+        // ue(8) → P-intra unpinned unified-8 slot.
         let bytes = pack(&[ue(8)]);
         let mut br = BitReader::new(&bytes);
         let mb = read_mb_type(&mut br, Svq3FrameType::Predicted).unwrap();
-        assert_eq!(mb, Svq3MbType::PIntra(IFrameMbType::LumaDcSeparate));
+        assert_eq!(mb, Svq3MbType::PIntra(IFrameMbType::Unpinned8));
     }
 
     #[test]
@@ -1264,7 +1340,7 @@ mod tests {
         let bytes = pack(&[ue(4)]);
         let mut br = BitReader::new(&bytes);
         let mb = read_mb_type(&mut br, Svq3FrameType::Bidirectional).unwrap();
-        assert_eq!(mb, Svq3MbType::BIntra(IFrameMbType::LumaDcSeparate));
+        assert_eq!(mb, Svq3MbType::BIntra(IFrameMbType::Unpinned8));
     }
 
     #[test]

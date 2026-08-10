@@ -238,10 +238,11 @@ const fn sat_i32(v: i64) -> i32 {
 /// 1538 * block[0]` to the single argument `block_zero`.
 ///
 /// The wiki spec uses this expression "for intra luma blocks without
-/// separate DC coefficients block" — that is, intra macroblocks whose
-/// type code does NOT take the [`crate::svq3_mb::IFrameMbType::LumaDcSeparate`]
-/// (code 0) / [`crate::svq3_mb::IFrameMbType::LumaDcSeparateNoOthers`]
-/// (code 25) branch.
+/// separate DC coefficients block" — that is, the intra 4×4 macroblock
+/// type ([`crate::svq3_mb::IFrameMbType::Intra4x4`]), whose luma DCs
+/// are carried inline in each 4×4 block; the intra 16×16 types carry
+/// their luma DCs in the separate DC block instead
+/// ([`luma_dc_secondary_transform`]).
 ///
 /// Returns the intermediate (64-bit) DC value before the trailing
 /// `+ DEQUANT_ROUND >> DEQUANT_SHIFT` finalisation; feed it to

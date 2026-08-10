@@ -151,6 +151,8 @@ pub mod svq1_vlc;
 // internal helpers (hidden individually inside the module).
 pub mod svq3;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
+pub mod svq3_cbp;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq3_coeff;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq3_dequant;

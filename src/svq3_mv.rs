@@ -405,8 +405,7 @@ mod tests {
     fn mb_mv_differences_intra_reads_nothing() {
         let mut br = BitReader::new(&[]);
         let diffs =
-            read_mb_mv_differences(&mut br, Svq3MbType::PIntra(IFrameMbType::LumaDcSeparate))
-                .unwrap();
+            read_mb_mv_differences(&mut br, Svq3MbType::PIntra(IFrameMbType::Intra4x4)).unwrap();
         assert!(diffs.is_empty());
     }
 
