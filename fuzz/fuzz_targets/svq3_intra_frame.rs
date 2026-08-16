@@ -17,8 +17,9 @@ use oxideav_svq::svq3_frame::decode_intra_access_unit;
 /// bytes (dimensions clamped to keep the macroblock grid small enough
 /// for a bounded run).
 fn seqh_from(w_byte: u8, h_byte: u8) -> Svq3SequenceHeader {
-    let width = 16 + ((w_byte as u32) % 8) * 16; // 16..=128
-    let height = 16 + ((h_byte as u32) % 8) * 16; // 16..=128
+    // Both dimensions span 16..=128.
+    let width = 16 + ((w_byte as u32) % 8) * 16;
+    let height = 16 + ((h_byte as u32) % 8) * 16;
     // Pack: 3-bit code 7, 12-bit width, 12-bit height, 2 MV flags,
     // 4 unknown bits, no-B flag, optional-loop stop, protected 0 —
     // 35 bits.
