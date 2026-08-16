@@ -47,7 +47,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   locally against the staged fixtures: with the (still docs-gapped)
   first macroblock skipped — its 48-bit span is pinned by the unit
   tiling — the frame walk decodes the remaining 299 macroblocks of
-  the real Sorenson-encoded sync frame pixel-exact on all three
+  the real third-party-encoded sync frame pixel-exact on all three
   planes and consumes the slice to within its 2 padding bits; the
   240×128 fixture's first Cb DC code (1464 → level −185) reproduces
   the expected uniform Cb 70 through the staged chroma pipeline

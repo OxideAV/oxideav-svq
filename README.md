@@ -21,7 +21,7 @@ the reference decoder reproduces sample-exact. SVQ3 now has the full
 binary-anchored entropy + transform layers AND a slice-level intra
 frame walk wired through the registry decoder: the I-frame
 macroblock-type wire mapping is fixture-pinned, and **299 of the 300
-macroblocks of a real Sorenson-encoded I-frame decode pixel-exactly**
+macroblocks of a real third-party-encoded I-frame decode pixel-exactly**
 against the staged black-box reference decode — the single remaining
 blocker to unassisted end-to-end I-frame pixels is the first
 macroblock's element sequence (see the SVQ3 section below).
