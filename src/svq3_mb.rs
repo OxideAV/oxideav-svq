@@ -128,36 +128,47 @@ impl Intra16x16Params {
 /// Intra macroblock-type classification, shared by all three frame
 /// types' intra code ranges.
 ///
-/// The wire code spaces map into the unified type numbering of
-/// `docs/video/svq3/spec/04-dc-secondary-transform.md` §4.5 (below 9
-/// inter, 9…32 intra 16×16, 33 intra 4×4) at a per-frame-type offset:
-/// I-frame wire codes are `0..=25` at offset +8, P-frame intra codes
-/// are `8..=33` at offset 0, B-frame intra codes are `4..=29` at
-/// offset +4 (the wiki §"Macroblock layer" per-frame enumerations all
-/// name the same 26-entry list).
+/// The 26-entry intra type space is the wiki §"Macroblock layer"
+/// I-frame list (`0..=25`); P-frame intra codes are `8..=33` and
+/// B-frame intra codes are `4..=29`, each "the same as above" at the
+/// respective offset per the wiki.
 ///
-/// * Unified `33` — the **intra 4×4** type: sixteen per-sub-block
-///   prediction modes on the wire, an explicit coded-block-pattern
-///   (spec/03 §2, intra mapping table), luma DCs inline in each 4×4
-///   block.
-/// * Unified `9..=32` — the **intra 16×16** types: one predictor for
-///   the whole macroblock, no CBP element, luma DCs gathered in a
-///   separate 4×4 block (spec/04 §4).
-/// * Unified `8` — first entry of the wiki's 26-entry intra list
-///   ("luma DCs coded in a separate 4×4 block"), which the staged
-///   binary-anchored chapters do **not** pin (spec/04 §4.5 enumerates
-///   9…32 and 33 only; the decoder's jump table for values below 9 is
-///   documented as the inter dispatch). Classified structurally so a
-///   caller can stop with a docs-gap error rather than desynchronise.
+/// **I-frame wire mapping (fixture-pinned, r446).** The staged
+/// binary-anchored chapters give the decoder's *dispatch* numbering
+/// (spec/04 §4.5: below 9 inter, 9…32 intra 16×16, 33 intra 4×4) but
+/// not the per-slice-type wire-code adjustment. The all-intra sync
+/// frame of `docs/video/svq3/fixtures/real-sample-320x240-short-seqh`
+/// (a uniform-black 300-macroblock I-frame) pins the I-frame wire
+/// mapping structurally: its macroblock layer is 299 identical
+/// 14-bit units — one universal code `0`, eight 1-bit prediction-pair
+/// codes, and the 5-bit code `3` (whose intra CBP mapping is pattern
+/// `0`, spec/03 §4) — ending bit-exactly at the slice boundary. Only
+/// wire code 0 = the **intra 4×4** grammar (pairs + explicit CBP)
+/// tiles that stream, so:
+///
+/// * wire `0` → intra 4×4 (dispatch 33): per-4×4 modes + explicit
+///   CBP, luma DCs inline;
+/// * wire `1..=24` → the 24 intra 16×16 records (dispatch `wire + 8`,
+///   the tables/03 factorisation): implied CBP, separate luma DC
+///   block (spec/04 §4);
+/// * wire `25` → by elimination the remaining dispatch value `8` —
+///   the wiki list's "luma DCs coded in a separate 4×4 block and no
+///   other blocks coded" type ([`Self::SeparateDcOnly`]). Its
+///   reconstruction grammar beyond the DC block is not yet pinned by
+///   the staged docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IFrameMbType {
-    /// Unified type `33` — per-4×4 intra modes + explicit CBP.
+    /// I-frame wire code `0` (dispatch 33) — per-4×4 intra modes +
+    /// explicit CBP, luma DCs inline.
     Intra4x4,
-    /// Unified types `9..=32` — implied CBP, separate luma DC block.
+    /// I-frame wire codes `1..=24` (dispatch 9..=32) — implied CBP,
+    /// separate luma DC block.
     Intra16x16(Intra16x16Params),
-    /// Unified type `8` — enumerated by the wiki snapshot but not
-    /// pinned by the staged docs; decoding it is a docs gap.
-    Unpinned8,
+    /// I-frame wire code `25` (dispatch 8) — the wiki list's
+    /// "luma DCs coded in a separate 4×4 block and no other blocks
+    /// coded" type. Assigned by elimination; its exact element
+    /// grammar is not pinned by the staged docs.
+    SeparateDcOnly,
 }
 
 /// P-frame inter macroblock-type classification (codes `0..=7`).
@@ -321,7 +332,7 @@ impl Svq3MbType {
 /// re-classify the residue against the I-frame code space.
 fn classify_i_code(code: u32) -> Result<IFrameMbType> {
     match code {
-        0 => Ok(IFrameMbType::Unpinned8),
+        0 => Ok(IFrameMbType::Intra4x4),
         1..=24 => Ok(IFrameMbType::Intra16x16(
             match Intra16x16Params::from_unified_type(code + 8) {
                 Some(p) => p,
@@ -329,7 +340,7 @@ fn classify_i_code(code: u32) -> Result<IFrameMbType> {
                 None => return Err(Error::InvalidFrameCode(code)),
             },
         )),
-        25 => Ok(IFrameMbType::Intra4x4),
+        25 => Ok(IFrameMbType::SeparateDcOnly),
         other => Err(Error::InvalidFrameCode(other)),
     }
 }
@@ -899,66 +910,6 @@ impl Intra4x4ModeGrid {
     }
 }
 
-/// Resolve the top / left intra-neighbour classification of the 4×4
-/// sub-block at raster `index` (`0..=15`) within a macroblock, given
-/// the running per-block mode grid `decoded[0..16]` (entries for blocks
-/// not yet decoded are ignored because the scan order guarantees a
-/// block's in-MB top / left neighbours are decoded first).
-///
-/// `top_avail` / `left_avail` say whether the macroblock has a
-/// neighbour macroblock above / to the left in the slice. When a 4×4
-/// sub-block sits on the top (resp. left) edge of the macroblock its
-/// top (resp. left) neighbour is in the macroblock above (resp. left).
-/// Per `docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Intra macroblock
-/// information decoding": "When predictors lie outside of slice, -1 is
-/// used instead" — an unavailable out-of-MB neighbour is
-/// [`IntraNeighbour::Outside`]. The out-of-MB neighbour macroblock's
-/// own per-block mode is not threaded here (it is treated as
-/// [`IntraNeighbour::Intra16x16OrInter`] = the spec's "value 2"
-/// fallback when present); only the in-MB 4×4 neighbours carry a
-/// resolved [`IntraNeighbour::Mode4x4`].
-fn intra_neighbours_for_block(
-    index: usize,
-    decoded: &[Option<u8>; 16],
-    top_avail: bool,
-    left_avail: bool,
-) -> (IntraNeighbour, IntraNeighbour) {
-    // Raster row / col of the 4×4 sub-block inside the 4×4 grid.
-    let row = index / 4;
-    let col = index % 4;
-
-    let top = if row == 0 {
-        // Top edge of the macroblock: neighbour is in the MB above.
-        if top_avail {
-            IntraNeighbour::Intra16x16OrInter
-        } else {
-            IntraNeighbour::Outside
-        }
-    } else {
-        match decoded[index - 4] {
-            Some(m) => IntraNeighbour::Mode4x4(m),
-            None => IntraNeighbour::Outside,
-        }
-    };
-
-    let left = if col == 0 {
-        // Left edge of the macroblock: neighbour is in the MB to the
-        // left.
-        if left_avail {
-            IntraNeighbour::Intra16x16OrInter
-        } else {
-            IntraNeighbour::Outside
-        }
-    } else {
-        match decoded[index - 1] {
-            Some(m) => IntraNeighbour::Mode4x4(m),
-            None => IntraNeighbour::Outside,
-        }
-    };
-
-    (top, left)
-}
-
 /// Decode the 16 intra-prediction modes of one 4×4-intra macroblock
 /// from the slice bitstream.
 ///
@@ -990,20 +941,77 @@ pub fn decode_intra_4x4_modes(
     top_avail: bool,
     left_avail: bool,
 ) -> Result<Intra4x4ModeGrid> {
+    let edge = |avail: bool| {
+        if avail {
+            [IntraNeighbour::Intra16x16OrInter; 4]
+        } else {
+            [IntraNeighbour::Outside; 4]
+        }
+    };
+    decode_intra_4x4_modes_with_context(br, edge(top_avail), edge(left_avail))
+}
+
+/// Decode the 16 intra-prediction modes of one 4×4-intra macroblock
+/// with **explicit out-of-macroblock neighbour contexts**.
+///
+/// The generalised form of [`decode_intra_4x4_modes`]: `top_ctx[c]` is
+/// the neighbour classification for the sub-block directly above the
+/// top-row block in column `c` (i.e. the bottom-row block of the
+/// macroblock above), and `left_ctx[r]` the classification for the
+/// sub-block to the left of the left-column block in row `r` (the
+/// rightmost-column block of the macroblock to the left). A slice-level
+/// frame walk threads the neighbouring macroblocks' decoded 4×4 modes
+/// through [`IntraNeighbour::Mode4x4`] — the wiki §"Intra macroblock
+/// information decoding" `pred_table[top + 1][left + 1][idx]` context
+/// substitutes the *actual* neighbour mode when the neighbour
+/// macroblock is itself 4×4-intra-coded, `2` when it is 16×16-intra or
+/// inter ([`IntraNeighbour::Intra16x16OrInter`]), and `-1` outside the
+/// slice ([`IntraNeighbour::Outside`]).
+///
+/// In-macroblock neighbour sequencing follows the pair scan order
+/// exactly as in [`decode_intra_4x4_modes`]; errors propagate
+/// identically.
+pub fn decode_intra_4x4_modes_with_context(
+    br: &mut BitReader<'_>,
+    top_ctx: [IntraNeighbour; 4],
+    left_ctx: [IntraNeighbour; 4],
+) -> Result<Intra4x4ModeGrid> {
     let mut decoded: [Option<u8>; 16] = [None; 16];
+
+    let neighbours = |index: usize, decoded: &[Option<u8>; 16]| {
+        let row = index / 4;
+        let col = index % 4;
+        let top = if row == 0 {
+            top_ctx[col]
+        } else {
+            match decoded[index - 4] {
+                Some(m) => IntraNeighbour::Mode4x4(m),
+                None => IntraNeighbour::Outside,
+            }
+        };
+        let left = if col == 0 {
+            left_ctx[row]
+        } else {
+            match decoded[index - 1] {
+                Some(m) => IntraNeighbour::Mode4x4(m),
+                None => IntraNeighbour::Outside,
+            }
+        };
+        (top, left)
+    };
 
     for &(block_a, block_b) in INTRA_4X4_PRED_BLOCK_PAIRS.iter() {
         let (idx_a, idx_b) = read_intra_4x4_pred_pair(br)?;
 
         let ia = block_a as usize;
-        let (top_a, left_a) = intra_neighbours_for_block(ia, &decoded, top_avail, left_avail);
+        let (top_a, left_a) = neighbours(ia, &decoded);
         let mode_a = resolve_intra_4x4_predictor(top_a, left_a, idx_a)?;
         decoded[ia] = Some(mode_a);
 
         let ib = block_b as usize;
         // Block `b`'s neighbours are resolved AFTER `a` is recorded, so
         // if `b` is below / right of `a` it sees `a`'s mode.
-        let (top_b, left_b) = intra_neighbours_for_block(ib, &decoded, top_avail, left_avail);
+        let (top_b, left_b) = neighbours(ib, &decoded);
         let mode_b = resolve_intra_4x4_predictor(top_b, left_b, idx_b)?;
         decoded[ib] = Some(mode_b);
     }
@@ -1076,23 +1084,26 @@ mod tests {
 
     #[test]
     fn i_frame_code_table() {
-        // Code 0 → the unpinned unified-8 slot.
+        // Code 0 → intra 4×4 (dispatch 33) — pinned by the black-frame
+        // structural census of the staged 320×240 fixture (see the
+        // IFrameMbType docs).
         assert_eq!(
             classify_mb_type(Svq3FrameType::Intra, 0).unwrap(),
-            Svq3MbType::IIntra(IFrameMbType::Unpinned8)
+            Svq3MbType::IIntra(IFrameMbType::Intra4x4)
         );
         // Codes 1..=24 → intra 16×16 with the tables/03 factorisation
-        // of unified type code + 8.
+        // of dispatch type code + 8.
         for code in 1..=24u32 {
             let got = classify_mb_type(Svq3FrameType::Intra, code).unwrap();
             let params = Intra16x16Params::from_unified_type(code + 8).unwrap();
             assert_eq!(got, Svq3MbType::IIntra(IFrameMbType::Intra16x16(params)));
             assert_eq!(params.unified_type(), code + 8);
         }
-        // Code 25 → intra 4×4 (unified 33).
+        // Code 25 → the separate-DC / no-other-blocks type (dispatch 8,
+        // by elimination).
         assert_eq!(
             classify_mb_type(Svq3FrameType::Intra, 25).unwrap(),
-            Svq3MbType::IIntra(IFrameMbType::Intra4x4)
+            Svq3MbType::IIntra(IFrameMbType::SeparateDcOnly)
         );
     }
 
@@ -1126,10 +1137,12 @@ mod tests {
 
     #[test]
     fn p_frame_intra_codes_offset_correctly() {
-        // P-frame code 8 ↔ I-frame code 0 (the unpinned slot).
+        // P-frame code 8 ↔ I-frame code 0 = intra 4×4 (wiki −8 rule;
+        // the P-side wire↔dispatch correspondence is a docs gap — see
+        // the IFrameMbType docs).
         assert_eq!(
             classify_mb_type(Svq3FrameType::Predicted, 8).unwrap(),
-            Svq3MbType::PIntra(IFrameMbType::Unpinned8)
+            Svq3MbType::PIntra(IFrameMbType::Intra4x4)
         );
         // P-frame code 9 = unified 9 = the first intra 16×16 type.
         assert_eq!(
@@ -1145,10 +1158,10 @@ mod tests {
                 Intra16x16Params::from_unified_type(32).unwrap()
             ))
         );
-        // P-frame code 33 = unified 33 = intra 4×4.
+        // P-frame code 33 ↔ I-frame code 25 = the separate-DC-only type.
         assert_eq!(
             classify_mb_type(Svq3FrameType::Predicted, 33).unwrap(),
-            Svq3MbType::PIntra(IFrameMbType::Intra4x4)
+            Svq3MbType::PIntra(IFrameMbType::SeparateDcOnly)
         );
     }
 
@@ -1176,15 +1189,15 @@ mod tests {
 
     #[test]
     fn b_frame_intra_codes_offset_correctly() {
-        // B-frame code 4 ↔ I-frame code 0.
+        // B-frame code 4 ↔ I-frame code 0 = intra 4×4.
         assert_eq!(
             classify_mb_type(Svq3FrameType::Bidirectional, 4).unwrap(),
-            Svq3MbType::BIntra(IFrameMbType::Unpinned8)
+            Svq3MbType::BIntra(IFrameMbType::Intra4x4)
         );
-        // B-frame code 29 ↔ I-frame code 25 = intra 4×4.
+        // B-frame code 29 ↔ I-frame code 25 = the separate-DC-only type.
         assert_eq!(
             classify_mb_type(Svq3FrameType::Bidirectional, 29).unwrap(),
-            Svq3MbType::BIntra(IFrameMbType::Intra4x4)
+            Svq3MbType::BIntra(IFrameMbType::SeparateDcOnly)
         );
     }
 
@@ -1284,11 +1297,11 @@ mod tests {
 
     #[test]
     fn read_mb_type_decodes_golomb_for_i_frame() {
-        // ue(0) = "1" → code 0 → the unpinned unified-8 slot.
+        // ue(0) = "1" → code 0 → intra 4×4.
         let bytes = pack(&[(1, 0b1)]);
         let mut br = BitReader::new(&bytes);
         let mb = read_mb_type(&mut br, Svq3FrameType::Intra).unwrap();
-        assert_eq!(mb, Svq3MbType::IIntra(IFrameMbType::Unpinned8));
+        assert_eq!(mb, Svq3MbType::IIntra(IFrameMbType::Intra4x4));
 
         // Universal code 25: n = 4, value = 10 = 0b1010 → bits
         // "0 0 1 0 0 1 0 0 1" (0 0 d1 d2 0 d3 0 d4 1) = 0b001001001.
@@ -1298,7 +1311,7 @@ mod tests {
         let bytes = pack(&[(w, v)]);
         let mut br = BitReader::new(&bytes);
         let mb = read_mb_type(&mut br, Svq3FrameType::Intra).unwrap();
-        assert_eq!(mb, Svq3MbType::IIntra(IFrameMbType::Intra4x4));
+        assert_eq!(mb, Svq3MbType::IIntra(IFrameMbType::SeparateDcOnly));
     }
 
     #[test]
@@ -1315,11 +1328,11 @@ mod tests {
         let mb = read_mb_type(&mut br, Svq3FrameType::Predicted).unwrap();
         assert_eq!(mb, Svq3MbType::PInter(PFrameInterMode::Inter4x4));
 
-        // ue(8) → P-intra unpinned unified-8 slot.
+        // ue(8) → P-intra of I-code 0 = intra 4×4.
         let bytes = pack(&[ue(8)]);
         let mut br = BitReader::new(&bytes);
         let mb = read_mb_type(&mut br, Svq3FrameType::Predicted).unwrap();
-        assert_eq!(mb, Svq3MbType::PIntra(IFrameMbType::Unpinned8));
+        assert_eq!(mb, Svq3MbType::PIntra(IFrameMbType::Intra4x4));
     }
 
     #[test]
@@ -1336,11 +1349,11 @@ mod tests {
         let mb = read_mb_type(&mut br, Svq3FrameType::Bidirectional).unwrap();
         assert_eq!(mb, Svq3MbType::BInter(BFrameInterMode::Bidirectional));
 
-        // ue(4) → B-intra of code 0.
+        // ue(4) → B-intra of I-code 0 = intra 4×4.
         let bytes = pack(&[ue(4)]);
         let mut br = BitReader::new(&bytes);
         let mb = read_mb_type(&mut br, Svq3FrameType::Bidirectional).unwrap();
-        assert_eq!(mb, Svq3MbType::BIntra(IFrameMbType::Unpinned8));
+        assert_eq!(mb, Svq3MbType::BIntra(IFrameMbType::Intra4x4));
     }
 
     #[test]
