@@ -84,6 +84,14 @@ pub enum Error {
     /// registration, frame decode) that the round-1 frame-header
     /// parser has not yet wired up.
     NotImplemented,
+    /// An SVQ3 per-macroblock quantiser delta
+    /// (`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Intra macroblock
+    /// information decoding", signed fold per
+    /// `docs/video/svq3/spec/06-residual-coefficient-coding.md` §1.1)
+    /// carried the running macroblock quantiser outside the 32-entry
+    /// dequantisation-ladder domain `0..=31`. The payload is the
+    /// out-of-range quantiser value.
+    InvalidQuantiser(i32),
 }
 
 impl core::fmt::Display for Error {
@@ -141,6 +149,13 @@ impl core::fmt::Display for Error {
             Error::NotImplemented => f.write_str(
                 "oxideav-svq: clean-room rebuild in progress — see crates/oxideav-svq/README.md",
             ),
+            Error::InvalidQuantiser(q) => {
+                write!(
+                    f,
+                    "oxideav-svq: SVQ3 quantiser delta drove the macroblock quantiser to {q} \
+                     (outside the dequantisation ladder domain 0..=31)"
+                )
+            }
         }
     }
 }

@@ -535,6 +535,55 @@ impl Svq3Picture {
             ],
         }
     }
+
+    /// Emit the reconstructed picture as an [`oxideav_core::VideoFrame`]
+    /// cropped to the stream's visible `width × height`.
+    ///
+    /// The canvas is macroblock-padded (its planes span the full
+    /// 16-pixel grid); a stream whose `SEQH` dimensions are not
+    /// multiples of 16 codes overhang macroblocks whose out-of-frame
+    /// samples are not part of the visible output. This variant copies
+    /// the visible `width × height` luma window and the corresponding
+    /// `ceil(width/2) × ceil(height/2)` chroma windows, tightly packed.
+    /// Both dimensions are clamped to the canvas extent; `pts` is
+    /// attached as supplied.
+    #[cfg(feature = "registry")]
+    #[must_use]
+    pub fn to_video_frame_cropped(
+        &self,
+        width: usize,
+        height: usize,
+        pts: Option<i64>,
+    ) -> oxideav_core::VideoFrame {
+        let w = width.min(self.luma_width());
+        let h = height.min(self.luma_height());
+        let cw = w.div_ceil(2).min(self.chroma_width());
+        let ch = h.div_ceil(2).min(self.chroma_height());
+        let crop = |src: &[u8], src_stride: usize, w: usize, h: usize| {
+            let mut out = Vec::with_capacity(w * h);
+            for y in 0..h {
+                out.extend_from_slice(&src[y * src_stride..y * src_stride + w]);
+            }
+            out
+        };
+        oxideav_core::VideoFrame {
+            pts,
+            planes: vec![
+                oxideav_core::VideoPlane {
+                    stride: w,
+                    data: crop(&self.luma, self.luma_width(), w, h),
+                },
+                oxideav_core::VideoPlane {
+                    stride: cw,
+                    data: crop(&self.cb, self.chroma_width(), cw, ch),
+                },
+                oxideav_core::VideoPlane {
+                    stride: cw,
+                    data: crop(&self.cr, self.chroma_width(), cw, ch),
+                },
+            ],
+        }
+    }
 }
 
 /// The per-macroblock decode inputs a [`Svq3Picture::reconstruct_intra_frame`]

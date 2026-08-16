@@ -635,6 +635,72 @@ pub fn reconstruct_intra_16x16_luma_macroblock_from_coeffs(
     }
 }
 
+/// Reconstruct one 16×16 **intra-16×16** luma macroblock end-to-end from
+/// its separate-luma-DC terms plus the per-sub-block AC coefficient
+/// grids.
+///
+/// The separate-DC counterpart to
+/// [`reconstruct_intra_16x16_luma_macroblock_from_coeffs`], composing
+/// `docs/video/svq3/spec/04-dc-secondary-transform.md` §4:
+///
+/// * `dc_terms[k]` is `v_k` — the *k*-th output of the luma DC
+///   secondary transform
+///   ([`crate::svq3_dequant::luma_dc_secondary_transform`]), destined
+///   for coefficient position 0 of luma 4×4 sub-block *k* in **raster
+///   order** across the macroblock (§4.1 step 4). In the fused store it
+///   is the additive post-transform term `169 · v_k`.
+/// * `ac_blocks[k]` is sub-block *k*'s placed AC coefficient grid (the
+///   §4.3 `luma_ac = 1` pass, decoded with the scan starting at
+///   position 1 so the DC position is never written from the
+///   bitstream). Pass all-zero grids for `luma_ac = 0` — the fused
+///   store then reduces to the §4.3 DC-only value
+///   `(169 · v_k + 0x80000) >> 20` broadcast per sub-block,
+///   bit-identically to the decoder's fast path.
+///
+/// Prediction and writeback follow
+/// [`reconstruct_intra_16x16_luma_macroblock_from_coeffs`] exactly (one
+/// macroblock-wide predictor, Gap 5 saturating writeback).
+///
+/// # Panics
+///
+/// Panics if `q >= DEQUANT_COEFF_TABLE_LEN`.
+pub fn reconstruct_intra_16x16_luma_macroblock_with_dc(
+    mb: &mut LumaMacroblock,
+    mode: Svq3Luma16x16Mode,
+    ac_blocks: &[[i32; PRED_4X4_SAMPLES]; MB_LUMA_BLOCKS],
+    dc_terms: &[i32; MB_LUMA_BLOCKS],
+    q: u32,
+) {
+    // One macroblock-wide prediction plane (Gap 4).
+    let plane = mb.predict_16x16(mode);
+
+    for (index, ac_block) in ac_blocks.iter().enumerate() {
+        let gr = index / MB_GRID_DIM;
+        let gc = index % MB_GRID_DIM;
+        let by = gr * PRED_4X4_DIM;
+        let bx = gc * PRED_4X4_DIM;
+
+        // Spec/01 Gap 2 residual interleave with the spec/04 §4 DC
+        // override: v_k at coefficient position 0 = the additive
+        // 169·v_k in the fused store.
+        let residual = crate::svq3_dequant::dequantize_transform_luma_block_with_dc(
+            q,
+            *ac_block,
+            169 * dc_terms[index] as i64,
+        );
+
+        for r in 0..PRED_4X4_DIM {
+            for c in 0..PRED_4X4_DIM {
+                let px = bx + c;
+                let py = by + r;
+                let pred = plane[py * PRED_16X16_DIM + px];
+                let recon = reconstruct_sample(pred, residual[r * PRED_4X4_DIM + c]);
+                mb.samples[py * MB_LUMA_DIM + px] = recon;
+            }
+        }
+    }
+}
+
 /// Side length of one 8×8 chroma plane (Cb or Cr) of a macroblock.
 pub const CHROMA_PLANE_DIM: usize = PRED_CHROMA_DIM;
 

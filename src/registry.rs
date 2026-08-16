@@ -78,6 +78,10 @@ impl From<crate::Error> for Error {
             crate::Error::NotImplemented => Error::unsupported(
                 "oxideav-svq: SVQ1 pixel decode blocked on codebook docs-gap — see crates/oxideav-svq/README.md",
             ),
+            crate::Error::InvalidQuantiser(q) => Error::InvalidData(format!(
+                "oxideav-svq: SVQ3 quantiser delta drove the macroblock quantiser to {q} \
+                 (outside the dequantisation ladder domain 0..=31)"
+            )),
         }
     }
 }
@@ -700,7 +704,7 @@ pub fn make_svq3_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let sequence_header = if params.extradata.is_empty() {
         None
     } else {
-        parse_extradata(&params.extradata).ok()
+        parse_svq3_extradata_flexible(&params.extradata)
     };
     Ok(Box::new(Svq3DecoderHandle {
         codec_id,
@@ -709,6 +713,23 @@ pub fn make_svq3_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         last_slice_header: None,
         eof: false,
     }))
+}
+
+/// Parse SVQ3 extradata that may carry the container-level `SMI `
+/// wrapper in front of the `SEQH` record.
+///
+/// QuickTime files deliver the sequence header inside an `SMI ` sample
+/// -entry extension atom — a 4-byte big-endian size plus the `SMI `
+/// tag — ahead of the `SEQH` marker + length + payload
+/// (`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Sequence Header";
+/// the staged fixtures' `extradata.bin` files carry exactly this
+/// shape). Accept both the bare `SEQH…` form and the wrapped form by
+/// locating the marker.
+fn parse_svq3_extradata_flexible(extradata: &[u8]) -> Option<crate::svq3::Svq3SequenceHeader> {
+    let start = extradata
+        .windows(crate::svq3::SVQ3_SEQH_MAGIC.len())
+        .position(|w| w == crate::svq3::SVQ3_SEQH_MAGIC)?;
+    parse_extradata(&extradata[start..]).ok()
 }
 
 /// SVQ3 decoder handle bound to a single stream.
@@ -797,16 +818,36 @@ impl Decoder for Svq3DecoderHandle {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        if self.pending.take().is_none() {
+        let Some(packet) = self.pending.take() else {
             return if self.eof {
                 Err(Error::Eof)
             } else {
                 Err(Error::NeedMore)
             };
+        };
+        // A pure frame-end-sentinel packet carries no picture.
+        if !packet.data.is_empty() && packet.data[0] == crate::svq3::SVQ3_FRAME_END {
+            return Err(Error::NeedMore);
         }
-        Err(Error::unsupported(
-            "oxideav-svq: SVQ3 macroblock-layer decode not yet implemented — see crates/oxideav-svq/README.md",
-        ))
+        let Some(seqh) = self.sequence_header.as_ref() else {
+            return Err(Error::InvalidData(
+                "oxideav-svq: SVQ3 decode requires the SEQH sequence header in extradata".into(),
+            ));
+        };
+        match self.last_slice_header.as_ref().map(|h| h.frame_type) {
+            Some(crate::svq3::Svq3FrameType::Intra) => {
+                let picture = crate::svq3_frame::decode_intra_access_unit(seqh, &packet.data)?;
+                let video = picture.to_video_frame_cropped(
+                    usize::from(seqh.width),
+                    usize::from(seqh.height),
+                    packet.pts,
+                );
+                Ok(Frame::Video(video))
+            }
+            _ => Err(Error::unsupported(
+                "oxideav-svq: SVQ3 P/B macroblock-layer decode not yet implemented — see crates/oxideav-svq/README.md",
+            )),
+        }
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -1467,15 +1508,18 @@ mod tests {
     }
 
     #[test]
-    fn svq3_decoder_send_then_receive_returns_unsupported() {
+    fn svq3_decoder_send_then_receive_without_seqh_errors() {
+        // No extradata was supplied, so the intra frame walk cannot
+        // derive the macroblock grid — receive_frame reports the
+        // missing SEQH as InvalidData.
         let params = CodecParameters::video(CodecId::new(SVQ3_CODEC_ID_STR));
         let mut decoder = make_svq3_decoder(&params).expect("make_svq3_decoder ok");
         let pkt = make_packet(minimal_svq3_slice_packet());
         decoder.send_packet(&pkt).expect("send_packet ok");
         let err = decoder
             .receive_frame()
-            .expect_err("macroblock decode out of round-3 scope");
-        assert!(matches!(err, Error::Unsupported(_)));
+            .expect_err("intra decode requires the SEQH grid");
+        assert!(matches!(err, Error::InvalidData(_)));
     }
 
     #[test]
@@ -1500,16 +1544,94 @@ mod tests {
         let params = CodecParameters::video(CodecId::new(SVQ3_CODEC_ID_STR));
         let mut decoder = make_svq3_decoder(&params).expect("make_svq3_decoder ok");
         // A 0xFF-leading packet is the frame-data-end sentinel — the
-        // decoder accepts it (no header parsed) and returns
-        // Unsupported on receive_frame.
+        // decoder accepts it (no header parsed) and receive_frame
+        // reports that no picture was carried.
         let pkt = make_packet(vec![crate::svq3::SVQ3_FRAME_END]);
         decoder
             .send_packet(&pkt)
             .expect("send_packet ok on frame-end byte");
         let err = decoder
             .receive_frame()
-            .expect_err("macroblock decode out of round-3 scope");
-        assert!(matches!(err, Error::Unsupported(_)));
+            .expect_err("a frame-end sentinel carries no picture");
+        assert!(matches!(err, Error::NeedMore));
+    }
+
+    /// SMI-wrapped SVQ3 extradata for an explicit-dimension 32×32
+    /// stream, shaped like a QuickTime visual sample entry trailer
+    /// (4-byte wrapper size + `SMI ` + `SEQH` + 4-byte length +
+    /// payload), exercising the flexible SEQH-marker location.
+    fn svq3_extradata_32x32_smi_wrapped() -> Vec<u8> {
+        let payload = pack(&[
+            (3, 7),   // frame_size_code 7 → explicit dimensions
+            (12, 32), // width
+            (12, 32), // height
+            (1, 0),   // halfpel
+            (1, 0),   // thirdpel
+            (4, 0),   // unknown
+            (1, 1),   // no B-frames
+            (1, 0),   // optional-data loop stop
+            (1, 0),   // not protected
+        ]);
+        let mut out = Vec::new();
+        out.extend_from_slice(&((payload.len() as u32) + 16).to_be_bytes());
+        out.extend_from_slice(b"SMI ");
+        out.extend_from_slice(&crate::svq3::SVQ3_SEQH_MAGIC);
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&[0, 0, 0, 0]); // zero filler
+        out
+    }
+
+    /// A synthetic 32×32 intra access unit: version-1 slice, quantiser
+    /// 13, four all-empty intra-4×4 macroblocks (the 14-bit unit the
+    /// staged fixture census pinned), frame-end sentinel.
+    fn svq3_intra_au_32x32_flat() -> Vec<u8> {
+        let mut items: Vec<(u32, u32)> = vec![
+            (3, 0b011), // ue(2) = I frame code
+            (1, 0),     // v1: no more slices
+            (8, 0),     // frame number
+            (5, 13),    // slice quantiser
+            (1, 0),     // delta qp flag
+            (1, 0),     // unknown
+            (1, 0),     // optional-data loop stop
+        ];
+        for _ in 0..4 {
+            // type ue(0) + eight pair codes ue(0) + CBP ue(3) = "00001".
+            for _ in 0..9 {
+                items.push((1, 1));
+            }
+            items.push((5, 1));
+        }
+        let body = pack(&items);
+        let prefix = (1u8 << 5) | 1; // slice_size_size = 1, version 1
+        let mut au = vec![prefix, body.len() as u8];
+        au.extend_from_slice(&body);
+        au.push(crate::svq3::SVQ3_FRAME_END);
+        au
+    }
+
+    #[test]
+    fn svq3_intra_end_to_end_decodes_flat_frame() {
+        let mut params = CodecParameters::video(CodecId::new(SVQ3_CODEC_ID_STR));
+        params.extradata = svq3_extradata_32x32_smi_wrapped();
+        let mut decoder = make_svq3_decoder(&params).expect("make_svq3_decoder ok");
+        decoder
+            .send_packet(&make_packet(svq3_intra_au_32x32_flat()))
+            .expect("send_packet ok");
+        let Frame::Video(video) = decoder.receive_frame().expect("intra AU decodes") else {
+            panic!("expected a video frame");
+        };
+        assert_eq!(video.planes.len(), 3);
+        assert_eq!(video.planes[0].stride, 32);
+        assert_eq!(video.planes[0].data.len(), 32 * 32);
+        assert_eq!(video.planes[1].data.len(), 16 * 16);
+        assert_eq!(video.planes[2].data.len(), 16 * 16);
+        // All-empty intra-4×4 macroblocks: the DC prediction chain
+        // stays at the 128 fallback on every plane.
+        assert!(video
+            .planes
+            .iter()
+            .all(|p| p.data.iter().all(|&s| s == 128)));
     }
 
     #[test]
