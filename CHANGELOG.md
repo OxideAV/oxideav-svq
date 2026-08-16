@@ -8,6 +8,52 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- svq3: the intra access-unit frame walk (`svq3_frame`,
+  `decode_intra_access_unit`) — slice envelope walk (version-1
+  multi-slice continuation at macroblock boundaries, version-2
+  macroblock offsets validated against the raster cursor),
+  per-macroblock type dispatch, the intra-4×4 grammar (eight
+  prediction-mode pair codes with cross-macroblock `pred_table`
+  contexts, explicit intra CBP, optional quantiser delta with the new
+  ladder-domain check `Error::InvalidQuantiser`, quadrant-ordered
+  alternate/normal residual blocks, the fixed intra-luma DC scale),
+  the intra-16×16 grammar (separate luma DC block → luma DC secondary
+  transform → per-block `169·v_k` scatter via the new
+  `svq3_recon::reconstruct_intra_16x16_luma_macroblock_with_dc`,
+  scan-start-1 luma AC, implied chroma class), the separate-DC-only
+  type, and the per-plane chroma section (DC then AC, scan start 1)
+- svq3 registry: `receive_frame` decodes intra access units
+  end-to-end into cropped `Yuv420P` frames
+  (`Svq3Picture::to_video_frame_cropped`); `make_svq3_decoder`
+  accepts the QuickTime `SMI `-wrapped extradata shape by locating
+  the `SEQH` marker; P/B slices keep the unsupported error and
+  frame-end sentinel packets report `NeedMore`
+- svq3: `svq3_mb::decode_intra_4x4_modes_with_context` — the
+  generalised intra-4×4 mode decode taking explicit out-of-macroblock
+  neighbour contexts so the frame walk threads ACTUAL neighbour modes
+  into the wiki `pred_table` lookup
+
+### Changed
+
+- svq3: the I-frame macroblock-type wire mapping is re-pinned from
+  the staged 320×240 fixture's uniform-black 300-macroblock sync
+  frame, whose macroblock layer tiles as 299 identical 14-bit units
+  `[type 0][eight pair codes][CBP code 3 → pattern 0]` ending
+  bit-exact at the slice boundary: I wire code 0 = intra 4×4
+  (dispatch 33; previously the unpinned dispatch-8 slot), wire 1..=24
+  = the intra-16×16 records (dispatch +8, unchanged), wire 25 = the
+  dispatch-8 "separate luma DC block, no other blocks coded" type
+  (`IFrameMbType::SeparateDcOnly`, replacing `Unpinned8`). Validated
+  locally against the staged fixtures: with the (still docs-gapped)
+  first macroblock skipped — its 48-bit span is pinned by the unit
+  tiling — the frame walk decodes the remaining 299 macroblocks of
+  the real Sorenson-encoded sync frame pixel-exact on all three
+  planes and consumes the slice to within its 2 padding bits; the
+  240×128 fixture's first Cb DC code (1464 → level −185) reproduces
+  the expected uniform Cb 70 through the staged chroma pipeline
+  exactly. The leading-macroblock element sequence (24 codes where
+  the staged grammar spends 2) remains the blocking docs gap
+
 - svq3: the coded-block-pattern element (`svq3_cbp`, spec/03 + tables/01) —
   `cbp_luma` (one bit per 8×8 quadrant, raster order) + `cbp_chroma` (the
   shared 3-valued class), carried as one universal-code code number through

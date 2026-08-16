@@ -47,7 +47,9 @@
 //! * [`svq3_mc`] — reference-plane views and the third-pel /
 //!   half-pel interpolation kernels (spec/05).
 //! * [`svq3_picture`] — the picture canvas, cross-MB neighbour
-//!   binding, the intra frame walk and `VideoFrame` output bridge.
+//!   binding, and the `VideoFrame` output bridges.
+//! * [`svq3_frame`] — the slice-level intra access-unit decoder
+//!   (frame walk) composing all of the above.
 //!
 //! ## Standalone vs registry-integrated
 //!

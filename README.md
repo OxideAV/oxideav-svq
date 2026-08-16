@@ -17,13 +17,14 @@ oracle, whose 348-MB INTER_4MV wire census our decode reproduces) —
 AND a full I/P/B encoder (adaptive λ-tree, MV search, INTER_4MV,
 droppable frames).**
 `receive_frame` returns real frames; `make_encoder` produces streams
-the reference decoder reproduces sample-exact. SVQ3 is parse +
-per-block reconstruction infrastructure, now with the full
-binary-anchored entropy + transform layers (universal code, residual
-code books, both secondary transforms, CBP tables) landed and
-spec-anchored; the one remaining blocker to end-to-end I-frame pixels
-is the I-frame macroblock-type wire-mapping docs gap (see the SVQ3
-section below).
+the reference decoder reproduces sample-exact. SVQ3 now has the full
+binary-anchored entropy + transform layers AND a slice-level intra
+frame walk wired through the registry decoder: the I-frame
+macroblock-type wire mapping is fixture-pinned, and **299 of the 300
+macroblocks of a real Sorenson-encoded I-frame decode pixel-exactly**
+against the staged black-box reference decode — the single remaining
+blocker to unassisted end-to-end I-frame pixels is the first
+macroblock's element sequence (see the SVQ3 section below).
 
 ### SVQ1
 
@@ -185,11 +186,20 @@ individually spec-anchored and unit-tested.
   exp-Golomb, so the slice frame-code alphabet is unchanged; codes ≥ 3
   differ, which the earlier reader got wrong.)
 * **Macroblock types** (`svq3_mb`, spec/04 §4.5 + tables/03): the
-  unified numbering — intra 4×4 (`Intra4x4`), intra 16×16
+  dispatch numbering — intra 4×4 (`Intra4x4`), intra 16×16
   (`Intra16x16(Intra16x16Params)`, factored
-  `9 + pred_mode + 4·cbp_chroma + 12·luma_ac`), and the inter modes —
-  plus the intra-4×4 prediction-mode pair VLC + `INTRA_PRED_TABLE`
-  context resolution and the MV-precision selector (spec/05 §2).
+  `9 + pred_mode + 4·cbp_chroma + 12·luma_ac`), the separate-DC /
+  no-other-blocks type (`SeparateDcOnly`), and the inter modes — with
+  the **I-frame wire mapping fixture-pinned** (r446): the staged
+  320×240 fixture's uniform-black 300-macroblock sync frame tiles as
+  299 identical 14-bit units `[type 0][eight pair codes][CBP code 3 →
+  pattern 0]` ending bit-exactly at the slice boundary, so I wire 0 =
+  intra 4×4 (dispatch 33), 1…24 = the 24 intra-16×16 records
+  (dispatch +8), 25 = the dispatch-8 separate-DC type by elimination.
+  Plus the intra-4×4 prediction-mode pair VLC + `INTRA_PRED_TABLE`
+  context resolution (now with cross-macroblock mode threading,
+  `decode_intra_4x4_modes_with_context`) and the MV-precision
+  selector (spec/05 §2).
 * **Coded-block-pattern** (`svq3_cbp`, spec/03 + tables/01):
   `cbp_luma` (one bit per 8×8 quadrant, raster order) + the shared
   3-valued `cbp_chroma` class, decoded from one universal code number
@@ -233,24 +243,50 @@ individually spec-anchored and unit-tested.
 * **Motion compensation** (`svq3_mc`, spec/05): reference-plane views
   with edge-replication clamping, the third-pel / half-pel / full-pel
   interpolation kernels, and the sixths-grid MV split.
+* **The intra frame walk** (`svq3_frame`, r446): the slice-level
+  access-unit decoder — slice envelope walk (v1 multi-slice
+  continuation, v2 macroblock offsets), per-macroblock type dispatch,
+  the full intra-4×4 grammar (pair codes with cross-macroblock
+  `pred_table` contexts, explicit intra CBP, optional quantiser
+  delta, quadrant-ordered alt/normal residual blocks, the fixed
+  intra-luma DC scale), the intra-16×16 grammar (separate luma DC
+  block → secondary transform → `169·v_k` scatter, scan-start-1 AC,
+  implied chroma), and the per-plane chroma section — wired into the
+  registry decoder: `make_svq3_decoder` accepts the QuickTime
+  `SMI `-wrapped extradata and `receive_frame` returns cropped
+  `Yuv420P` frames for intra access units.
 
-**Remaining blocker — the I-frame macroblock-type wire mapping.**
-The staged docs pin every *component* above in isolation, but not how
-an **I-frame's** small macroblock-type code numbers map into the
-spec/04 §4.5 *unified* type space. §4.5 gives the unified numbering
-(below 9 = inter, 9…32 = intra 16×16, 33 = intra 4×4) and provenance/05
-overturns the wiki's "type 0/25 code luma DCs separately" reading, but
-neither pins the I-frame wire-code → unified-type dispatch: an all-intra
-I-frame's first macroblock carries code number 4, which the unified
-scheme classifies as *inter* — a contradiction that no reading in the
-staged docs resolves. Driving the two `docs/video/svq3/fixtures/`
-I-frames through the per-block pipeline confirms the arithmetic stages
-reproduce the expected flat-per-4×4-block DC structure, but the
-per-macroblock wire *concatenation* (type dispatch + where the luma DC
-block, CBP, and chroma sub-streams sit for each I-frame type) does not
-reconcile with the element-by-element chapters. This is the one docs
-trace between here and end-to-end I-frame pixels; see the round report
-DOCS-GAP.
+**Validated on real wire data (locally, against the staged
+fixtures):** skipping the first macroblock's 48 bits of the 320×240
+fixture's sync frame (its span is pinned exactly by the 299-unit tail
+tiling), the walk decodes the remaining **299 macroblocks pixel-exact
+on all three planes** (76 800 luma + 38 400 chroma samples, zero
+mismatches) and consumes the slice to within its 2 padding bits — and
+the skip length 24 codes is the *unique* value in 1…119 that reaches
+the last macroblock at all. The staged chroma arithmetic is also
+pinned end-to-end by the 240×128 fixture: its first Cb DC code number
+1464 → level −185 through the staged chroma book → −58 through the
+remap/Hadamard-halve/`169·B` pipeline → exactly the expected uniform
+Cb 70 against the 128 prediction.
+
+**Remaining blocker — the leading-macroblock element sequence.**
+Both staged fixtures' I-frames open with a first macroblock whose
+element list the staged grammars cannot account for: in the black
+320×240 frame it consumes 24 universal codes
+(`[4][0×7][1,0,1,1,3,1,15][0×9]`) where a spec'd empty 16×16 consumes
+2, every nonzero code is provably non-coefficient (the frame is
+uniformly black), and both fixtures share the 12-bit `[4][0×7]`
+prefix. Content-bearing macroblocks later in the real streams also
+carry elements the staged chapters don't pin (the walk desyncs inside
+them under every element-order variant tried). Needed from the docs
+side: the decoder's I-frame macroblock-loop element order read from
+the staged decompressor — the wire→dispatch type adjustment per slice
+type, every element between mb_type and the residual lists for each
+intra family (including any leading/first-macroblock-only elements),
+the cross-plane chroma stream interleaving, the 16×16
+`intra16x16_pred_mode` → predictor binding, and the luma DC
+predictor's no-neighbour fallback (the black frame pins it near 0,
+not the H.264 128).
 
 ## Fuzzing
 
