@@ -81,3 +81,10 @@ path = "fuzz_targets/registry_stream.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "svq3_intra_frame"
+path = "fuzz_targets/svq3_intra_frame.rs"
+test = false
+doc = false
+bench = false

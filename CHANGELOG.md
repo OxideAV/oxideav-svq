@@ -75,6 +75,11 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   spec/04 §3, tables/02). The spec/04 §1 measured basis is pinned by
   single-coefficient response tests
 
+- fuzz: `svq3_intra_frame` target — the whole intra access-unit frame
+  walk over arbitrary access-unit bytes at fuzz-derived grid
+  geometries (structural canvas invariants asserted on success);
+  bounded local runs of it and `registry_stream` are clean against
+  the new decode path
 - fuzz: eight-target bounded libFuzzer harness (`fuzz/`) — SVQ1 frame-header
   parse, whole-frame intra decode, P/B decode against held references
   (committed 176×144 fixture + synthesised 160×120 overhang geometry), and a

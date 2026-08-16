@@ -290,7 +290,7 @@ not the H.264 128).
 
 ## Fuzzing
 
-`fuzz/` is an eight-target libFuzzer harness (nightly + `cargo fuzz`;
+`fuzz/` is a nine-target libFuzzer harness (nightly + `cargo fuzz`;
 CI type-checks it so it cannot rot, runs stay local and bounded):
 
 * **SVQ1** — `svq1_frame_header` (header parse), `svq1_decode_intra`
@@ -303,9 +303,13 @@ CI type-checks it so it cannot rot, runs stay local and bounded):
   byte-identical to the encoder's own `reconstruction`.
 * **SVQ3** — `svq3_extradata` (SEQH walk), `svq3_slice` (envelope
   prefix/size/unpermute + header walk, both header versions swept
-  directly), and `svq3_mb_layer` (MB-type walk, intra-4×4 mode VLC,
+  directly), `svq3_mb_layer` (MB-type walk, intra-4×4 mode VLC,
   the three residual block decoders, inter-MB motion header, and
-  bits→reconstruction with hostile-magnitude placed coefficients).
+  bits→reconstruction with hostile-magnitude placed coefficients),
+  and `svq3_intra_frame` (the whole intra access-unit frame walk —
+  slice envelope, macroblock grammars, residual decode and
+  reconstruction — over arbitrary access-unit bytes at fuzz-derived
+  grid geometries).
 * **Framework** — `registry_stream`: the `make_decoder` /
   `make_svq3_decoder` handles driven end-to-end over arbitrary
   packetisations (`send_packet` → `receive_frame` drain → `flush`),

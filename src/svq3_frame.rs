@@ -466,13 +466,15 @@ fn decode_slice_macroblocks(
     }
 
     let mut qp = u32::from(header.slice_qp);
-    // Slices with the version-1 "has more slices" flag set end where
-    // their payload runs out; the last (or only) slice must carry the
-    // rest of the picture. A slice boundary is only legal at a
-    // macroblock boundary, so a Truncated error from the very first
-    // read of a macroblock — with the more-slices flag set — hands the
-    // walk to the next slice rather than failing the picture.
-    let more_slices = header.has_more_slices_v1 == Some(true);
+    // A multi-slice picture's non-final slices end where their payload
+    // runs out; the last (or only) slice must carry the rest of the
+    // picture. A slice boundary is only legal at a macroblock
+    // boundary, so a Truncated error from the very first read of a
+    // macroblock hands the walk to the next slice rather than failing
+    // the picture — for version-1 slices that signal "has more
+    // slices", and for version-2 slices generally (the next slice's
+    // macroblock offset re-validates continuity above).
+    let more_slices = header.has_more_slices_v1 == Some(true) || header.mb_offset_v2.is_some();
     while mb_cursor < total_mbs {
         let mb_start_bits = br.bits_consumed();
         match dec.decode_macroblock(&mut br, mb_cursor, &mut qp, header.delta_qp_present) {
@@ -899,5 +901,153 @@ mod tests {
                 let _ = decode_intra_access_unit(&seqh, &m);
             }
         }
+    }
+
+    #[test]
+    fn intra_16x16_luma_ac_matches_component_composition() {
+        let seqh = seqh_32x32();
+        let mut p = Packer::new();
+        intra_slice_header(&mut p, 13, false);
+        // MB0: type code 15 → idx 14 = pred 2 (DC), chroma 0,
+        // luma_ac = 1. DC block: level +3 run 0 (code 15), EOB. Then
+        // sixteen AC blocks, scan start 1: block 0 carries level +1
+        // run 0 (lands at scan position 1 = raster 1), the other
+        // fifteen are empty.
+        p.ue(15);
+        p.ue(15);
+        p.ue(0);
+        p.ue(1);
+        p.ue(0);
+        for _ in 0..15 {
+            p.ue(0);
+        }
+        for _ in 0..3 {
+            push_empty_i4_mb(&mut p);
+        }
+        let au = wire_v1(p.into_bytes());
+        let pic = decode_intra_access_unit(&seqh, &au).unwrap();
+
+        // Component composition of the same macroblock: no neighbours,
+        // DC fallback prediction, spec/04 §4 DC scatter + the placed
+        // AC coefficient in block 0.
+        let mut dc_block = [0i32; 16];
+        dc_block[0] = 3;
+        let v = luma_dc_secondary_transform(13, dc_block);
+        let mut ac_blocks = [[0i32; 16]; 16];
+        ac_blocks[0][NORMAL_ZIGZAG_4X4_SCAN[1]] = 1;
+        let mut mb = crate::svq3_recon::LumaMacroblock::new();
+        reconstruct_intra_16x16_luma_macroblock_with_dc(
+            &mut mb,
+            Svq3Luma16x16Mode::Dc,
+            &ac_blocks,
+            &v,
+            13,
+        );
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(pic.luma_sample(x, y), mb.samples[y * 16 + x], "({x},{y})");
+            }
+        }
+        // The AC coefficient must be visible (the walk read it with
+        // scan start 1, so it cannot have been swallowed as a DC).
+        assert_ne!(pic.luma_sample(1, 0), pic.luma_sample(0, 0));
+    }
+
+    /// Start a version-2 intra slice-header bit stream with the given
+    /// macroblock offset (6-bit field for a 4-macroblock picture:
+    /// `max(ceil_log2(4), 6) = 6`).
+    fn intra_slice_header_v2(p: &mut Packer, mb_offset: u32, qp: u32) {
+        p.ue(2); // frame code 2 = I
+        p.push(6, mb_offset);
+        p.push(8, 0); // frame number
+        p.push(5, qp);
+        p.push(1, 0); // delta qp flag
+        p.push(1, 0); // unknown
+        p.push(1, 0); // optional-data loop stop
+    }
+
+    /// Wrap a packed slice payload in the version-2 wire envelope
+    /// (no trailing frame-end byte — the caller concatenates).
+    fn wire_v2_slice(payload: Vec<u8>) -> Vec<u8> {
+        let sss = 2u8;
+        let mut out = Vec::new();
+        out.push((sss << 5) | 2); // slice_size_size = 2, version 2
+        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        out.extend_from_slice(&payload[1..]);
+        out.push(payload[0]);
+        out
+    }
+
+    #[test]
+    fn v2_two_slice_access_unit_decodes() {
+        let seqh = seqh_32x32();
+        // Slice 0: macroblocks 0..2 at offset 0; slice 1: macroblocks
+        // 2..4 at offset 2. Each slice's payload ends exactly at its
+        // last macroblock (plus byte padding), exercising the
+        // continuation-at-truncation rule and the offset check.
+        let mut p0 = Packer::new();
+        intra_slice_header_v2(&mut p0, 0, 13);
+        push_empty_i4_mb(&mut p0);
+        push_empty_i4_mb(&mut p0);
+        let mut p1 = Packer::new();
+        intra_slice_header_v2(&mut p1, 2, 13);
+        push_empty_i4_mb(&mut p1);
+        push_empty_i4_mb(&mut p1);
+        let mut au = wire_v2_slice(p0.into_bytes());
+        au.extend_from_slice(&wire_v2_slice(p1.into_bytes()));
+        au.push(SVQ3_FRAME_END);
+        let pic = decode_intra_access_unit(&seqh, &au).unwrap();
+        assert!(pic.luma().iter().all(|&s| s == 128));
+
+        // A wrong second-slice offset is rejected.
+        let mut p0 = Packer::new();
+        intra_slice_header_v2(&mut p0, 0, 13);
+        push_empty_i4_mb(&mut p0);
+        push_empty_i4_mb(&mut p0);
+        let mut p1 = Packer::new();
+        intra_slice_header_v2(&mut p1, 3, 13);
+        push_empty_i4_mb(&mut p1);
+        push_empty_i4_mb(&mut p1);
+        let mut au = wire_v2_slice(p0.into_bytes());
+        au.extend_from_slice(&wire_v2_slice(p1.into_bytes()));
+        au.push(SVQ3_FRAME_END);
+        assert_eq!(
+            decode_intra_access_unit(&seqh, &au).unwrap_err(),
+            Error::InvalidFrameCode(3)
+        );
+    }
+
+    #[test]
+    fn intra4x4_alt_scan_block_matches_component_composition() {
+        let seqh = seqh_32x32();
+        // qp 13 < 24 → the intra-4×4 luma blocks use the alternate
+        // scan. MB0: all-DC modes, CBP code 2 → pattern 15 (all four
+        // luma quadrants, no chroma); every block's two half-scans:
+        // the first half carries level +2 run 0 (alt-book code 5 →
+        // the inline DC, zero residual under the fixed intra scale),
+        // the second half is empty.
+        let mut p = Packer::new();
+        intra_slice_header(&mut p, 13, false);
+        p.ue(0);
+        for _ in 0..8 {
+            p.ue(0);
+        }
+        p.ue(2); // CBP code 2 → intra pattern 15
+        for _ in 0..16 {
+            p.ue(5); // half 1: +2 at alt scan position 0 (raster 0)
+            p.ue(0); // half 1 end
+            p.ue(0); // half 2 end
+        }
+        for _ in 0..3 {
+            push_empty_i4_mb(&mut p);
+        }
+        let au = wire_v1(p.into_bytes());
+        let pic = decode_intra_access_unit(&seqh, &au).unwrap();
+        // Inline DC level +2 under the fixed 13·13·1538 scale rounds
+        // to zero residual, so the macroblock stays at the DC
+        // prediction chain — but the stream MUST have consumed the 48
+        // block codes (a desync would corrupt the following
+        // macroblocks or fail the decode).
+        assert!(pic.luma().iter().all(|&s| s == 128));
     }
 }
