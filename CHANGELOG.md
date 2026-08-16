@@ -35,6 +35,11 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- svq3: `reconstruct_intra_macroblock`'s 4×4-intra arm now runs the
+  fixed inline intra-luma DC scale
+  (`reconstruct_intra_luma_macroblock_from_coeffs_intra_dc`, the wiki
+  `dc = 13·13·1538·block[0]` rule) instead of the general
+  coeff·dequant path, matching the frame walk
 - svq3: the I-frame macroblock-type wire mapping is re-pinned from
   the staged 320×240 fixture's uniform-black 300-macroblock sync
   frame, whose macroblock layer tiles as 299 identical 14-bit units

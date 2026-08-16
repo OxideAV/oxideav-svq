@@ -951,8 +951,8 @@ pub struct ChromaPlaneCoeffs {
 /// owns into the single-macroblock unit a frame walk consumes:
 ///
 /// * **Luma** — dispatched on `luma` ([`Svq3LumaIntra`]): the 4×4-intra
-///   per-sub-block mode loop
-///   ([`reconstruct_intra_luma_macroblock_from_coeffs`]) or the
+///   per-sub-block mode loop with the fixed inline intra-luma DC scale
+///   ([`reconstruct_intra_luma_macroblock_from_coeffs_intra_dc`]) or the
 ///   16×16-intra whole-macroblock loop
 ///   ([`reconstruct_intra_16x16_luma_macroblock_from_coeffs`]).
 /// * **Cb / Cr chroma** — each via
@@ -982,10 +982,20 @@ pub fn reconstruct_intra_macroblock(
     q: u32,
 ) {
     match luma {
+        // A 4×4-intra macroblock's luma DCs are carried inline in each
+        // block, so the SVQ3-specific fixed intra-luma DC scale applies
+        // (wiki §"Macroblock transform and dequantization", spec/01
+        // Gap 2 — `dc = 13·13·1538·block[0]`), not the general
+        // coeff·dequant[Q] path.
         Svq3LumaIntra::Blocks4x4 {
             modes,
             coeff_blocks,
-        } => reconstruct_intra_luma_macroblock_from_coeffs(&mut mb.luma, modes, coeff_blocks, q),
+        } => reconstruct_intra_luma_macroblock_from_coeffs_intra_dc(
+            &mut mb.luma,
+            modes,
+            coeff_blocks,
+            q,
+        ),
         Svq3LumaIntra::Whole16x16 { mode, coeff_blocks } => {
             reconstruct_intra_16x16_luma_macroblock_from_coeffs(
                 &mut mb.luma,
