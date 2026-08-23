@@ -156,6 +156,15 @@ impl Intra16x16Params {
 ///   other blocks coded" type ([`Self::SeparateDcOnly`]). Its
 ///   reconstruction grammar beyond the DC block is not yet pinned by
 ///   the staged docs.
+///
+/// **r450 caveat.** Black-box body-shape probing of the reference
+/// decoder (see the [`crate::svq3_frame`] module docs) confirms wire
+/// `0`'s pairs + explicit-CBP shape but shows the `1..=24` bodies do
+/// **not** fit the tables/03 factoring under any constant offset
+/// (probed minimal bodies: types 4, 9, 10, 19–22 take one coefficient
+/// list, 12 and 25 take three, 1–2 carry mode-pair-bearing bodies), so
+/// the `wire + 8` record binding for `1..=24` is a provisional reading
+/// awaiting the docs-side I-frame macroblock-layer extraction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IFrameMbType {
     /// I-frame wire code `0` (dispatch 33) — per-4×4 intra modes +
