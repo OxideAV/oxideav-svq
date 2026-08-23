@@ -122,9 +122,7 @@ impl Svq1MvCache {
     /// §6.8.2 forbids MV inheritance across frames, so a reused cache
     /// must be reset between frames.
     pub fn reset(&mut self) {
-        for slot in &mut self.slots {
-            *slot = Svq1Mv::ZERO;
-        }
+        self.slots.fill(Svq1Mv::ZERO);
     }
 
     /// The MV at 8×8-block position `(row, col)`, or `None` when the
