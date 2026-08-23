@@ -177,7 +177,10 @@ individually spec-anchored and unit-tested.
 
 * **Container + slice framing** (`svq3`): `SEQH` extradata (spec/02),
   the permuted slice envelope + per-slice header (frame code, version,
-  quantiser, delta flag), and the macroblock-grid geometry.
+  quantiser, delta flag, and the two reserved bits that close the
+  header — pinned r450 by black-box bit-probing: every value decodes
+  identically, deleting them desynchronises the macroblock layer), and
+  the macroblock-grid geometry.
 * **The universal variable-length code** (`svq3::read_universal_code`,
   spec/06 §1): SVQ3's single `2n+1`-bit code with terminator bits
   interleaved among the data bits, carrying every macroblock-layer
@@ -269,24 +272,27 @@ pinned end-to-end by the 240×128 fixture: its first Cb DC code number
 remap/Hadamard-halve/`169·B` pipeline → exactly the expected uniform
 Cb 70 against the 128 prediction.
 
-**Remaining blocker — the leading-macroblock element sequence.**
-Both staged fixtures' I-frames open with a first macroblock whose
-element list the staged grammars cannot account for: in the black
-320×240 frame it consumes 24 universal codes
-(`[4][0×7][1,0,1,1,3,1,15][0×9]`) where a spec'd empty 16×16 consumes
-2, every nonzero code is provably non-coefficient (the frame is
-uniformly black), and both fixtures share the 12-bit `[4][0×7]`
-prefix. Content-bearing macroblocks later in the real streams also
-carry elements the staged chapters don't pin (the walk desyncs inside
-them under every element-order variant tried). Needed from the docs
-side: the decoder's I-frame macroblock-loop element order read from
-the staged decompressor — the wire→dispatch type adjustment per slice
-type, every element between mb_type and the residual lists for each
-intra family (including any leading/first-macroblock-only elements),
-the cross-plane chroma stream interleaving, the 16×16
-`intra16x16_pred_mode` → predictor binding, and the luma DC
-predictor's no-neighbour fallback (the black frame pins it near 0,
-not the H.264 128).
+**Remaining blocker — the leading-macroblock coefficient coding.**
+An r450 black-box probing campaign (rewriting the staged fixture's
+first slice element-by-element and diffing the reference decoder's
+output) replaced the old "unexplained 24-code prefix" story with a
+precise characterisation. With the newly pinned reserved slice-header
+bits consumed, the black sync frame's first macroblock reads type
+code 2 followed by `[0x7, 1, 0, 1, 1, 3, 1, 15, 0x9]`; the
+no-neighbour fallback predictor is 128 for luma and chroma alike
+(probed types with empty bodies decode to uniform-128 macroblocks);
+the I-frame type space carries per-type body grammars that fit no
+constant wire-to-dispatch offset against the staged tables/03
+factoring (types 4, 9, 10, 19-22 take one coefficient list; 12 and
+25 take three; 0-2 carry mode-pair-bearing bodies); and - the heart
+of the gap - the luma coefficient data of I-frame macroblocks is a
+bit-level level/run code that is NOT the staged spec/06 universal
+book: quantiser-31 probing pins the uniform-DC ladder to the bit
+forms `0^(2n) 111` (negative) / `0^(2n+1) 11` (positive) with
+magnitudes 1, 2, 3, 5 at the probed rungs, plus multi-coefficient
+composite code points. Needed from the docs side: the I-frame
+macroblock-layer coefficient tables and reader, read from the staged
+decompressor, reconciled against these black-box pins.
 
 ## Fuzzing
 

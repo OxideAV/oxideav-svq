@@ -6,6 +6,17 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- svq3: the slice header carries two reserved bits after the
+  optional-data loop, before the macroblock layer starts
+  (`Svq3SliceHeader::reserved2`). Pinned by an r450 black-box
+  bit-probing campaign against the reference decoder on the staged
+  real-stream fixtures: all four values decode byte-identically in I-
+  and P-slices alike, while removing the bits desynchronises the
+  macroblock layer. `header_end_bit` now points past them, so the
+  frame walk starts the macroblock layer two bits later than before.
+
 ### Added
 
 - svq3: the intra access-unit frame walk (`svq3_frame`,

@@ -1407,6 +1407,7 @@ mod tests {
             (1, 0),     // delta qp
             (1, 0),     // unknown
             (1, 0),     // optional loop stop
+            (2, 0),     // reserved bits
         ]);
         let prefix = (1 << 5) | 1; // size_size=1, version=1
         let mut wire = vec![prefix, header_bits.len() as u8];
@@ -1594,6 +1595,7 @@ mod tests {
             (1, 0),     // delta qp flag
             (1, 0),     // unknown
             (1, 0),     // optional-data loop stop
+            (2, 0),     // reserved bits
         ];
         for _ in 0..4 {
             // type ue(0) + eight pair codes ue(0) + CBP ue(3) = "00001".

@@ -49,16 +49,39 @@
 //!
 //! ## What this module cannot yet do
 //!
-//! The staged real-stream fixtures (`docs/video/svq3/fixtures/`) begin
-//! with a first macroblock whose element sequence consumes far more
-//! codes than the grammars above account for (24 universal codes for
-//! the all-black first macroblock of the 320×240 fixture, against 2
-//! for a spec'd empty 16×16), so end-to-end pixel validation against
-//! `expected.yuv` is blocked on that docs gap; every macroblock
-//! *after* the first tiles those streams exactly (see the
-//! [`crate::svq3_mb::IFrameMbType`] census note). The decoder here is
-//! validated against synthetic streams built from the same staged
-//! grammar in the crate tests.
+//! End-to-end pixel validation of the staged real-stream fixtures
+//! (`docs/video/svq3/fixtures/`) is still blocked on the leading
+//! macroblock of each I-frame; every macroblock *after* the first
+//! tiles those streams exactly and decodes pixel-exact (see the
+//! [`crate::svq3_mb::IFrameMbType`] census note). An r450 black-box
+//! probing campaign against the reference decoder (slice-rewrite +
+//! bit-flip differentials on the staged fixtures) sharpened the gap
+//! considerably:
+//!
+//! * the two reserved bits closing the slice header (now consumed by
+//!   [`crate::svq3::parse_slice_header`]) mean the black fixture's
+//!   first macroblock actually starts with type code **2**, followed
+//!   by `[0×7, 1, 0, 1, 1, 3, 1, 15, 0×9]`;
+//! * the no-neighbour fallback predictor is **128** for luma and
+//!   chroma alike (a type with an empty body decodes to a uniform
+//!   128 macroblock);
+//! * the I-frame type space maps to per-type body grammars that do
+//!   not match the staged `tables/03` factoring under any constant
+//!   wire→dispatch offset (probed minimal bodies: types 4, 9, 10 and
+//!   19–22 take a single coefficient list; 12 and 25 take three;
+//!   types 0–2 carry mode-pair-bearing bodies);
+//! * the luma coefficient data of I-frame macroblocks is carried in a
+//!   bit-level level/run code that is **not** the staged spec/06
+//!   universal-code book: the uniform-DC ladder answers to the bit
+//!   forms `0^(2n) 111` (negative) / `0^(2n+1) 11` (positive) with
+//!   magnitudes 1, 2, 3, 5 at the probed rungs, and several code
+//!   points decode as multi-coefficient composites.
+//!
+//! Decoding the leading macroblock therefore needs the actual I-frame
+//! macroblock-layer coefficient tables from the staged decompressor —
+//! a docs-side extraction ask — after which this walk can be pointed
+//! at the full corpus. The decoder here is validated against synthetic
+//! streams built from the staged grammar in the crate tests.
 
 use crate::bitreader::BitReader;
 use crate::error::{Error, Result};
@@ -589,6 +612,7 @@ mod tests {
         p.push(1, u32::from(delta_qp));
         p.push(1, 0); // unknown
         p.push(1, 0); // optional-data loop: stop
+        p.push(2, 0); // reserved bits closing the header
     }
 
     /// Wrap a packed slice payload in the version-1 wire envelope
@@ -964,6 +988,7 @@ mod tests {
         p.push(1, 0); // delta qp flag
         p.push(1, 0); // unknown
         p.push(1, 0); // optional-data loop stop
+        p.push(2, 0); // reserved bits closing the header
     }
 
     /// Wrap a packed slice payload in the version-2 wire envelope

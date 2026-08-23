@@ -201,6 +201,11 @@ pub struct Svq3SliceHeader {
     /// `1 bit - has more data, 8 bits - data, repeat` loop. Empty
     /// when the loop's first peek-bit was 0.
     pub optional_bytes: Vec<u8>,
+    /// The two reserved bits that close the slice header. Their value
+    /// is ignored (all four values decode identically against the
+    /// black-box reference decoder), but the bits are on the wire and
+    /// must be consumed before the macroblock layer starts.
+    pub reserved2: u8,
     /// Bit position (relative to the start of the unpermuted slice
     /// payload) at which the parser stopped reading. The macroblock-
     /// layer Golomb stream begins at this offset.
@@ -585,6 +590,14 @@ pub fn parse_slice_header(
         optional_bytes.push(br.read_bits(8)? as u8);
     }
 
+    // Two reserved bits close the header before the macroblock data
+    // begins. Pinned against the black-box reference decoder on the
+    // staged real-stream fixtures (r450 bit-probing): every one of the
+    // four values decodes byte-identically in I- and P-slices alike,
+    // while deleting the bits desynchronises the macroblock layer — so
+    // the field exists on the wire and its value is ignored.
+    let reserved2 = br.read_bits(2)? as u8;
+
     Ok(Svq3SliceHeader {
         version,
         slice_size_size,
@@ -598,6 +611,7 @@ pub fn parse_slice_header(
         unknown1,
         protected_unknown,
         optional_bytes,
+        reserved2,
         header_end_bit: br.bits_consumed(),
     })
 }
@@ -1151,7 +1165,17 @@ mod tests {
         // 1 bit delta_qp = 1.
         // 1 bit unknown = 0.
         // optional loop: 0.
-        let unpermuted = pack(&[(1, 0b1), (7, 100), (8, 5), (5, 10), (1, 1), (1, 0), (1, 0)]);
+        // 2 reserved bits = 0.
+        let unpermuted = pack(&[
+            (1, 0b1),
+            (7, 100),
+            (8, 5),
+            (5, 10),
+            (1, 1),
+            (1, 0),
+            (1, 0),
+            (2, 0),
+        ]);
         let hdr = parse_slice_header(&unpermuted, SliceVersion::V2, 1, 0, 99, false).unwrap();
         assert_eq!(hdr.frame_type, Svq3FrameType::Predicted);
         assert_eq!(hdr.has_more_slices_v1, None);
@@ -1230,7 +1254,16 @@ mod tests {
     fn parse_wire_slice_round_trip_v1_size1() {
         // Build an unpermuted body that contains a v1 I-frame slice
         // header + 3 trailing macroblock-layer bytes.
-        let header_bits = pack(&[(3, 0b011), (1, 0), (8, 7), (5, 4), (1, 0), (1, 0), (1, 0)]);
+        let header_bits = pack(&[
+            (3, 0b011),
+            (1, 0),
+            (8, 7),
+            (5, 4),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (2, 0),
+        ]);
         let mut unpermuted_body = header_bits.clone();
         unpermuted_body.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
 
@@ -1248,13 +1281,13 @@ mod tests {
         assert_eq!(hdr.frame_number, 7);
         assert_eq!(hdr.slice_qp, 4);
         // header_end_bit ÷ 8 = full bytes the header occupies. The
-        // header bit-length is 3+1+8+5+1+1+1 = 20 → 2 bytes + 4
+        // header bit-length is 3+1+8+5+1+1+1+2 = 22 → 2 bytes + 6
         // bits, so remainder starts at byte offset 2.
-        assert_eq!(hdr.header_end_bit, 20);
+        assert_eq!(hdr.header_end_bit, 22);
         assert_eq!(
             rem,
             vec![
-                0x00, /* low 4 bits of header byte 3 = 0 */
+                0x00, /* low 6 bits of header byte 3 = 0 */
                 0xAA, 0xBB, 0xCC
             ]
         );
@@ -1273,8 +1306,9 @@ mod tests {
             (1, 1),   // delta qp
             (1, 0),   // unknown
             (1, 0),   // optional loop: stop
+            (2, 0),   // reserved bits
         ]);
-        // 1+7+8+5+1+1+1 = 24 bits = 3 bytes exact.
+        // 1+7+8+5+1+1+1+2 = 26 bits.
         let mut unpermuted_body = header_bits.clone();
         unpermuted_body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
 
