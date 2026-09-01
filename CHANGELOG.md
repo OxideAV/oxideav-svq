@@ -6,6 +6,48 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-svq/compare/v0.0.2...v0.0.3) - 2026-08-23
+
+### Other
+
+- slice::fill for the frame-start reset (clippy 1.98 manual_slice_fill)
+- record the r450 body-shape caveat on the I-frame wire mapping
+- two reserved slice-header bits + r450 black-box findings
+- 4x4-intra dispatcher uses the fixed inline intra-luma DC scale
+- keep the SEQH pack comment block rustfmt-stable
+- describe the fixture stream origin generically
+- V2 multi-slice continuation, deeper frame-walk tests, svq3_intra_frame fuzz target
+- svq3 README + CHANGELOG: frame walk landed, wire mapping pinned, 299/300 pixel-exact
+- intra access-unit frame walk + registry decode to real frames
+- fixture-pinned I-frame macroblock-type wire mapping
+- README + CHANGELOG — entropy/transform/CBP layers landed; I-frame wire-mapping gap documented
+- CBP decode, intra-16x16 type factorisation, 16x16 V/H predictors
+- rustfmt import order in svq3_mb_layer
+- spec/04 transform corrections - measured basis, chroma remap, both secondary transforms
+- staged residual code books + block decoders (spec/06, tables/05-06)
+- switch every VLC element to the spec/06 universal code
+- mark internal decode/encode/plumbing surface #[doc(hidden)]
+- registry_stream target — framework decoder handles end-to-end
+- deepen inter-decode and slice targets
+- README + CHANGELOG: document the fuzz harness and the two findings
+- widen dequant/transform arithmetic, saturate to i32
+- evaluate chroma-DC closed-form extension in 64-bit
+- seven-target bounded libFuzzer harness + CI type-check job
+- generalise a historical scrub-record entry to not re-enumerate external names
+- svq1 CHANGELOG: genuine-4MV conformance + end-to-end registry decode
+- svq1 registry: genuine-4MV chain decodes end-to-end through the framework
+- document genuine-4MV oracle (docs #197) + scrub external-impl name
+- svq1 tests: corrupt-frame robustness sweep over the genuine-4MV path
+- genuine-4MV mode-census conformance (docs #197 inter-4mv)
+- svq1 encoder: registry-level droppable (B) frame cadence
+- svq1 encoder: per-frame rate control via warm-started lambda search
+- svq1 tests: corrupt-P-frame robustness sweep over the window-clamp path
+- r391 rollup — second-oracle conformance, reference-window clamp, mode census
+- T03 mode census API — fixture's INTER_4MV-presence claim refuted
+- INTER_4MV fixture conformance — reference-window MV clamp pinned
+- add CI / crates.io / docs.rs / MIT-license badges
+- release v0.0.2 ([#2](https://github.com/OxideAV/oxideav-svq/pull/2))
+
 ### Fixed
 
 - svq3: the slice header carries two reserved bits after the
