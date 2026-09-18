@@ -218,8 +218,8 @@ mod tests {
     #[test]
     fn wire_read_rejects_out_of_alphabet_code() {
         // Universal code 48: n = 5, value = 48 + 1 - 32 = 17 = 0b10001
-        // → bits "0 0 1 0 (0 0) (0 0) (0 1) 1" = "00100000011".
-        let bits = [0b0010_0000, 0b0110_0000];
+        // → spec/07 §1 bits "0 1 0 0 0 0 0 0 0 1 1" = "01000000011".
+        let bits = [0b0100_0000, 0b0110_0000];
         let mut br = BitReader::new(&bits);
         assert!(matches!(
             read_cbp_intra(&mut br),

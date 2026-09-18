@@ -1618,32 +1618,7 @@ mod tests {
         assert!(mb.cr.samples.iter().all(|&s| s == 128), "cr flat 128");
     }
 
-    /// Pack `(width, value)` items MSB-first into bytes (mirrors the
-    /// `svq3_mb` test helper).
-    fn pack(items: &[(u32, u32)]) -> Vec<u8> {
-        let mut out: Vec<u8> = Vec::new();
-        let mut bit_cursor: usize = 0;
-        for &(width, value) in items {
-            for i in (0..width).rev() {
-                let bit = ((value >> i) & 1) as u8;
-                let byte_idx = bit_cursor / 8;
-                if byte_idx >= out.len() {
-                    out.push(0);
-                }
-                let shift = 7 - (bit_cursor % 8);
-                out[byte_idx] |= bit << shift;
-                bit_cursor += 1;
-            }
-        }
-        out
-    }
-
-    /// `(width, value)` for the unsigned exp-Golomb code of `n`.
-    fn ue(n: u32) -> (u32, u32) {
-        let p = n + 1;
-        let leading = 31 - p.leading_zeros();
-        (2 * leading + 1, p)
-    }
+    use crate::svq3_testutil::{pack, uvlc as ue};
 
     #[test]
     fn intra_modes_from_grid_maps_every_block() {

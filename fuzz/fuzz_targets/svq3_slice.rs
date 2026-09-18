@@ -1,6 +1,7 @@
 //! Fuzz the SVQ3 slice envelope: the wire-slice prefix/size parse,
 //! the byte-permutation reversal (`unpermute_slice_payload`), and the
-//! slice-header field walk (wiki §"Slice Header") on arbitrary bytes.
+//! slice-header field walk (spec/07 §2–§3, including the extended-mode
+//! read sequence of §3.3) on arbitrary bytes.
 
 #![no_main]
 
@@ -17,10 +18,13 @@ fuzz_target!(|data: &[u8]| {
     let protected = data[1] & 1 != 0;
     let wire = &data[2..];
 
-    if let Ok((header, payload)) = parse_wire_slice(wire, num_mbs, protected) {
-        // The returned macroblock-layer bytes are the slice body past
-        // the parsed header — never more than the declared body size.
-        assert!(payload.len() <= header.slice_size as usize);
+    let extended_mode = data[1] & 4 != 0;
+    if let Ok(slice) = parse_wire_slice(wire, num_mbs, protected, extended_mode) {
+        // The unpermuted payload is exactly the declared body size and
+        // the header ends inside it.
+        assert_eq!(slice.payload.len(), slice.header.slice_size as usize);
+        assert!(slice.header.header_end_bit <= slice.payload.len() * 8);
+        assert!(slice.consumed <= wire.len());
     }
 
     // Drive the permutation reversal directly across all legal
@@ -38,5 +42,13 @@ fuzz_target!(|data: &[u8]| {
     } else {
         SliceVersion::V1
     };
-    let _ = parse_slice_header(wire, version, sss, wire.len() as u32, num_mbs, protected);
+    let _ = parse_slice_header(
+        wire,
+        version,
+        sss,
+        wire.len() as u32,
+        num_mbs,
+        protected,
+        extended_mode,
+    );
 });

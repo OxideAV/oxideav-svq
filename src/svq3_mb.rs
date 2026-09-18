@@ -1040,56 +1040,7 @@ pub fn decode_intra_4x4_modes_with_context(
 mod tests {
     use super::*;
 
-    /// Helper: pack a sequence of `(width, value)` items into a byte
-    /// stream by writing them MSB-first. Mirrors the helper used by
-    /// `svq3::tests` so the MB-type tests can build fixtures without
-    /// re-implementing the bit-packing.
-    fn pack(items: &[(u32, u32)]) -> Vec<u8> {
-        let mut out: Vec<u8> = Vec::new();
-        let mut bit_cursor: usize = 0;
-        for &(width, value) in items {
-            assert!((1..=32).contains(&width));
-            assert!(width == 32 || value < (1u32 << width));
-            for i in (0..width).rev() {
-                let bit = ((value >> i) & 1) as u8;
-                let byte_idx = bit_cursor / 8;
-                if byte_idx >= out.len() {
-                    out.push(0);
-                }
-                let shift = 7 - (bit_cursor % 8);
-                out[byte_idx] |= bit << shift;
-                bit_cursor += 1;
-            }
-        }
-        out
-    }
-
-    /// Universal-code encoding helper (spec/06 §1 interleaved layout) —
-    /// produces a `(width, value)` pack item that decodes to `n`.
-    ///
-    /// `ue(0) = "1"`, `ue(1) = "010"`, `ue(2) = "011"`,
-    /// `ue(3) = "00001"`, `ue(7) = "0000001"`, … — codes 0..=2 match
-    /// the familiar exp-Golomb layout, higher codes interleave
-    /// terminator bits among the data bits.
-    fn ue(n: u32) -> (u32, u32) {
-        let exp = 31 - (n + 1).leading_zeros();
-        let data = n + 1 - (1u32 << exp);
-        match exp {
-            0 => (1, 1),
-            1 => (3, 0b010 | data),
-            _ => {
-                let mut bits: u32 = 0b00;
-                bits = (bits << 1) | ((data >> (exp - 1)) & 1);
-                bits = (bits << 1) | ((data >> (exp - 2)) & 1);
-                let mut width = 4;
-                for i in (0..exp - 2).rev() {
-                    bits = (bits << 2) | ((data >> i) & 1);
-                    width += 2;
-                }
-                (width + 1, (bits << 1) | 1)
-            }
-        }
-    }
+    use crate::svq3_testutil::{pack, uvlc as ue};
 
     #[test]
     fn i_frame_code_table() {
@@ -1313,10 +1264,10 @@ mod tests {
         assert_eq!(mb, Svq3MbType::IIntra(IFrameMbType::Intra4x4));
 
         // Universal code 25: n = 4, value = 10 = 0b1010 → bits
-        // "0 0 1 0 0 1 0 0 1" (0 0 d1 d2 0 d3 0 d4 1) = 0b001001001.
+        // "0 1 0 0 0 1 0 0 1" (0 d1 0 d2 0 d3 0 d4 1) = 0b010001001.
         let (w, v) = ue(25);
         assert_eq!(w, 9);
-        assert_eq!(v, 0b001001001);
+        assert_eq!(v, 0b010001001);
         let bytes = pack(&[(w, v)]);
         let mut br = BitReader::new(&bytes);
         let mb = read_mb_type(&mut br, Svq3FrameType::Intra).unwrap();

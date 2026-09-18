@@ -811,8 +811,13 @@ impl Decoder for Svq3DecoderHandle {
             .as_ref()
             .map(|s| s.protected)
             .unwrap_or(false);
-        let (header, _remainder) = parse_wire_slice(&packet.data, num_mbs, protected)?;
-        self.last_slice_header = Some(header);
+        let extended_mode = self
+            .sequence_header
+            .as_ref()
+            .map(|s| s.extended_mode)
+            .unwrap_or(false);
+        let slice = parse_wire_slice(&packet.data, num_mbs, protected, extended_mode)?;
+        self.last_slice_header = Some(slice.header);
         self.pending = Some(packet.clone());
         Ok(())
     }
@@ -1400,14 +1405,15 @@ mod tests {
     /// Minimal SVQ3 wire-slice: v1 I-frame, size_size=1, num_mbs=99.
     fn minimal_svq3_slice_packet() -> Vec<u8> {
         let header_bits = pack(&[
-            (3, 0b011), // ue(2) = I
-            (1, 0),     // has more slices = 0
-            (8, 7),     // frame number
+            (3, 0b011), // uvlc(2) = slice_type I
+            (1, 0),     // encrypted
+            (8, 7),     // picture_id
             (5, 4),     // qp
-            (1, 0),     // delta qp
-            (1, 0),     // unknown
-            (1, 0),     // optional loop stop
-            (2, 0),     // reserved bits
+            (1, 0),     // mb_qp_delta_enable
+            (1, 0),     // flag
+            (1, 0),     // mode
+            (2, 0),     // reserved
+            (1, 0),     // extension bytes: none
         ]);
         let prefix = (1 << 5) | 1; // size_size=1, version=1
         let mut wire = vec![prefix, header_bits.len() as u8];
@@ -1536,7 +1542,7 @@ mod tests {
         handle.send_packet(&pkt).expect("send_packet ok");
         let hdr = handle.last_slice_header().expect("slice header recorded");
         assert_eq!(hdr.frame_type, crate::svq3::Svq3FrameType::Intra);
-        assert_eq!(hdr.frame_number, 7);
+        assert_eq!(hdr.picture_id, 7);
         assert_eq!(hdr.slice_qp, 4);
     }
 
@@ -1588,14 +1594,15 @@ mod tests {
     /// staged fixture census pinned), frame-end sentinel.
     fn svq3_intra_au_32x32_flat() -> Vec<u8> {
         let mut items: Vec<(u32, u32)> = vec![
-            (3, 0b011), // ue(2) = I frame code
-            (1, 0),     // v1: no more slices
-            (8, 0),     // frame number
+            (3, 0b011), // uvlc(2) = slice_type I
+            (1, 0),     // encrypted
+            (8, 0),     // picture_id
             (5, 13),    // slice quantiser
-            (1, 0),     // delta qp flag
-            (1, 0),     // unknown
-            (1, 0),     // optional-data loop stop
-            (2, 0),     // reserved bits
+            (1, 0),     // mb_qp_delta_enable
+            (1, 0),     // flag
+            (1, 0),     // mode
+            (2, 0),     // reserved
+            (1, 0),     // extension bytes: none
         ];
         for _ in 0..4 {
             // type ue(0) + eight pair codes ue(0) + CBP ue(3) = "00001".

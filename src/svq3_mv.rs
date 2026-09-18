@@ -229,53 +229,21 @@ mod tests {
     /// Pack a list of `(value, nbits)` MSB-first into a byte buffer for
     /// the bit reader.
     fn pack(items: &[(u32, u32)]) -> Vec<u8> {
-        let mut bits: Vec<u8> = Vec::new();
-        for &(value, nbits) in items {
-            for i in (0..nbits).rev() {
-                bits.push(((value >> i) & 1) as u8);
-            }
-        }
-        let mut out = vec![0u8; bits.len().div_ceil(8)];
-        for (i, &bit) in bits.iter().enumerate() {
-            if bit == 1 {
-                out[i / 8] |= 1 << (7 - (i % 8));
-            }
-        }
-        out
+        let swapped: Vec<(u32, u32)> = items.iter().map(|&(v, n)| (n, v)).collect();
+        crate::svq3_testutil::pack(&swapped)
     }
 
-    /// Encode universal-code `code_num n` (spec/06 §1 interleaved
-    /// layout) as `(value, nbits)`.
+    /// Universal codeword for code number `n` as `(value, nbits)`
+    /// (spec/07 §1 layout, via the shared test packer).
     fn ue(n: u32) -> (u32, u32) {
-        let exp = 31 - (n + 1).leading_zeros();
-        let data = n + 1 - (1u32 << exp);
-        match exp {
-            0 => (1, 1),
-            1 => (0b010 | data, 3),
-            _ => {
-                // 0 0 d1 d2 [0 d]* 1 — data bits MSB first.
-                let mut bits: u32 = 0b00;
-                bits = (bits << 1) | ((data >> (exp - 1)) & 1);
-                bits = (bits << 1) | ((data >> (exp - 2)) & 1);
-                let mut len = 4;
-                for i in (0..exp - 2).rev() {
-                    bits = (bits << 2) | ((data >> i) & 1);
-                    len += 2;
-                }
-                ((bits << 1) | 1, len + 1)
-            }
-        }
+        let (w, bits) = crate::svq3_testutil::uvlc(n);
+        (bits, w)
     }
 
-    /// Encode a signed value under the spec/06 §1.1 fold, then as raw
-    /// `(value, nbits)`.
+    /// Signed fold of spec/06 §1.1 as `(value, nbits)`.
     fn se(v: i32) -> (u32, u32) {
-        let k = if v > 0 {
-            (2 * v - 1) as u32
-        } else {
-            (-2 * v) as u32
-        };
-        ue(k)
+        let (w, bits) = crate::svq3_testutil::svlc(v);
+        (bits, w)
     }
 
     #[test]

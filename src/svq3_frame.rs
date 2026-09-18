@@ -86,9 +86,9 @@
 use crate::bitreader::BitReader;
 use crate::error::{Error, Result};
 use crate::svq3::{
-    macroblock_position, mb_grid_dims, num_macroblocks, parse_wire_slice, read_universal_code,
-    unpermute_slice_payload, Svq3FrameType, Svq3MacroblockPosition, Svq3SequenceHeader,
-    Svq3SliceHeader, SVQ3_FRAME_END,
+    classify_packet_byte, macroblock_position, mb_grid_dims, num_macroblocks, parse_wire_slice,
+    read_universal_code, Svq3FrameType, Svq3MacroblockPosition, Svq3PacketKind, Svq3SequenceHeader,
+    Svq3SliceHeader,
 };
 use crate::svq3_cbp::read_cbp_intra;
 use crate::svq3_coeff::{
@@ -442,24 +442,48 @@ pub fn decode_intra_access_unit(seqh: &Svq3SequenceHeader, au: &[u8]) -> Result<
     let mut offset = 0usize;
 
     while mb_cursor < total_mbs {
-        if offset >= au.len() || au[offset] == SVQ3_FRAME_END {
+        let Some(&packet_byte) = au.get(offset) else {
             // The access unit ended before the macroblock grid was
             // complete.
             return Err(Error::Truncated);
+        };
+        match classify_packet_byte(packet_byte)? {
+            Svq3PacketKind::End => return Err(Error::Truncated),
+            Svq3PacketKind::Zero { length_width } => {
+                // spec/07 §2: type 0 is followed by a u(16) that must be
+                // zero; nothing else about it is specified.
+                let end = offset + 1 + length_width as usize + 2;
+                if au.len() < end {
+                    return Err(Error::Truncated);
+                }
+                if au[end - 2] != 0 || au[end - 1] != 0 {
+                    return Err(Error::InvalidFrameCode(u16::from_be_bytes([
+                        au[end - 2],
+                        au[end - 1],
+                    ]) as u32));
+                }
+                offset = end;
+                continue;
+            }
+            Svq3PacketKind::Slice { .. } => {}
         }
-        let (header, _) = parse_wire_slice(&au[offset..], total_mbs as u32, seqh.protected)?;
-        if header.frame_type != Svq3FrameType::Intra {
+        let slice = parse_wire_slice(
+            &au[offset..],
+            total_mbs as u32,
+            seqh.protected,
+            seqh.extended_mode,
+        )?;
+        if slice.header.frame_type != Svq3FrameType::Intra {
             return Err(Error::NotImplemented);
         }
-        let sss = header.slice_size_size as usize;
-        let body_start = offset + 1 + sss;
-        let body_end = body_start + header.slice_size as usize;
-        // parse_wire_slice validated the bounds.
-        let body = &au[body_start..body_end];
-        let unpermuted = unpermute_slice_payload(body, header.slice_size_size)?;
-
-        mb_cursor = decode_slice_macroblocks(&mut dec, &header, &unpermuted, mb_cursor, total_mbs)?;
-        offset = body_end;
+        mb_cursor = decode_slice_macroblocks(
+            &mut dec,
+            &slice.header,
+            &slice.payload,
+            mb_cursor,
+            total_mbs,
+        )?;
+        offset += slice.consumed;
     }
 
     Ok(dec.picture)
@@ -474,7 +498,7 @@ fn decode_slice_macroblocks(
     mut mb_cursor: usize,
     total_mbs: usize,
 ) -> Result<usize> {
-    if let Some(mb_offset) = header.mb_offset_v2 {
+    if let Some(mb_offset) = header.first_mb {
         // Version-2 slices carry their starting macroblock offset;
         // an intra picture decodes every macroblock in raster order,
         // so the offset must equal the running cursor.
@@ -497,10 +521,10 @@ fn decode_slice_macroblocks(
     // the picture — for version-1 slices that signal "has more
     // slices", and for version-2 slices generally (the next slice's
     // macroblock offset re-validates continuity above).
-    let more_slices = header.has_more_slices_v1 == Some(true) || header.mb_offset_v2.is_some();
+    let more_slices = true;
     while mb_cursor < total_mbs {
         let mb_start_bits = br.bits_consumed();
-        match dec.decode_macroblock(&mut br, mb_cursor, &mut qp, header.delta_qp_present) {
+        match dec.decode_macroblock(&mut br, mb_cursor, &mut qp, header.mb_qp_delta_enable) {
             Ok(()) => mb_cursor += 1,
             Err(Error::Truncated)
                 if more_slices && br.bits_consumed().saturating_sub(mb_start_bits) < 16 =>
@@ -520,66 +544,8 @@ mod tests {
     use super::*;
     use crate::svq3::parse_extradata;
 
-    /// Pack `(width, value)` items into bytes, MSB-first.
-    struct Packer {
-        bits: Vec<u8>,
-    }
-
-    impl Packer {
-        fn new() -> Self {
-            Self { bits: Vec::new() }
-        }
-
-        fn push(&mut self, width: u32, value: u32) {
-            assert!((1..=32).contains(&width));
-            assert!(width == 32 || value < (1u32 << width));
-            for i in (0..width).rev() {
-                self.bits.push(((value >> i) & 1) as u8);
-            }
-        }
-
-        /// Append one universal-code codeword for code number `n`
-        /// (spec/06 §1 interleaved layout).
-        fn ue(&mut self, n: u32) {
-            let exp = 31 - (n + 1).leading_zeros();
-            let data = n + 1 - (1u32 << exp);
-            match exp {
-                0 => self.push(1, 1),
-                1 => self.push(3, 0b010 | data),
-                _ => {
-                    self.push(1, 0);
-                    self.push(1, 0);
-                    self.push(1, (data >> (exp - 1)) & 1);
-                    self.push(1, (data >> (exp - 2)) & 1);
-                    for i in (0..exp - 2).rev() {
-                        self.push(1, 0);
-                        self.push(1, (data >> i) & 1);
-                    }
-                    self.push(1, 1);
-                }
-            }
-        }
-
-        /// Append the signed universal code for `v` (spec/06 §1.1).
-        fn se(&mut self, v: i32) {
-            let code = if v == 0 {
-                0
-            } else if v > 0 {
-                (v as u32) * 2 - 1
-            } else {
-                (-v as u32) * 2
-            };
-            self.ue(code);
-        }
-
-        fn into_bytes(self) -> Vec<u8> {
-            let mut out = vec![0u8; self.bits.len().div_ceil(8)];
-            for (i, &b) in self.bits.iter().enumerate() {
-                out[i / 8] |= b << (7 - (i % 8));
-            }
-            out
-        }
-    }
+    use crate::svq3::SVQ3_FRAME_END;
+    use crate::svq3_testutil::Packer;
 
     /// A 32×32 (2×2 macroblock) SEQH via the explicit-dimension escape.
     fn seqh_32x32() -> Svq3SequenceHeader {
@@ -589,8 +555,11 @@ mod tests {
         p.push(12, 32); // height
         p.push(1, 0); // halfpel
         p.push(1, 0); // thirdpel
-        p.push(4, 0); // unknown
+        p.push(1, 0); // postfilter hint
+        p.push(1, 0); // extended mode
+        p.push(2, 0b11); // reserved
         p.push(1, 1); // no B frames
+        p.push(1, 0); // reserved
         p.push(1, 0); // no optional data
         p.push(1, 0); // not protected
         let payload = p.into_bytes();
@@ -605,14 +574,15 @@ mod tests {
     /// no more slices, frame number 0, the given quantiser, delta flag,
     /// unknown 0, no optional data.
     fn intra_slice_header(p: &mut Packer, qp: u32, delta_qp: bool) {
-        p.ue(2); // frame code 2 = I
-        p.push(1, 0); // v1: no more slices
-        p.push(8, 0); // frame number
+        p.ue(2); // slice_type 2 = I
+        p.push(1, 0); // encrypted
+        p.push(8, 0); // picture_id
         p.push(5, qp);
-        p.push(1, u32::from(delta_qp));
-        p.push(1, 0); // unknown
-        p.push(1, 0); // optional-data loop: stop
-        p.push(2, 0); // reserved bits closing the header
+        p.push(1, u32::from(delta_qp)); // mb_qp_delta_enable
+        p.push(1, 0); // flag
+        p.push(1, 0); // mode
+        p.push(2, 0); // reserved
+        p.push(1, 0); // extension bytes: none
     }
 
     /// Wrap a packed slice payload in the version-1 wire envelope
@@ -887,12 +857,14 @@ mod tests {
     fn p_slice_is_not_implemented() {
         let seqh = seqh_32x32();
         let mut p = Packer::new();
-        p.ue(0); // frame code 0 = P
+        p.ue(0); // slice_type 0 = P
         p.push(1, 0);
         p.push(8, 0);
         p.push(5, 13);
         p.push(1, 0);
         p.push(1, 0);
+        p.push(1, 0);
+        p.push(2, 0);
         p.push(1, 0);
         let au = wire_v1(p.into_bytes());
         assert_eq!(
@@ -981,14 +953,15 @@ mod tests {
     /// macroblock offset (6-bit field for a 4-macroblock picture:
     /// `max(ceil_log2(4), 6) = 6`).
     fn intra_slice_header_v2(p: &mut Packer, mb_offset: u32, qp: u32) {
-        p.ue(2); // frame code 2 = I
-        p.push(6, mb_offset);
-        p.push(8, 0); // frame number
+        p.ue(2); // slice_type 2 = I
+        p.push(6, mb_offset); // first_mb
+        p.push(8, 0); // picture_id
         p.push(5, qp);
-        p.push(1, 0); // delta qp flag
-        p.push(1, 0); // unknown
-        p.push(1, 0); // optional-data loop stop
-        p.push(2, 0); // reserved bits closing the header
+        p.push(1, 0); // mb_qp_delta_enable
+        p.push(1, 0); // flag
+        p.push(1, 0); // mode
+        p.push(2, 0); // reserved
+        p.push(1, 0); // extension bytes: none
     }
 
     /// Wrap a packed slice payload in the version-2 wire envelope

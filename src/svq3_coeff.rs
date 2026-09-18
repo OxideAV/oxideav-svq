@@ -402,47 +402,7 @@ mod tests {
     use super::*;
     use crate::svq3_scan::{ALT_SCAN_4X4_SCAN, NORMAL_ZIGZAG_4X4_SCAN};
 
-    /// Pack `(width, value)` items into bytes, MSB-first.
-    fn pack(items: &[(u32, u32)]) -> Vec<u8> {
-        let mut out: Vec<u8> = Vec::new();
-        let mut bit_cursor: usize = 0;
-        for &(width, value) in items {
-            assert!((1..=32).contains(&width));
-            assert!(width == 32 || value < (1u32 << width));
-            for i in (0..width).rev() {
-                let bit = ((value >> i) & 1) as u8;
-                let byte_idx = bit_cursor / 8;
-                if byte_idx >= out.len() {
-                    out.push(0);
-                }
-                let shift = 7 - (bit_cursor % 8);
-                out[byte_idx] |= bit << shift;
-                bit_cursor += 1;
-            }
-        }
-        out
-    }
-
-    /// Universal-code encoding helper (spec/06 §1 interleaved layout).
-    fn ue(n: u32) -> (u32, u32) {
-        let exp = 31 - (n + 1).leading_zeros();
-        let data = n + 1 - (1u32 << exp);
-        match exp {
-            0 => (1, 1),
-            1 => (3, 0b010 | data),
-            _ => {
-                let mut bits: u32 = 0b00;
-                bits = (bits << 1) | ((data >> (exp - 1)) & 1);
-                bits = (bits << 1) | ((data >> (exp - 2)) & 1);
-                let mut width = 4;
-                for i in (0..exp - 2).rev() {
-                    bits = (bits << 2) | ((data >> i) & 1);
-                    width += 2;
-                }
-                (width + 1, (bits << 1) | 1)
-            }
-        }
-    }
+    use crate::svq3_testutil::{pack, uvlc as ue};
 
     // ---- Book-shape invariants (tables/05 validation notes) ----------
 

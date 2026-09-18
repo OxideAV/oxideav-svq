@@ -6,6 +6,41 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- svq3: the universal code's bit layout is `0 d₁ 0 d₂ … 0 dₙ 1` — a
+  marker bit *before* every data bit, closed by a `1` (spec/06 §1 /
+  spec/07 §1, docs round 6). The earlier reader placed the first data
+  bit after two leading zeros, which agreed only for code numbers 0,
+  2, 3 and 4; every macroblock-layer element read through it was
+  affected (`read_universal_code`, every test packer).
+- svq3: the `SEQH` flag group is parsed bit for bit per spec/02 §3 —
+  `postfilter_hint` (bit 3), `extended_mode` (bit 4), the two
+  reserved `1`s, `no_b_frames`, the reserved `0`, the bit-9 escape
+  for further data bytes and the `protected` flag (bit 10); the
+  earlier parser folded bits 3–6 into `unknown4` and took bit 8 as the
+  escape. `frame_size_code` 5 selects SVQ3's own `1152 × 1408`
+  (spec/02 §2), not the SVQ1 table's slot.
+- svq3: the slice header follows spec/07 §3.1/§3.2 — `encrypted` (type
+  1) or `first_mb` with `N = max(6, ⌈log₂(mb_count + 1)⌉)` (type 2),
+  `picture_id`, `qp`, `mb_qp_delta_enable`, the unassigned flag, the
+  protected-only bit, `mode` (which must echo `SEQH` bit 4), the
+  reserved `u(2)`, then the extension-byte loop. The two "reserved bits
+  closing the header" of r450 were the `mode` bit plus the reserved
+  pair read before the loop terminator, not after it.
+
+### Added
+
+- svq3: the extended-mode slice-header read sequence of spec/07 §3.3
+  (`Svq3ExtendedModeFields`: the `a…e` group after `mode`, the
+  `f…h` group plus four `uvlc` values and the trailing bits after the
+  extension bytes) is parsed when `mode = 1`; its semantics stay
+  unspecified and the macroblock layer of that mode is not decoded.
+- svq3: `classify_packet_byte` / `Svq3PacketKind` for the spec/07 §2
+  packet byte (`L = (b >> 5) & 3`, `T = b & 0x9f`, bit-7 types
+  rejected, the type-0 zero packet), and `parse_wire_slice` now
+  returns the unpermuted payload plus the packet's byte length.
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-svq/compare/v0.0.2...v0.0.3) - 2026-08-23
 
 ### Other
