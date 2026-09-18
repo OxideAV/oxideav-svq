@@ -190,6 +190,7 @@ pub use crate::header::{
     parse_frame_header, ChecksumTrailer, EmbeddedString, Svq1FrameHeader, Svq1PictureType,
     FRAME_SIZE_TABLE,
 };
+pub use crate::svq3_frame::{Svq3DecodeOptions, Svq3DecodedPicture, Svq3PictureDecoder};
 
 #[cfg(feature = "registry")]
 pub use crate::registry::{

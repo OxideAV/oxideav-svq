@@ -521,12 +521,13 @@ impl<'a> PictureState<'a> {
                 (median3(av.0, bv.0, cv.0), median3(av.1, bv.1, cv.1))
             }
         };
-        // Clamp the referenced position to [0, 6·(W − w)] × [0, 6·(H − h)].
-        let (wpic, hpic) = ((self.mb_cols * 16) as i32, (self.mb_rows * 16) as i32);
-        let abs_x = (6 * x as i32 + px).clamp(0, 6 * (wpic - w as i32));
-        let abs_y = (6 * y as i32 + py).clamp(0, 6 * (hpic - h as i32));
-        px = abs_x - 6 * x as i32;
-        py = abs_y - 6 * y as i32;
+        // Clamp the referenced position to [0, 6·(W − w)] × [0, 6·(H − h)]
+        // (in i64: a hostile stored vector may sit at the i32 extremes).
+        let (wpic, hpic) = ((self.mb_cols * 16) as i64, (self.mb_rows * 16) as i64);
+        let abs_x = (6 * x as i64 + px as i64).clamp(0, 6 * (wpic - w as i64));
+        let abs_y = (6 * y as i64 + py as i64).clamp(0, 6 * (hpic - h as i64));
+        px = (abs_x - 6 * x as i64) as i32;
+        py = (abs_y - 6 * y as i64) as i32;
         (px, py)
     }
 
@@ -574,13 +575,14 @@ impl<'a> PictureState<'a> {
             let mvd = read_mv_difference(br)?;
             let (x, y) = (mb_x + ox, mb_y + oy);
             let (pred_x, pred_y) = self.predict_mv(x, y, w, h);
+            // Saturating: a hostile difference may be near the i32 limits.
             let mv = (
-                convert_predictor(pred_x, precision) + mvd.dx,
-                convert_predictor(pred_y, precision) + mvd.dy,
+                convert_predictor(pred_x, precision).saturating_add(mvd.dx),
+                convert_predictor(pred_y, precision).saturating_add(mvd.dy),
             );
             let stored = (
-                mv.0 * stored_scale(precision),
-                mv.1 * stored_scale(precision),
+                mv.0.saturating_mul(stored_scale(precision)),
+                mv.1.saturating_mul(stored_scale(precision)),
             );
             self.store_partition_mv(x, y, w, h, stored);
 
@@ -1805,5 +1807,35 @@ mod tests {
         assert_eq!(d.picture.luma_sample(5, 20), 128);
         assert_eq!(d.picture.luma_sample(20, 20), lifted);
         assert!(d.picture.cb().iter().all(|&s| s == 128));
+    }
+
+    #[test]
+    fn hostile_motion_vector_differences_saturate() {
+        // Found by fuzz/svq3_access_units: a difference near the i32
+        // limits overflowed the predictor add / stored multiply. Every
+        // such vector must decode (edge-replicated) or error, never
+        // panic.
+        let seqh = seqh_32x32();
+        let mut dec = Svq3PictureDecoder::new(seqh).unwrap();
+        reference_with_lifted_mb3(&mut dec);
+        for (dy, dx) in [
+            (i32::MAX, 0),
+            (0, i32::MIN + 1),
+            (i32::MAX, i32::MAX),
+            (i32::MIN + 1, i32::MIN + 1),
+            (-1, i32::MAX),
+        ] {
+            let mut p = Packer::new();
+            slice_header(&mut p, 0, 13, false);
+            p.ue(1);
+            p.se(dy);
+            p.se(dx);
+            p.ue(0);
+            for _ in 0..3 {
+                p.ue(0);
+            }
+            let au = wire_v1(p.into_bytes());
+            let _ = dec.decode_access_unit(&au);
+        }
     }
 }

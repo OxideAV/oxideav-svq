@@ -79,12 +79,18 @@ pub fn filter_plane(samples: &mut [u8], width: usize, height: usize, limit: u8) 
         return;
     }
     debug_assert_eq!(samples.len(), width * height);
-    // Vertical edges first: x = 4k, k = 1 … ⌊(w − 1)/4⌋, every row.
+    // Vertical edges first: x = 4k, k = 1 … ⌊(w − 1)/4⌋, every row. On
+    // the macroblock-aligned planes the decoder filters, q1 = x + 1 is
+    // always inside the plane; for other widths (spec/09 §7: not
+    // established) an edge whose q1 would fall outside is skipped.
     let last_x_edge = (width - 1) / 4;
     for y in 0..height {
         let row = &mut samples[y * width..(y + 1) * width];
         for k in 1..=last_x_edge {
             let x = 4 * k;
+            if x + 1 >= width {
+                break;
+            }
             let (p0, q0) = filter_edge(row[x - 2], row[x - 1], row[x], row[x + 1], limit);
             row[x - 1] = p0;
             row[x] = q0;
@@ -95,6 +101,9 @@ pub fn filter_plane(samples: &mut [u8], width: usize, height: usize, limit: u8) 
     let last_y_edge = (height - 1) / 4;
     for k in 1..=last_y_edge {
         let y = 4 * k;
+        if y + 1 >= height {
+            break;
+        }
         for x in 0..width {
             let i = |row: usize| row * width + x;
             let (p0, q0) = filter_edge(
@@ -213,6 +222,22 @@ mod tests {
         assert_eq!(at(28, 9), 4);
         assert_eq!(at(25, 11), 5);
         assert_eq!(at(25, 12), 4);
+    }
+
+    #[test]
+    fn non_aligned_plane_sizes_do_not_read_past_the_plane() {
+        // Found by fuzz/svq3_filter_mc: a height (or width) of 1 mod 4
+        // puts the last edge's q1 outside the plane; that edge is
+        // skipped (spec/09 §7 leaves non-16-multiple sizes open; the
+        // decoder itself only filters macroblock-aligned canvases).
+        for (w, h) in [(5usize, 5usize), (9, 1), (1, 9), (13, 6), (8, 5)] {
+            let mut plane: Vec<u8> = (0..(w * h)).map(|i| (i * 37 % 256) as u8).collect();
+            let before = plane.clone();
+            filter_plane(&mut plane, w, h, 5);
+            for (a, b) in before.iter().zip(&plane) {
+                assert!(a.abs_diff(*b) <= 10);
+            }
+        }
     }
 
     #[test]

@@ -88,3 +88,17 @@ path = "fuzz_targets/svq3_intra_frame.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "svq3_access_units"
+path = "fuzz_targets/svq3_access_units.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "svq3_filter_mc"
+path = "fuzz_targets/svq3_filter_mc.rs"
+test = false
+doc = false
+bench = false

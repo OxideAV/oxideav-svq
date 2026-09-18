@@ -85,6 +85,20 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- fuzz: `svq3_access_units` (I + P access-unit chains through
+  `Svq3PictureDecoder`, filter on and off, every partition shape and
+  sub-pel phase) and `svq3_filter_mc` (the edge filter and motion
+  compensation over arbitrary planes and vectors). Bounded runs of
+  every SVQ3 target found two defects fixed in the same round —
+  motion-vector differences near the i32 limits overflowed the
+  predictor add / stored multiply (now saturating, with the picture
+  clamp and motion-compensation origins computed in i64), and the edge
+  filter read one sample past a plane whose size is 1 mod 4 (an edge
+  whose `q1` falls outside is skipped; the decoder's own canvases are
+  macroblock-aligned) — both with regression tests.
+- svq3: `Svq3PictureDecoder`, `Svq3DecodeOptions` and
+  `Svq3DecodedPicture` are re-exported at the crate root as the direct
+  SVQ3 decode API alongside the registry `make_svq3_decoder`.
 - svq3: the P-slice inter macroblock layer of spec/08 — the skip type's
   zero-motion copy (§5); for types 1…7 the precision selector (§3),
   one motion-vector-difference pair per partition (vertical first,

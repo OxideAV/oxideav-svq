@@ -577,8 +577,14 @@ pub fn motion_compensate_block(
 ) -> Vec<u8> {
     let sx = split_mv_component(mv_x);
     let sy = split_mv_component(mv_y);
-    let ox = x + sx.integer_pel;
-    let oy = y + sy.integer_pel;
+    // Origins in i64 (a hostile vector may sit at the i32 extremes),
+    // then clamped to a window in which every read already replicates
+    // the same edge sample, so the per-sample i32 arithmetic is safe.
+    let window = |o: i64, extent: usize, span: usize| -> i32 {
+        o.clamp(-(span as i64) - 2, extent as i64 + 2) as i32
+    };
+    let ox = window(x as i64 + sx.integer_pel as i64, plane.width(), w);
+    let oy = window(y as i64 + sy.integer_pel as i64, plane.height(), h);
     let px = sx.frac_sixths;
     let py = sy.frac_sixths;
     let mut out = Vec::with_capacity(w * h);
