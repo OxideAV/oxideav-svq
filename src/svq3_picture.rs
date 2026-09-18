@@ -471,6 +471,27 @@ impl Svq3Picture {
         Ok(())
     }
 
+    /// Mutable luma plane (row-major, `luma_width × luma_height`).
+    #[inline]
+    #[must_use]
+    pub fn luma_mut(&mut self) -> &mut [u8] {
+        &mut self.luma
+    }
+
+    /// Mutable Cb plane (row-major, `chroma_width × chroma_height`).
+    #[inline]
+    #[must_use]
+    pub fn cb_mut(&mut self) -> &mut [u8] {
+        &mut self.cb
+    }
+
+    /// Mutable Cr plane (row-major, `chroma_width × chroma_height`).
+    #[inline]
+    #[must_use]
+    pub fn cr_mut(&mut self) -> &mut [u8] {
+        &mut self.cr
+    }
+
     /// Copy the macroblock at `pos` (16×16 luma, both 8×8 chroma blocks)
     /// from `reference` at the same position — the zero-motion copy of a
     /// P-slice skip macroblock (spec/08 §5) and of the macroblocks a P

@@ -85,6 +85,20 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- svq3: the intra-picture edge filter of spec/09 (`svq3_filter`): after
+  every I picture each plane's 4-sample block edges are smoothed by up
+  to `limit[quantiser]` (`tables/09`; luma with the quantiser in force
+  after the last macroblock, chroma with its remapped index) —
+  vertical edges first, then horizontal, `delta = trunc((4(q0 − p0) +
+  (p1 − q1)) / 8)` clipped to `±limit`. On by default
+  (`Svq3DecodeOptions::intra_edge_filter`, also
+  `Svq3DecoderHandle::set_options`): the filtered picture is displayed
+  and referenced, as in the vendor decoder; off, the decoder yields the
+  unfiltered reconstruction the fixtures' `expected.yuv` holds. Pinned
+  by the fixture harness: the 320×240 stream's second sync frame
+  filtered matches the component's own picture (SHA-256
+  `7f07e2acc656…`, spec/09 §6), its first sync frame and the 240×128
+  stream are unchanged by the pass.
 - svq3: `Svq3PictureDecoder` (`svq3_frame`) — the stateful access-unit
   decoder: the spec/07 §2 packet walk (slices, zero packets, the end
   marker), the §4 macroblock loop with its byte-boundary end test,

@@ -159,6 +159,8 @@ pub mod svq3_coeff;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq3_dequant;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
+pub mod svq3_filter;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq3_frame;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq3_mb;

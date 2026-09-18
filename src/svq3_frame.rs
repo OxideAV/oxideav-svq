@@ -641,7 +641,12 @@ impl Svq3PictureDecoder {
         }
 
         let frame_type = st.frame_type;
-        let picture = st.picture;
+        let mut picture = st.picture;
+        if frame_type == Svq3FrameType::Intra && self.options.intra_edge_filter {
+            // spec/09 §1–§2: after the last macroblock of an I picture,
+            // with the luma quantiser then in force.
+            crate::svq3_filter::filter_intra_picture(&mut picture, st.qp);
+        }
         self.reference = Some(picture.clone());
         Ok(Svq3DecodedPicture {
             picture,
