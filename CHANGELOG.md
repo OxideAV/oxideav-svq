@@ -6,6 +6,18 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-svq/compare/v0.0.3...v0.0.4) - 2026-09-18
+
+### Other
+
+- svq3 README + CHANGELOG: I/P decode byte-exact on all 10 fixture access units; package excludes
+- svq3 fuzz: access-unit + filter/MC targets; saturating vectors, bounded filter sweeps
+- spec/08 P-slice inter layer — all 10 fixture access units byte-exact
+- spec/09 intra-picture edge filter — filtered AU2 matches the component's picture
+- spec/07 macroblock layer — three I access units byte-exact on the staged fixtures
+- tables 07–09 mirrored + macroblock types and intra-4x4 modes per spec/07 §5/§10
+- universal code bit layout, SEQH flag group and slice header per docs round 6–8
+
 ### Changed
 
 - Package metadata: the description now names the SVQ3 decoder;
