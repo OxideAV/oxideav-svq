@@ -57,7 +57,7 @@ use crate::svq3::{
     read_universal_code, Svq3FrameType, Svq3MacroblockPosition, Svq3PacketKind, Svq3SequenceHeader,
     Svq3SliceHeader,
 };
-use crate::svq3_cbp::{read_cbp_intra, CodedBlockPattern};
+use crate::svq3_cbp::{read_cbp_inter, read_cbp_intra, CodedBlockPattern};
 use crate::svq3_coeff::{
     decode_chroma_dc_2x2, decode_residual_4x4_alt, decode_residual_4x4_normal,
 };
@@ -65,18 +65,21 @@ use crate::svq3_dequant::{
     dequantize_transform_luma_block, luma_dc_secondary_transform, DEQUANT_COEFF_TABLE_LEN,
 };
 use crate::svq3_mb::{
-    classify_mb_type, decode_intra_4x4_modes_with_context, Intra16x16Params, IntraMbKind,
-    PFrameInterMode, Svq3MbType, INTRA_4X4_BLOCK_RASTER, INTRA_4X4_CONTEXT_OTHER,
+    classify_mb_type, decode_intra_4x4_modes_with_context, read_inter_mv_precision_p_frame,
+    Intra16x16Params, IntraMbKind, PFrameInterMode, Svq3MbType, Svq3MvPrecision,
+    INTRA_4X4_BLOCK_RASTER, INTRA_4X4_CONTEXT_OTHER,
 };
-use crate::svq3_mv::read_quantiser_delta;
+use crate::svq3_mc::{motion_compensate_block, motion_compensate_chroma_block};
+use crate::svq3_mv::{read_mv_difference, read_quantiser_delta};
 use crate::svq3_picture::{ChromaSelect, Svq3Picture};
 use crate::svq3_pred::{
     predict_chroma_dc_8x8, predict_intra_4x4, reconstruct_4x4, Svq3IntraMode, PRED_4X4_DIM,
     PRED_CHROMA_SAMPLES,
 };
 use crate::svq3_recon::{
-    reconstruct_chroma_plane_with_prediction, reconstruct_intra_16x16_luma_macroblock_with_dc,
-    ChromaPlane, LumaMacroblock, Svq3Luma16x16Mode,
+    add_luma_residual_blocks, reconstruct_chroma_plane_with_prediction,
+    reconstruct_intra_16x16_luma_macroblock_with_dc, ChromaPlane, LumaMacroblock,
+    Svq3Luma16x16Mode,
 };
 use crate::svq3_scan::{ALT_SCAN_4X4_SCAN, ALT_SCAN_QUANTISER_THRESHOLD, NORMAL_ZIGZAG_4X4_SCAN};
 
@@ -196,6 +199,49 @@ fn slice_ends(br: &BitReader<'_>, payload: &[u8]) -> bool {
     let byte = payload.get(pos / 8).copied().unwrap_or(0);
     let remaining_mask = (1u16 << (8 - pos % 8)) as u8 - 1;
     byte & remaining_mask == 0
+}
+
+/// Component-wise median of three (spec/08 §4.3).
+const fn median3(a: i32, b: i32, c: i32) -> i32 {
+    let hi = if a > b { a } else { b };
+    let lo = if a > b { b } else { a };
+    if c > hi {
+        hi
+    } else if c < lo {
+        lo
+    } else {
+        c
+    }
+}
+
+/// Convert a predictor in sixths to the coded unit of `precision`
+/// (spec/08 §4.2): full-pel `trunc((p + 3) / 6)` for `p ≥ 0`, else
+/// `trunc((p − 2) / 6)`; half-pel the same applied to `2p`; third-pel
+/// `(p + 1) >> 1`.
+const fn convert_predictor(p: i32, precision: Svq3MvPrecision) -> i32 {
+    match precision {
+        Svq3MvPrecision::Fullpel => round_to_sixths(p),
+        Svq3MvPrecision::Halfpel => round_to_sixths(2 * p),
+        Svq3MvPrecision::Thirdpel => (p + 1) >> 1,
+    }
+}
+
+const fn round_to_sixths(v: i32) -> i32 {
+    if v >= 0 {
+        (v + 3) / 6
+    } else {
+        (v - 2) / 6
+    }
+}
+
+/// The stored-vector multiplier of a coded unit: ×6 full, ×3 half,
+/// ×2 third (spec/08 §4.2).
+const fn stored_scale(precision: Svq3MvPrecision) -> i32 {
+    match precision {
+        Svq3MvPrecision::Fullpel => 6,
+        Svq3MvPrecision::Halfpel => 3,
+        Svq3MvPrecision::Thirdpel => 2,
+    }
 }
 
 /// Running state of one picture decode.
@@ -436,15 +482,172 @@ impl<'a> PictureState<'a> {
         Ok(())
     }
 
-    /// A P-slice inter macroblock (spec/08).
+    /// Whether 4×4 block `(bx, by)` (block units, possibly outside the
+    /// picture) is available for motion-vector prediction: inside the
+    /// picture and decoded in the current slice (spec/08 §4.3).
+    fn mv_block(&self, bx: i32, by: i32) -> Option<(i32, i32)> {
+        let cols = (self.mb_cols * 4) as i32;
+        let rows = (self.mb_rows * 4) as i32;
+        if bx < 0 || by < 0 || bx >= cols || by >= rows {
+            return None;
+        }
+        let i = self.block_index(bx as usize, by as usize);
+        (self.block_map[i] != 0).then_some(self.mv[i])
+    }
+
+    /// The motion-vector predictor of spec/08 §4.3 for a `w × h`
+    /// partition at luma position `(x, y)`: the median of the left
+    /// (`A`), above (`B`) and above-right (`C`, replaced by above-left
+    /// `D` when unavailable) blocks' vectors — that vector alone when
+    /// exactly one is available, `(0, 0)` when none — then clamped so
+    /// the referenced block lies inside the macroblock-aligned picture
+    /// (all in sixths).
+    fn predict_mv(&self, x: u32, y: u32, w: u32, h: u32) -> (i32, i32) {
+        let bx = (x / 4) as i32;
+        let by = (y / 4) as i32;
+        let a = self.mv_block(bx - 1, by);
+        let b = self.mv_block(bx, by - 1);
+        let c = self
+            .mv_block(bx + (w / 4) as i32, by - 1)
+            .or_else(|| self.mv_block(bx - 1, by - 1));
+        let available = [a, b, c].iter().filter(|v| v.is_some()).count();
+        let (mut px, mut py) = match available {
+            0 => (0, 0),
+            1 => a.or(b).or(c).unwrap_or((0, 0)),
+            _ => {
+                let av = a.unwrap_or((0, 0));
+                let bv = b.unwrap_or((0, 0));
+                let cv = c.unwrap_or((0, 0));
+                (median3(av.0, bv.0, cv.0), median3(av.1, bv.1, cv.1))
+            }
+        };
+        // Clamp the referenced position to [0, 6·(W − w)] × [0, 6·(H − h)].
+        let (wpic, hpic) = ((self.mb_cols * 16) as i32, (self.mb_rows * 16) as i32);
+        let abs_x = (6 * x as i32 + px).clamp(0, 6 * (wpic - w as i32));
+        let abs_y = (6 * y as i32 + py).clamp(0, 6 * (hpic - h as i32));
+        px = abs_x - 6 * x as i32;
+        py = abs_y - 6 * y as i32;
+        (px, py)
+    }
+
+    /// Store `mv` for every 4×4 block of a `w × h` partition at `(x, y)`
+    /// and mark the blocks decoded (context value 1).
+    fn store_partition_mv(&mut self, x: u32, y: u32, w: u32, h: u32, mv: (i32, i32)) {
+        for by in (y / 4)..((y + h) / 4) {
+            for bx in (x / 4)..((x + w) / 4) {
+                let i = self.block_index(bx as usize, by as usize);
+                self.mv[i] = mv;
+                self.block_map[i] = INTRA_4X4_CONTEXT_OTHER;
+            }
+        }
+    }
+
+    /// A P-slice inter macroblock (spec/08): the precision selector,
+    /// one motion-vector-difference pair per partition (vertical
+    /// first) predicted, clamped and converted per §4, the motion
+    /// compensation of the whole macroblock (luma and both chroma
+    /// planes), then the inter-table pattern, the conditional
+    /// quantiser delta and the residual of §6. The skip type copies the
+    /// co-located macroblock (§5).
     fn decode_inter_mb(
         &mut self,
-        _br: &mut BitReader<'_>,
-        _pos: Svq3MacroblockPosition,
-        _mode: PFrameInterMode,
+        br: &mut BitReader<'_>,
+        pos: Svq3MacroblockPosition,
+        mode: PFrameInterMode,
     ) -> Result<()> {
-        let _ = (self.seqh, self.reference, &self.mv, self.mb_rows);
-        Err(Error::NotImplemented)
+        let reference = self.reference.ok_or(Error::MissingReference)?;
+        let (mb_x, mb_y) = pos.luma_origin();
+
+        if mode == PFrameInterMode::Skip {
+            self.picture.copy_macroblock_from(reference, pos);
+            self.mark_macroblock(pos, [INTRA_4X4_CONTEXT_OTHER; 16], (0, 0));
+            return Ok(());
+        }
+
+        let precision =
+            read_inter_mv_precision_p_frame(br, self.seqh.has_thirdpel, self.seqh.has_halfpel)?;
+        let (w, h) = mode.partition_size();
+        let mut luma = [0u8; 256];
+        let mut cb = [0u8; 64];
+        let mut cr = [0u8; 64];
+        for (ox, oy) in mode.partition_offsets() {
+            let mvd = read_mv_difference(br)?;
+            let (x, y) = (mb_x + ox, mb_y + oy);
+            let (pred_x, pred_y) = self.predict_mv(x, y, w, h);
+            let mv = (
+                convert_predictor(pred_x, precision) + mvd.dx,
+                convert_predictor(pred_y, precision) + mvd.dy,
+            );
+            let stored = (
+                mv.0 * stored_scale(precision),
+                mv.1 * stored_scale(precision),
+            );
+            self.store_partition_mv(x, y, w, h, stored);
+
+            let luma_ref = reference.luma_reference();
+            let block = motion_compensate_block(
+                &luma_ref, x as i32, y as i32, w as usize, h as usize, stored.0, stored.1,
+            );
+            for r in 0..h as usize {
+                for c in 0..w as usize {
+                    luma[(oy as usize + r) * 16 + ox as usize + c] = block[r * w as usize + c];
+                }
+            }
+            for (plane, which) in [(&mut cb, ChromaSelect::Cb), (&mut cr, ChromaSelect::Cr)] {
+                let chroma_ref = reference.chroma_reference(which);
+                let block = motion_compensate_chroma_block(
+                    &chroma_ref,
+                    x as i32,
+                    y as i32,
+                    w as usize,
+                    h as usize,
+                    stored.0,
+                    stored.1,
+                );
+                let (cw, chh) = (w as usize / 2, h as usize / 2);
+                for r in 0..chh {
+                    for c in 0..cw {
+                        plane[(oy as usize / 2 + r) * 8 + ox as usize / 2 + c] = block[r * cw + c];
+                    }
+                }
+            }
+        }
+
+        // §6: pattern (inter table), conditional delta, residual.
+        let cbp = read_cbp_inter(br)?;
+        if cbp.value() != 0 && self.mb_qp_delta_enable {
+            self.apply_quantiser_delta(br)?;
+        }
+        let mut coeff_blocks = [[0i32; 16]; 16];
+        for quadrant in 0..4usize {
+            if !cbp.luma_quadrant_coded(quadrant) {
+                continue;
+            }
+            for sub in 0..4usize {
+                let cell = INTRA_4X4_BLOCK_RASTER[quadrant * 4 + sub] as usize;
+                decode_residual_4x4_normal(
+                    br,
+                    &NORMAL_ZIGZAG_4X4_SCAN,
+                    0,
+                    &mut coeff_blocks[cell],
+                )?;
+            }
+        }
+        let chroma = decode_chroma_section(br, cbp.chroma)?;
+
+        add_luma_residual_blocks(&mut luma, &coeff_blocks, self.qp);
+        let mut mb = LumaMacroblock::new();
+        mb.samples = luma;
+        self.picture.blit_luma(pos, &mb);
+        for (which, predicted, dc, ac) in [
+            (ChromaSelect::Cb, &cb, chroma.cb_dc, &chroma.cb_ac),
+            (ChromaSelect::Cr, &cr, chroma.cr_dc, &chroma.cr_ac),
+        ] {
+            let mut plane = ChromaPlane::new();
+            plane.samples = reconstruct_chroma_plane_with_prediction(predicted, dc, ac, self.qp);
+            self.picture.blit_chroma(pos, which, &plane);
+        }
+        Ok(())
     }
 
     /// Decode the macroblocks of one slice (spec/07 §4), returning the
@@ -1379,5 +1582,228 @@ mod tests {
             .map(|(x, y)| pic.luma_sample(x, y))
             .collect();
         assert!(block.iter().any(|&s| s != block[0]));
+    }
+
+    #[test]
+    fn predictor_conversion_matches_spec08() {
+        // spec/08 §4.2: full-pel trunc((p+3)/6) / trunc((p−2)/6).
+        assert_eq!(convert_predictor(0, Svq3MvPrecision::Fullpel), 0);
+        assert_eq!(convert_predictor(3, Svq3MvPrecision::Fullpel), 1);
+        assert_eq!(convert_predictor(2, Svq3MvPrecision::Fullpel), 0);
+        assert_eq!(convert_predictor(-3, Svq3MvPrecision::Fullpel), 0);
+        assert_eq!(convert_predictor(-4, Svq3MvPrecision::Fullpel), -1);
+        assert_eq!(convert_predictor(9, Svq3MvPrecision::Fullpel), 2);
+        // Half-pel: the same on 2p.
+        assert_eq!(convert_predictor(3, Svq3MvPrecision::Halfpel), 1);
+        assert_eq!(convert_predictor(1, Svq3MvPrecision::Halfpel), 0);
+        assert_eq!(convert_predictor(2, Svq3MvPrecision::Halfpel), 1);
+        assert_eq!(convert_predictor(-2, Svq3MvPrecision::Halfpel), -1);
+        assert_eq!(convert_predictor(-1, Svq3MvPrecision::Halfpel), 0);
+        // Third-pel: (p + 1) >> 1.
+        assert_eq!(convert_predictor(2, Svq3MvPrecision::Thirdpel), 1);
+        assert_eq!(convert_predictor(1, Svq3MvPrecision::Thirdpel), 1);
+        assert_eq!(convert_predictor(-1, Svq3MvPrecision::Thirdpel), 0);
+        assert_eq!(convert_predictor(-2, Svq3MvPrecision::Thirdpel), -1); // arithmetic shift floors
+        assert_eq!(convert_predictor(-3, Svq3MvPrecision::Thirdpel), -1);
+        assert_eq!(stored_scale(Svq3MvPrecision::Fullpel), 6);
+        assert_eq!(stored_scale(Svq3MvPrecision::Halfpel), 3);
+        assert_eq!(stored_scale(Svq3MvPrecision::Thirdpel), 2);
+        assert_eq!(median3(1, 5, 3), 3);
+        assert_eq!(median3(5, 1, 3), 3);
+        assert_eq!(median3(-4, -4, 9), -4);
+        assert_eq!(median3(2, 2, 2), 2);
+    }
+
+    #[test]
+    fn mv_predictor_availability_median_and_clamp() {
+        let seqh = seqh_32x32();
+        let mut st = PictureState::new(&seqh, None, Svq3FrameType::Predicted).unwrap();
+        // Nothing decoded: (0, 0).
+        assert_eq!(st.predict_mv(16, 16, 16, 16), (0, 0));
+        // Only A (left macroblock) decoded: its vector alone (inside
+        // the clamp window: 96 − 6 and 96 − 12 sixths).
+        st.store_partition_mv(0, 16, 16, 16, (-6, -12));
+        assert_eq!(st.predict_mv(16, 16, 16, 16), (-6, -12));
+        // A and B: C = above-right (32, 12) is outside the picture and
+        // D = above-left (12, 12) is undecoded → median(A, B, (0, 0)).
+        st.store_partition_mv(16, 0, 16, 16, (18, 6));
+        assert_eq!(st.predict_mv(16, 16, 16, 16), (0, 0));
+        // D available → median(A, B, D).
+        st.store_partition_mv(0, 0, 16, 16, (-30, -30));
+        assert_eq!(st.predict_mv(16, 16, 16, 16), (-6, -12));
+        // Clamp: a predictor pointing left of the picture for the
+        // macroblock at x = 0 is pulled to 0; at the right edge the
+        // referenced block must end inside the 32-wide picture.
+        let mut st = PictureState::new(&seqh, None, Svq3FrameType::Predicted).unwrap();
+        st.store_partition_mv(0, 0, 16, 16, (-60, 0));
+        assert_eq!(st.predict_mv(0, 16, 16, 16), (0, 0));
+        let mut st = PictureState::new(&seqh, None, Svq3FrameType::Predicted).unwrap();
+        st.store_partition_mv(0, 0, 16, 16, (60, 60));
+        // For (16, 0) 16×16: A = (60, 60) only → clamp x to 6·(32−16) −
+        // 96 = 0, y to 6·(32−16) − 0 = 96 → (0, 60).
+        assert_eq!(st.predict_mv(16, 0, 16, 16), (0, 60));
+    }
+
+    /// A reference picture for the P tests: a flat-128 I picture whose
+    /// bottom-right macroblock (16…31, 16…31) is lifted by a 16×16 DC
+    /// coefficient (nothing is decoded after it, so the DC chain does
+    /// not propagate the lift). Returns the lifted value.
+    fn reference_with_lifted_mb3(dec: &mut Svq3PictureDecoder) -> u8 {
+        // The inter tests read the seam between the lifted macroblock
+        // and its flat neighbours, so the edge filter stays off.
+        dec.set_options(Svq3DecodeOptions {
+            intra_edge_filter: false,
+        });
+        let mut p = Packer::new();
+        intra_slice_header(&mut p, 13, false);
+        for _ in 0..3 {
+            push_empty_i4_mb(&mut p);
+        }
+        p.ue(1);
+        p.se(0);
+        p.ue(15);
+        p.ue(0);
+        let au = wire_v1(p.into_bytes());
+        let d = dec.decode_access_unit(&au).unwrap();
+        assert_eq!(d.frame_type, Svq3FrameType::Intra);
+        let lifted = d.picture.luma_sample(16, 16);
+        assert_ne!(lifted, 128);
+        assert_eq!(d.picture.luma_sample(15, 16), 128);
+        assert_eq!(d.picture.luma_sample(16, 15), 128);
+        lifted
+    }
+
+    #[test]
+    fn p_slice_skip_and_inter_macroblocks_predict_from_the_reference() {
+        let seqh = seqh_32x32(); // no sub-pel precisions → no selector bits
+        let mut dec = Svq3PictureDecoder::new(seqh).unwrap();
+        let lifted = reference_with_lifted_mb3(&mut dec);
+
+        let mut p = Packer::new();
+        slice_header(&mut p, 0, 13, false);
+        // MB0, MB1: skip (flat 128 copies, vectors (0, 0)).
+        p.ue(0);
+        p.ue(0);
+        // MB2 (0, 16): inter 16×16, mvd (dy 0, dx +1). Predictor: no A,
+        // B = MB0 and C = MB1 both (0, 0) → (0, 0); full-pel +1 → stored
+        // (6, 0): the block reads x = 1…16 of rows 16…31, so its column
+        // 15 sees the lifted macroblock and the rest is 128. Inter
+        // pattern code 0 → nothing coded.
+        p.ue(1);
+        p.se(0);
+        p.se(1);
+        p.ue(0);
+        // MB3 (16, 16): inter 8×8 (code 4), four zero mvd pairs. Every
+        // partition's median lands on (0, 0) (A = MB2's (6, 0) is
+        // outvoted by B / C = (0, 0)), so the lifted block is copied.
+        p.ue(4);
+        for _ in 0..4 {
+            p.se(0);
+            p.se(0);
+        }
+        p.ue(0);
+        let au = wire_v1(p.into_bytes());
+        let d = dec.decode_access_unit(&au).unwrap();
+        assert_eq!(d.frame_type, Svq3FrameType::Predicted);
+        let pic = &d.picture;
+        for y in 0..16 {
+            for x in 0..32 {
+                assert_eq!(pic.luma_sample(x, y), 128, "skip row ({x},{y})");
+            }
+        }
+        for y in 16..32 {
+            for x in 0..15 {
+                assert_eq!(pic.luma_sample(x, y), 128, "MB2 ({x},{y})");
+            }
+            assert_eq!(pic.luma_sample(15, y), lifted, "MB2 column 15 row {y}");
+            for x in 16..32 {
+                assert_eq!(pic.luma_sample(x, y), lifted, "MB3 ({x},{y})");
+            }
+        }
+        assert!(pic.cb().iter().all(|&s| s == 128));
+        // The P picture is now the reference: a further all-skip P
+        // picture reproduces it.
+        let mut p = Packer::new();
+        slice_header(&mut p, 0, 13, false);
+        for _ in 0..4 {
+            p.ue(0);
+        }
+        let au = wire_v1(p.into_bytes());
+        let d2 = dec.decode_access_unit(&au).unwrap();
+        assert_eq!(d2.picture.luma(), pic.luma());
+    }
+
+    #[test]
+    fn p_slice_inter_residual_and_delta() {
+        let seqh = seqh_32x32();
+        let mut dec = Svq3PictureDecoder::new(seqh).unwrap();
+        reference_with_lifted_mb3(&mut dec);
+        // Delta enable set. MB0: inter 16×16, zero mvd, inter pattern
+        // code 2 → luma quadrant 0 only; delta +1 → qp 14; block 0 = +1
+        // at the DC (dequant[14] = 19561 → (19561·169 + 0x80000) >> 20
+        // = 3), three empty blocks. Then three skips.
+        let mut p = Packer::new();
+        slice_header(&mut p, 0, 13, true);
+        p.ue(1);
+        p.se(0);
+        p.se(0);
+        p.ue(2);
+        p.se(1);
+        p.ue(1);
+        p.ue(0);
+        for _ in 0..3 {
+            p.ue(0);
+        }
+        for _ in 0..3 {
+            p.ue(0);
+        }
+        let au = wire_v1(p.into_bytes());
+        let d = dec.decode_access_unit(&au).unwrap();
+        let pic = &d.picture;
+        let expected = crate::svq3_pred::reconstruct_sample(
+            128,
+            crate::svq3_dequant::finalise_dc(169 * 19561),
+        );
+        assert_eq!(expected, 131);
+        assert_eq!(pic.luma_sample(0, 0), expected);
+        assert_eq!(pic.luma_sample(3, 3), expected);
+        assert_eq!(pic.luma_sample(4, 0), 128);
+        assert_eq!(pic.luma_sample(8, 8), 128);
+    }
+
+    #[test]
+    fn p_slice_uncoded_tail_is_copied_from_the_reference() {
+        // A type-2 P slice covering only macroblock 0; the remaining
+        // three are copied from the reference (spec/08 §7).
+        let seqh = seqh_32x32();
+        let mut dec = Svq3PictureDecoder::new(seqh).unwrap();
+        let lifted = reference_with_lifted_mb3(&mut dec);
+        let mut p = Packer::new();
+        p.ue(0); // P
+        p.push(6, 0); // first_mb
+        p.push(8, 0);
+        p.push(5, 13);
+        p.push(1, 0);
+        p.push(1, 0);
+        p.push(1, 0);
+        p.push(2, 0);
+        p.push(1, 0);
+        // MB0: inter 16×16 with mvd (+1, +1) full-pel → reads
+        // (1…16, 1…16): only its sample (15, 15) sees the lifted block.
+        p.ue(1);
+        p.se(1);
+        p.se(1);
+        p.ue(0);
+        let mut au = wire_v2_slice(p.into_bytes());
+        au.push(SVQ3_FRAME_END);
+        let d = dec.decode_access_unit(&au).unwrap();
+        assert_eq!(d.picture.luma_sample(0, 0), 128);
+        assert_eq!(d.picture.luma_sample(14, 15), 128);
+        assert_eq!(d.picture.luma_sample(15, 15), lifted);
+        // The uncoded tail: MB1 / MB2 flat, MB3 lifted.
+        assert_eq!(d.picture.luma_sample(20, 5), 128);
+        assert_eq!(d.picture.luma_sample(5, 20), 128);
+        assert_eq!(d.picture.luma_sample(20, 20), lifted);
+        assert!(d.picture.cb().iter().all(|&s| s == 128));
     }
 }

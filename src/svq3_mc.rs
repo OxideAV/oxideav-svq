@@ -546,6 +546,122 @@ pub fn predict_inter_block_fullpel(
     ))
 }
 
+/// Predict one `w × h` block whose top-left sample is at plane position
+/// `(x, y)` displaced by the stored motion vector `(mv_x, mv_y)` in
+/// sixths of a sample (spec/05 §3), with the interpolation kernels of
+/// spec/05 §4:
+///
+/// * phase 0 — the full-sample copy;
+/// * phase 3 (half) — `(A + B + 1) >> 1` along one axis, and the
+///   bilinear `(A + B + C + D + 2) >> 2` when both axes are half
+///   (spec/05 §4.3 names the two-dimensional half-pel routine without
+///   stating its formula; this is the plain bilinear reading);
+/// * phases 2 / 4 (third) — `(4A + 2B + 3) / 6` and `(2A + 4B + 3) / 6`
+///   along one axis, `(4·near + 3·edge + 3·edge + 2·far + 6) / 12` with
+///   weight 4 on the corner nearest the produced sample when both axes
+///   are third (spec/05 §4.1–§4.2);
+/// * phases 1 / 5 do not occur for conforming vectors (no kernel
+///   exists); they are treated as the nearer third-pel phase.
+///
+/// Reads outside the plane replicate the edge samples
+/// ([`ReferencePlane::sample_clamped`]). Output is row-major.
+#[must_use]
+pub fn motion_compensate_block(
+    plane: &ReferencePlane<'_>,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    mv_x: i32,
+    mv_y: i32,
+) -> Vec<u8> {
+    let sx = split_mv_component(mv_x);
+    let sy = split_mv_component(mv_y);
+    let ox = x + sx.integer_pel;
+    let oy = y + sy.integer_pel;
+    let px = sx.frac_sixths;
+    let py = sy.frac_sixths;
+    let mut out = Vec::with_capacity(w * h);
+    for row in 0..h {
+        let ry = oy + row as i32;
+        for col in 0..w {
+            let rx = ox + col as i32;
+            let s = |dx: i32, dy: i32| plane.sample_clamped(rx + dx, ry + dy) as i32;
+            let v = match (px, py) {
+                (0, 0) => s(0, 0),
+                (3, 0) => (s(0, 0) + s(1, 0) + 1) >> 1,
+                (0, 3) => (s(0, 0) + s(0, 1) + 1) >> 1,
+                (3, 3) => (s(0, 0) + s(1, 0) + s(0, 1) + s(1, 1) + 2) >> 2,
+                (fx, 0) => third_1d(s(0, 0), s(1, 0), fx),
+                (0, fy) => third_1d(s(0, 0), s(0, 1), fy),
+                (fx, 3) | (3, fx) if px == 3 || py == 3 => {
+                    // A half phase on one axis with a third phase on the
+                    // other cannot occur (precision is per macroblock);
+                    // resolve as bilinear-then-third for robustness.
+                    let (a, b) = if px == 3 {
+                        ((s(0, 0) + s(1, 0) + 1) >> 1, (s(0, 1) + s(1, 1) + 1) >> 1)
+                    } else {
+                        ((s(0, 0) + s(0, 1) + 1) >> 1, (s(1, 0) + s(1, 1) + 1) >> 1)
+                    };
+                    third_1d(a, b, fx)
+                }
+                (fx, fy) => third_2d(s(0, 0), s(1, 0), s(0, 1), s(1, 1), fx, fy),
+            };
+            out.push(clip1_u8(v));
+        }
+    }
+    out
+}
+
+/// One-dimensional third-pel kernel for phase `f` sixths (1…2 → 1/3,
+/// 4…5 → 2/3): `(4A + 2B + 3) / 6` or `(2A + 4B + 3) / 6`.
+const fn third_1d(a: i32, b: i32, f: u32) -> i32 {
+    if f <= 2 {
+        (4 * a + 2 * b + 3) / 6
+    } else {
+        (2 * a + 4 * b + 3) / 6
+    }
+}
+
+/// Two-dimensional third-pel kernel `(4·near + 3 + 3 + 2·far + 6) / 12`
+/// over the corners `s00 s10 / s01 s11`, weight 4 on the corner nearest
+/// the produced sample (`fx`, `fy` in sixths).
+const fn third_2d(s00: i32, s10: i32, s01: i32, s11: i32, fx: u32, fy: u32) -> i32 {
+    let right = fx > 3;
+    let down = fy > 3;
+    let (near, ex, ey, far) = match (right, down) {
+        (false, false) => (s00, s10, s01, s11),
+        (true, false) => (s10, s00, s11, s01),
+        (false, true) => (s01, s11, s00, s10),
+        (true, true) => (s11, s01, s10, s00),
+    };
+    (4 * near + 3 * ex + 3 * ey + 2 * far + 6) / 12
+}
+
+/// Motion-compensate one chroma block of a partition whose luma
+/// origin is `(x, y)` with size `w × h` (luma samples) and stored luma
+/// vector `(mv_x, mv_y)` in sixths: the chroma block is `w/2 × h/2` at
+/// `(x/2, y/2)` and the chroma displacement is the luma vector halved
+/// (spec/08 §6), i.e. `mv/2` chroma sixths with the phase mapped onto
+/// the available kernels by [`motion_compensate_block`].
+///
+/// The docs leave the chroma sub-sample phase unspecified; this
+/// reading (exact halving, truncating toward zero) is pinned on the
+/// fixtures' full-pel vectors (odd luma displacements → half-pel
+/// chroma) and is a docs ask for half- and third-pel vectors.
+#[must_use]
+pub fn motion_compensate_chroma_block(
+    plane: &ReferencePlane<'_>,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    mv_x: i32,
+    mv_y: i32,
+) -> Vec<u8> {
+    motion_compensate_block(plane, x / 2, y / 2, w / 2, h / 2, mv_x / 2, mv_y / 2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1235,5 +1351,97 @@ mod tests {
         // dx = -1 sixth → integer_pel -1 + frac 5 (non-zero) → None.
         let mv = Svq3MotionVector { dx: -1, dy: 0 };
         assert!(predict_inter_block_fullpel(&plane, 2, 2, 4, 4, mv).is_none());
+    }
+
+    fn ramp8() -> Vec<u8> {
+        // 8×8 plane: sample = 10·x + y.
+        (0..64).map(|i| (10 * (i % 8) + i / 8) as u8).collect()
+    }
+
+    #[test]
+    fn mc_full_half_and_third_phases() {
+        let data = ramp8();
+        let plane = ReferencePlane::new(&data, 8, 8).unwrap();
+        // Full-pel: displacement +1 sample in x.
+        assert_eq!(
+            motion_compensate_block(&plane, 2, 2, 2, 1, 6, 0),
+            vec![32, 42]
+        );
+        // Half-pel horizontal: (A + B + 1) >> 1 = (22 + 32 + 1) >> 1 = 27.
+        assert_eq!(motion_compensate_block(&plane, 2, 2, 1, 1, 3, 0), vec![27]);
+        // Half-pel vertical: (22 + 23 + 1) >> 1 = 23.
+        assert_eq!(motion_compensate_block(&plane, 2, 2, 1, 1, 0, 3), vec![23]);
+        // Half-pel both: (22 + 32 + 23 + 33 + 2) >> 2 = 28.
+        assert_eq!(motion_compensate_block(&plane, 2, 2, 1, 1, 3, 3), vec![28]);
+        // Third-pel 1/3 horizontal: (4·22 + 2·32 + 3) / 6 = 155 / 6 = 25.
+        assert_eq!(motion_compensate_block(&plane, 2, 2, 1, 1, 2, 0), vec![25]);
+        // Third-pel 2/3 horizontal: (2·22 + 4·32 + 3) / 6 = 175 / 6 = 29.
+        assert_eq!(motion_compensate_block(&plane, 2, 2, 1, 1, 4, 0), vec![29]);
+        // Third-pel (1/3, 1/3): (4·22 + 3·32 + 3·23 + 2·33 + 6) / 12
+        //   = (88 + 96 + 69 + 66 + 6) / 12 = 325 / 12 = 27.
+        assert_eq!(motion_compensate_block(&plane, 2, 2, 1, 1, 2, 2), vec![27]);
+        // Third-pel (2/3, 2/3): weight 4 on (x+1, y+1) = 33:
+        //   (4·33 + 3·23 + 3·32 + 2·22 + 6) / 12 = (132 + 69 + 96 + 44 + 6) / 12 = 28.
+        assert_eq!(motion_compensate_block(&plane, 2, 2, 1, 1, 4, 4), vec![28]);
+        // Negative vectors floor toward −∞ with a positive phase:
+        // −1 sixth = −1 sample + 5/6 → 2/3 kernel between x = 1 and 2:
+        // (2·12 + 4·22 + 3) / 6 = 115 / 6 = 19.
+        assert_eq!(motion_compensate_block(&plane, 2, 2, 1, 1, -1, 0), vec![19]);
+    }
+
+    #[test]
+    fn mc_spec05_measured_rows() {
+        // spec/05 §4.1 / §4.3 measured source row 0,10,20,30,100,200,255,7,9.
+        let row = [0u8, 10, 20, 30, 100, 200, 255, 7, 9];
+        let plane = ReferencePlane::new(&row, 9, 1).unwrap();
+        assert_eq!(
+            motion_compensate_block(&plane, 0, 0, 8, 1, 2, 0),
+            vec![3, 13, 23, 53, 133, 218, 172, 8]
+        );
+        assert_eq!(
+            motion_compensate_block(&plane, 0, 0, 8, 1, 4, 0),
+            vec![7, 17, 27, 77, 167, 237, 90, 8]
+        );
+        assert_eq!(
+            motion_compensate_block(&plane, 0, 0, 8, 1, 3, 0),
+            vec![5, 15, 25, 65, 150, 228, 131, 8]
+        );
+        assert_eq!(
+            motion_compensate_block(&plane, 0, 0, 9, 1, 0, 0),
+            row.to_vec()
+        );
+    }
+
+    #[test]
+    fn mc_edge_replication() {
+        let data = ramp8();
+        let plane = ReferencePlane::new(&data, 8, 8).unwrap();
+        // Reading left of the plane replicates column 0.
+        assert_eq!(
+            motion_compensate_block(&plane, 0, 0, 2, 1, -12, 0),
+            vec![0, 0]
+        );
+        // Reading below replicates row 7.
+        assert_eq!(
+            motion_compensate_block(&plane, 3, 7, 1, 2, 0, 6),
+            vec![37, 37]
+        );
+    }
+
+    #[test]
+    fn chroma_block_halves_position_size_and_vector() {
+        let data = ramp8();
+        let plane = ReferencePlane::new(&data, 8, 8).unwrap();
+        // Luma partition (4, 4) 8×4, luma vector +2 samples in x (12
+        // sixths) → chroma (2, 2) 4×2 displaced +1 chroma sample.
+        let got = motion_compensate_chroma_block(&plane, 4, 4, 8, 4, 12, 0);
+        assert_eq!(got, motion_compensate_block(&plane, 2, 2, 4, 2, 6, 0));
+        // An odd luma displacement (+1 sample = 6 sixths) is a chroma
+        // half-pel (3 sixths).
+        let got = motion_compensate_chroma_block(&plane, 4, 4, 8, 4, 6, 0);
+        assert_eq!(got, motion_compensate_block(&plane, 2, 2, 4, 2, 3, 0));
+        // Negative: −6 → −3 (truncation toward zero).
+        let got = motion_compensate_chroma_block(&plane, 4, 4, 8, 4, -6, 0);
+        assert_eq!(got, motion_compensate_block(&plane, 2, 2, 4, 2, -3, 0));
     }
 }

@@ -85,6 +85,25 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- svq3: the P-slice inter macroblock layer of spec/08 — the skip type's
+  zero-motion copy (§5); for types 1…7 the precision selector (§3),
+  one motion-vector-difference pair per partition (vertical first,
+  §4.1) added to the median predictor of the left / above /
+  above-right (or above-left) blocks with the picture clamp (§4.3),
+  converted per precision and stored in sixths (§4.2); motion
+  compensation of luma and chroma through every spec/05 §4 kernel
+  (`svq3_mc::motion_compensate_block` — full copy, half-pel bilinear,
+  third-pel one- and two-dimensional with weight 4 on the nearest
+  corner; chroma at half the luma vector,
+  `motion_compensate_chroma_block`); then the inter-table pattern, the
+  conditional quantiser delta and the normal-zigzag residual (§6).
+  Intra 4×4 / 16×16 / flat-128 macroblocks inside P slices share the
+  intra grammar with their P-slice delta rules; macroblocks a P slice
+  leaves uncoded are copied from the reference (§7). **Every access
+  unit of both fixtures — 10/10 — now decodes byte-exact on every
+  plane** against the unfiltered reference, and with the filter on the
+  320×240 stream's AU3 matches the component's own picture (SHA-256
+  `cf9ec710700a…`). The registry decoder emits P pictures.
 - svq3: the intra-picture edge filter of spec/09 (`svq3_filter`): after
   every I picture each plane's 4-sample block edges are smoothed by up
   to `limit[quantiser]` (`tables/09`; luma with the quantiser in force

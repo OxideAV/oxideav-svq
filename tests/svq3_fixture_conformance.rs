@@ -242,6 +242,16 @@ fn edge_filter_reproduces_the_component_pictures_of_the_320x240_stream() {
         "AU2 filtered picture digest: {}",
         sha256_hex(au2)
     );
+    // The dependent P picture predicts from the filtered reference:
+    // `320x240-filter/frame3.buf0.yuv` (SHA-256 cf9ec710700a…).
+    let au3 = filtered[3].as_ref().expect("AU3 decodes");
+    let (mismatches, _) = compare(au3, f.expected_frame(3));
+    assert!(mismatches > 0, "AU3 inherits the filtered reference");
+    assert!(
+        sha256_hex(au3).starts_with("cf9ec710700a"),
+        "AU3 picture digest: {}",
+        sha256_hex(au3)
+    );
 
     let f = load_fixture("real-sample-240x128").unwrap();
     let filtered = decode_all(&f, Svq3DecodeOptions::default());
@@ -290,6 +300,27 @@ fn scorecard(
         }
     }
     all_exact
+}
+
+#[test]
+fn every_access_unit_decodes_byte_exact_against_the_unfiltered_reference() {
+    let Some(_) = fixtures_dir() else {
+        eprintln!("svq3 fixtures not found (set OXIDEAV_SVQ3_FIXTURES) — skipping");
+        return;
+    };
+    for name in FIXTURES {
+        let f = load_fixture(name).expect("fixture files present");
+        let decoded = decode_all(
+            &f,
+            Svq3DecodeOptions {
+                intra_edge_filter: false,
+            },
+        );
+        assert!(
+            scorecard(&f, &decoded, |_| true),
+            "{name}: every access unit must decode byte-exact"
+        );
+    }
 }
 
 #[test]
