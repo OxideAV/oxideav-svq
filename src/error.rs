@@ -92,6 +92,10 @@ pub enum Error {
     /// dequantisation-ladder domain `0..=31`. The payload is the
     /// out-of-range quantiser value.
     InvalidQuantiser(i32),
+    /// An SVQ3 intra 4×4 prediction mode that needs a neighbour block
+    /// (modes 1…4, spec/07 §10.2) was coded where that neighbour is
+    /// unavailable. Carries the mode value.
+    MissingIntraNeighbour(u8),
 }
 
 impl core::fmt::Display for Error {
@@ -121,8 +125,8 @@ impl core::fmt::Display for Error {
             Error::InvalidIntraPrediction(top, left, idx) => {
                 write!(
                     f,
-                    "oxideav-svq: intra-4x4 prediction lookup landed on -1 sentinel \
-                     at INTRA_PRED_TABLE[{top}][{left}][{idx}]"
+                    "oxideav-svq: SVQ3 intra-4x4 rank {idx} is illegal for neighbour \
+                     context (top {top}, left {left}) — tables/08 holds no mode there"
                 )
             }
             Error::InvalidLevelQuantise(level) => {
@@ -154,6 +158,13 @@ impl core::fmt::Display for Error {
                     f,
                     "oxideav-svq: SVQ3 quantiser delta drove the macroblock quantiser to {q} \
                      (outside the dequantisation ladder domain 0..=31)"
+                )
+            }
+            Error::MissingIntraNeighbour(mode) => {
+                write!(
+                    f,
+                    "oxideav-svq: SVQ3 intra prediction mode {mode} coded where its \
+                     neighbour samples are outside the picture (spec/07 §10)"
                 )
             }
         }

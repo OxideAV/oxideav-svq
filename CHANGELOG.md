@@ -8,6 +8,31 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- svq3: macroblock type code numbers are per slice type (spec/07 §5):
+  I slices carry only 0 (intra 4×4) and 1…24 (intra 16×16, record
+  `c − 1`); P slices 0…7 inter, 8 intra 4×4, 9…32 intra 16×16 and 33
+  the flat-128 intra type; B slices 0…3, 4, 5…28. The former I-slice
+  "separate-DC-only" type 25 does not exist (`IntraMbKind` replaces
+  `IFrameMbType`; `Svq3MbType::Intra` replaces the per-slice
+  `IIntra` / `PIntra` / `BIntra` arms).
+- svq3: intra 4×4 prediction modes use the decoder's numbering
+  (spec/07 §10.2, spec/01 Gap 3 round 6): 0 = DC, 1 = vertical,
+  2 = horizontal, 3 = diagonal-down-right, 4 = the averaged diagonal —
+  not H.264's. A pair code resolves into two *ranks* (blocks `2i`,
+  `2i + 1` in quadrant-major order) and a rank into a mode through
+  `tables/08` with context values 0 (unavailable), `mode + 1` (intra
+  4×4 neighbour) or 1 (any other decoded block); an illegal
+  `(context, rank)` is `Error::InvalidIntraPrediction`.
+- svq3: modes 1–4 require their neighbour blocks and are a bitstream
+  error (`Error::MissingIntraNeighbour`) without them — the decoder
+  reads no substitute; only DC has the 128 fallback. The
+  reconstruction entry points (`reconstruct_intra_luma_macroblock*`,
+  `Svq3Picture::reconstruct_intra_macroblock_into` /
+  `reconstruct_intra_frame`) now return `Result`.
+- svq3: the P-slice precision selector follows spec/08 §3's
+  enabled-set forms (`0` / `10` / `11` with all three precisions, a
+  single index bit with one sub-pel precision, no bits with full-pel
+  only).
 - svq3: the universal code's bit layout is `0 d₁ 0 d₂ … 0 dₙ 1` — a
   marker bit *before* every data bit, closed by a `1` (spec/06 §1 /
   spec/07 §1, docs round 6). The earlier reader placed the first data
@@ -31,6 +56,15 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- svq3: `tables/07` (intra 4×4 prediction-mode pairs), `tables/08`
+  (the `6 × 6 × 5` neighbour-context resolution) and `tables/09` (the
+  intra-picture edge-filter limit) are mirrored bit-exact under
+  `tables/svq3-0*.csv` (`tables/MANIFEST-svq3.sha256`) and emitted at
+  build time into `svq3_tables`; the wiki-era `INTRA_PRED_PAIRS` /
+  `INTRA_PRED_TABLE` constants are gone.
+- svq3: `PFrameInterMode::partition_size` / `partition_offsets` — the
+  spec/08 §2 partition shapes and coding order of P-slice type codes
+  1…7 (16×16, 8×16, 16×8, 8×8, 4×8, 8×4, 4×4).
 - svq3: the extended-mode slice-header read sequence of spec/07 §3.3
   (`Svq3ExtendedModeFields`: the `a…e` group after `mode`, the
   `f…h` group plus four `uvlc` values and the trailing bits after the

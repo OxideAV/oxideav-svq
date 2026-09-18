@@ -53,8 +53,12 @@ impl From<crate::Error> for Error {
                 Error::other(format!("oxideav-svq: bit-reader rejected width {n}"))
             }
             crate::Error::InvalidIntraPrediction(top, left, idx) => Error::InvalidData(format!(
-                "oxideav-svq: SVQ3 intra-4x4 prediction lookup landed on -1 sentinel \
-                 at INTRA_PRED_TABLE[{top}][{left}][{idx}]"
+                "oxideav-svq: SVQ3 intra-4x4 rank {idx} is illegal for neighbour context \
+                 (top {top}, left {left})"
+            )),
+            crate::Error::MissingIntraNeighbour(mode) => Error::InvalidData(format!(
+                "oxideav-svq: SVQ3 intra prediction mode {mode} coded where its neighbour \
+                 samples are outside the picture"
             )),
             crate::Error::InvalidLevelQuantise(level) => Error::InvalidData(format!(
                 "oxideav-svq: SVQ1 in-place quantise decision at {level:?} is illegal — \

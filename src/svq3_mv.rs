@@ -224,7 +224,7 @@ pub fn read_inter_macroblock_header(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::svq3_mb::{BFrameInterMode, IFrameMbType, PFrameInterMode};
+    use crate::svq3_mb::{BFrameInterMode, IntraMbKind, PFrameInterMode};
 
     /// Pack a list of `(value, nbits)` MSB-first into a byte buffer for
     /// the bit reader.
@@ -373,7 +373,7 @@ mod tests {
     fn mb_mv_differences_intra_reads_nothing() {
         let mut br = BitReader::new(&[]);
         let diffs =
-            read_mb_mv_differences(&mut br, Svq3MbType::PIntra(IFrameMbType::Intra4x4)).unwrap();
+            read_mb_mv_differences(&mut br, Svq3MbType::Intra(IntraMbKind::Intra4x4)).unwrap();
         assert!(diffs.is_empty());
     }
 

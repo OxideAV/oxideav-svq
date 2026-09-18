@@ -5,7 +5,7 @@
 //! — the 4×4 intra predictors + mode dispatcher
 //! ([`crate::svq3_pred::predict_intra_4x4`]), the predicted+residual
 //! writeback ([`crate::svq3_pred::reconstruct_4x4`]), and the
-//! per-sub-block scan order ([`crate::svq3_mb::INTRA_4X4_SCAN_ORDER`])
+//! per-sub-block scan order ([`crate::svq3_mb::INTRA_4X4_BLOCK_RASTER`])
 //! — into the **macroblock-level predictor-selection loop** that the
 //! README named as the open lacks-tail
 //! (`docs/video/svq3/spec/01-reconstruction-composition.md` Gaps 3/4/5,
@@ -19,7 +19,7 @@
 //!
 //! * The sub-block processing order is the wiki §"Intra macroblock
 //!   information decoding" picture (mirrored as
-//!   [`crate::svq3_mb::INTRA_4X4_SCAN_ORDER`]); its spatial layout
+//!   [`crate::svq3_mb::INTRA_4X4_BLOCK_RASTER`]); its spatial layout
 //!   (which 4×4 cell each block index occupies inside the 16×16
 //!   macroblock) is the [`LUMA_BLOCK_GRID_POS`] map derived directly
 //!   from that picture.
@@ -82,7 +82,7 @@ pub const MB_LUMA_BLOCKS: usize = MB_GRID_DIM * MB_GRID_DIM;
 /// the 16×16 macroblock.
 ///
 /// Derived directly from the wiki §"Intra macroblock information
-/// decoding" picture that [`crate::svq3_mb::INTRA_4X4_SCAN_ORDER`]
+/// decoding" picture that [`crate::svq3_mb::INTRA_4X4_BLOCK_RASTER`]
 /// mirrors:
 ///
 /// ```text
@@ -266,7 +266,7 @@ impl Default for LumaMacroblock {
 ///
 /// This is the **macroblock-level predictor-selection loop**. For each
 /// of the 16 luma 4×4 sub-blocks, walked in the wiki order
-/// ([`crate::svq3_mb::INTRA_4X4_SCAN_ORDER`]):
+/// ([`crate::svq3_mb::INTRA_4X4_BLOCK_RASTER`]):
 ///
 /// 1. The sub-block's spatial cell is looked up in
 ///    [`LUMA_BLOCK_GRID_POS`] to get its pixel origin `(bx, by)`.
@@ -296,18 +296,19 @@ pub fn reconstruct_intra_luma_macroblock(
     mb: &mut LumaMacroblock,
     modes: &[Svq3IntraMode; MB_LUMA_BLOCKS],
     residuals: &[[i32; PRED_4X4_SAMPLES]; MB_LUMA_BLOCKS],
-) {
-    for &scan_index in crate::svq3_mb::INTRA_4X4_SCAN_ORDER.iter() {
+) -> crate::Result<()> {
+    for &scan_index in crate::svq3_mb::INTRA_4X4_BLOCK_RASTER.iter() {
         let index = scan_index as usize;
         let (gr, gc) = LUMA_BLOCK_GRID_POS[index];
         let by = gr * PRED_4X4_DIM;
         let bx = gc * PRED_4X4_DIM;
 
         let nb = mb.neighbours_at(bx, by);
-        let predicted = predict_intra_4x4(modes[index], nb);
+        let predicted = predict_intra_4x4(modes[index], nb)?;
         let recon = reconstruct_4x4(predicted, residuals[index]);
         mb.write_block(bx, by, recon);
     }
+    Ok(())
 }
 
 /// Reconstruct one 16×16 luma macroblock's 4×4-intra sub-blocks
@@ -347,8 +348,8 @@ pub fn reconstruct_intra_luma_macroblock_from_coeffs(
     modes: &[Svq3IntraMode; MB_LUMA_BLOCKS],
     coeff_blocks: &[[i32; PRED_4X4_SAMPLES]; MB_LUMA_BLOCKS],
     q: u32,
-) {
-    for &scan_index in crate::svq3_mb::INTRA_4X4_SCAN_ORDER.iter() {
+) -> crate::Result<()> {
+    for &scan_index in crate::svq3_mb::INTRA_4X4_BLOCK_RASTER.iter() {
         let index = scan_index as usize;
         let (gr, gc) = LUMA_BLOCK_GRID_POS[index];
         let by = gr * PRED_4X4_DIM;
@@ -359,10 +360,11 @@ pub fn reconstruct_intra_luma_macroblock_from_coeffs(
         let residual = dequantize_transform_luma_block(q, coeff_blocks[index]);
 
         let nb = mb.neighbours_at(bx, by);
-        let predicted = predict_intra_4x4(modes[index], nb);
+        let predicted = predict_intra_4x4(modes[index], nb)?;
         let recon = reconstruct_4x4(predicted, residual);
         mb.write_block(bx, by, recon);
     }
+    Ok(())
 }
 
 /// Reconstruct one 16×16 luma macroblock's 4×4-intra sub-blocks
@@ -396,8 +398,8 @@ pub fn reconstruct_intra_luma_macroblock_from_coeffs_intra_dc(
     modes: &[Svq3IntraMode; MB_LUMA_BLOCKS],
     coeff_blocks: &[[i32; PRED_4X4_SAMPLES]; MB_LUMA_BLOCKS],
     q: u32,
-) {
-    for &scan_index in crate::svq3_mb::INTRA_4X4_SCAN_ORDER.iter() {
+) -> crate::Result<()> {
+    for &scan_index in crate::svq3_mb::INTRA_4X4_BLOCK_RASTER.iter() {
         let index = scan_index as usize;
         let (gr, gc) = LUMA_BLOCK_GRID_POS[index];
         let by = gr * PRED_4X4_DIM;
@@ -408,10 +410,11 @@ pub fn reconstruct_intra_luma_macroblock_from_coeffs_intra_dc(
         let residual = dequantize_transform_intra_luma_block(q, coeff_blocks[index]);
 
         let nb = mb.neighbours_at(bx, by);
-        let predicted = predict_intra_4x4(modes[index], nb);
+        let predicted = predict_intra_4x4(modes[index], nb)?;
         let recon = reconstruct_4x4(predicted, residual);
         mb.write_block(bx, by, recon);
     }
+    Ok(())
 }
 
 /// Convert an [`crate::svq3_mb::Intra4x4ModeGrid`] (the block-index-ordered
@@ -474,7 +477,7 @@ pub fn decode_and_reconstruct_intra_luma_macroblock(
 ) -> crate::Result<crate::svq3_mb::Intra4x4ModeGrid> {
     let grid = crate::svq3_mb::decode_intra_4x4_modes(br, top_avail, left_avail)?;
     let modes = intra_modes_from_grid(&grid)?;
-    reconstruct_intra_luma_macroblock_from_coeffs(mb, &modes, coeff_blocks, q);
+    reconstruct_intra_luma_macroblock_from_coeffs(mb, &modes, coeff_blocks, q)?;
     Ok(grid)
 }
 
@@ -980,7 +983,7 @@ pub fn reconstruct_intra_macroblock(
     cb: &ChromaPlaneCoeffs,
     cr: &ChromaPlaneCoeffs,
     q: u32,
-) {
+) -> crate::Result<()> {
     match luma {
         // A 4×4-intra macroblock's luma DCs are carried inline in each
         // block, so the SVQ3-specific fixed intra-luma DC scale applies
@@ -995,7 +998,7 @@ pub fn reconstruct_intra_macroblock(
             modes,
             coeff_blocks,
             q,
-        ),
+        )?,
         Svq3LumaIntra::Whole16x16 { mode, coeff_blocks } => {
             reconstruct_intra_16x16_luma_macroblock_from_coeffs(
                 &mut mb.luma,
@@ -1007,6 +1010,7 @@ pub fn reconstruct_intra_macroblock(
     }
     reconstruct_intra_chroma_plane_from_coeffs(&mut mb.cb, cb.dc_block, &cb.ac_blocks, q);
     reconstruct_intra_chroma_plane_from_coeffs(&mut mb.cr, cr.dc_block, &cr.ac_blocks, q);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1123,7 +1127,7 @@ mod tests {
         let mut mb = LumaMacroblock::new();
         let modes = [Svq3IntraMode::Dc; MB_LUMA_BLOCKS];
         let residuals = [[0i32; 16]; MB_LUMA_BLOCKS];
-        reconstruct_intra_luma_macroblock(&mut mb, &modes, &residuals);
+        reconstruct_intra_luma_macroblock(&mut mb, &modes, &residuals).unwrap();
         assert!(mb.samples.iter().all(|&s| s == 128), "expected flat 128");
     }
 
@@ -1147,7 +1151,7 @@ mod tests {
         // vertical only needs top. Keep left unavailable.
         let modes = [Svq3IntraMode::Vertical; MB_LUMA_BLOCKS];
         let residuals = [[0i32; 16]; MB_LUMA_BLOCKS];
-        reconstruct_intra_luma_macroblock(&mut mb, &modes, &residuals);
+        reconstruct_intra_luma_macroblock(&mut mb, &modes, &residuals).unwrap();
         for y in 0..16 {
             for x in 0..16 {
                 assert_eq!(mb.sample(x, y), above[x], "({x},{y})");
@@ -1163,7 +1167,7 @@ mod tests {
         let modes = [Svq3IntraMode::Dc; MB_LUMA_BLOCKS];
         let mut residuals = [[0i32; 16]; MB_LUMA_BLOCKS];
         residuals[0][0] = 10; // block 0 is at grid (0,0) → pixel (0,0)
-        reconstruct_intra_luma_macroblock(&mut mb, &modes, &residuals);
+        reconstruct_intra_luma_macroblock(&mut mb, &modes, &residuals).unwrap();
         assert_eq!(mb.sample(0, 0), 138);
         // Neighbouring sample untouched.
         assert_eq!(mb.sample(1, 0), 128);
@@ -1179,11 +1183,11 @@ mod tests {
         let coeffs = [[0i32; 16]; MB_LUMA_BLOCKS];
 
         let mut mb_a = LumaMacroblock::new();
-        reconstruct_intra_luma_macroblock_from_coeffs(&mut mb_a, &modes, &coeffs, 12);
+        reconstruct_intra_luma_macroblock_from_coeffs(&mut mb_a, &modes, &coeffs, 12).unwrap();
 
         let mut mb_b = LumaMacroblock::new();
         let residuals = [[0i32; 16]; MB_LUMA_BLOCKS];
-        reconstruct_intra_luma_macroblock(&mut mb_b, &modes, &residuals);
+        reconstruct_intra_luma_macroblock(&mut mb_b, &modes, &residuals).unwrap();
 
         assert_eq!(mb_a.samples, mb_b.samples);
         assert!(mb_a.samples.iter().all(|&s| s == 128));
@@ -1207,14 +1211,14 @@ mod tests {
         }
 
         let mut mb_e2e = LumaMacroblock::new();
-        reconstruct_intra_luma_macroblock_from_coeffs(&mut mb_e2e, &modes, &coeffs, q);
+        reconstruct_intra_luma_macroblock_from_coeffs(&mut mb_e2e, &modes, &coeffs, q).unwrap();
 
         let mut residuals = [[0i32; 16]; MB_LUMA_BLOCKS];
         for (i, r) in residuals.iter_mut().enumerate() {
             *r = dequantize_transform_luma_block(q, coeffs[i]);
         }
         let mut mb_manual = LumaMacroblock::new();
-        reconstruct_intra_luma_macroblock(&mut mb_manual, &modes, &residuals);
+        reconstruct_intra_luma_macroblock(&mut mb_manual, &modes, &residuals).unwrap();
 
         assert_eq!(mb_e2e.samples, mb_manual.samples);
     }
@@ -1231,7 +1235,7 @@ mod tests {
         coeffs[0][0] = 1; // pure DC in block 0 (grid (0,0) → pixel (0,0))
 
         let mut mb = LumaMacroblock::new();
-        reconstruct_intra_luma_macroblock_from_coeffs(&mut mb, &modes, &coeffs, q);
+        reconstruct_intra_luma_macroblock_from_coeffs(&mut mb, &modes, &coeffs, q).unwrap();
 
         let residual = dequantize_transform_luma_block(q, coeffs[0]);
         let expected = (128 + residual[0]).clamp(0, 255) as u8;
@@ -1258,7 +1262,8 @@ mod tests {
             &modes,
             &coeffs,
             DEQUANT_COEFF_TABLE_LEN as u32,
-        );
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1278,7 +1283,7 @@ mod tests {
         mb.left_available = true;
         let modes = [Svq3IntraMode::Horizontal; MB_LUMA_BLOCKS];
         let residuals = [[0i32; 16]; MB_LUMA_BLOCKS];
-        reconstruct_intra_luma_macroblock(&mut mb, &modes, &residuals);
+        reconstruct_intra_luma_macroblock(&mut mb, &modes, &residuals).unwrap();
         // Horizontal copies the left column across each row; the left
         // column of the first sub-block column is the leftcol seed, and
         // it propagates rightward, so every pixel in row y equals
@@ -1542,7 +1547,7 @@ mod tests {
             dc_block: [0i32; CHROMA_PLANE_BLOCKS],
             ac_blocks: [[0i32; 16]; CHROMA_PLANE_BLOCKS],
         };
-        reconstruct_intra_macroblock(&mut mb, &luma, &chroma, &chroma, 12);
+        reconstruct_intra_macroblock(&mut mb, &luma, &chroma, &chroma, 12).unwrap();
         assert!(mb.luma.samples.iter().all(|&s| s == 128), "luma flat 128");
         assert!(mb.cb.samples.iter().all(|&s| s == 128), "cb flat 128");
         assert!(mb.cr.samples.iter().all(|&s| s == 128), "cr flat 128");
@@ -1570,7 +1575,7 @@ mod tests {
             dc_block: [0i32; CHROMA_PLANE_BLOCKS],
             ac_blocks: [[0i32; 16]; CHROMA_PLANE_BLOCKS],
         };
-        reconstruct_intra_macroblock(&mut mb, &luma, &chroma, &chroma, q);
+        reconstruct_intra_macroblock(&mut mb, &luma, &chroma, &chroma, q).unwrap();
 
         let mut direct = LumaMacroblock::new();
         direct.above = [70; 16];
@@ -1608,7 +1613,7 @@ mod tests {
             dc_block: [0i32; CHROMA_PLANE_BLOCKS],
             ac_blocks: [[0i32; 16]; CHROMA_PLANE_BLOCKS],
         };
-        reconstruct_intra_macroblock(&mut mb, &luma, &cb, &cr, 30);
+        reconstruct_intra_macroblock(&mut mb, &luma, &cb, &cr, 30).unwrap();
         // A DC-only 2×2 input spreads through the [[8,8],[8,−8]] Hadamard
         // to all four chroma DC terms equally, so the whole Cb plane is
         // lifted off the flat-128 DC prediction; Cr (all-zero input) stays
@@ -1649,8 +1654,8 @@ mod tests {
             &mut br, &mut mb, &coeffs, 20, false, false,
         )
         .unwrap();
-        // The returned grid's block 0 is DC (mode 2).
-        assert_eq!(grid.mode(0), Some(2));
+        // The returned grid's block 0 is DC (mode 0).
+        assert_eq!(grid.mode(0), Some(0));
         // Flat-128 reconstruction (DC over unavailable neighbours = 128,
         // zero residual).
         assert!(mb.samples.iter().all(|&s| s == 128), "flat 128 plane");
@@ -1678,7 +1683,7 @@ mod tests {
         let grid = crate::svq3_mb::decode_intra_4x4_modes(&mut br_b, false, false).unwrap();
         let modes = intra_modes_from_grid(&grid).unwrap();
         let mut mb_b = LumaMacroblock::new();
-        reconstruct_intra_luma_macroblock_from_coeffs(&mut mb_b, &modes, &coeffs, 18);
+        reconstruct_intra_luma_macroblock_from_coeffs(&mut mb_b, &modes, &coeffs, 18).unwrap();
 
         assert_eq!(mb_a.samples, mb_b.samples);
     }
@@ -1696,10 +1701,12 @@ mod tests {
         }
 
         let mut mb_intra = LumaMacroblock::new();
-        reconstruct_intra_luma_macroblock_from_coeffs_intra_dc(&mut mb_intra, &modes, &coeffs, 14);
+        reconstruct_intra_luma_macroblock_from_coeffs_intra_dc(&mut mb_intra, &modes, &coeffs, 14)
+            .unwrap();
 
         let mut mb_general = LumaMacroblock::new();
-        reconstruct_intra_luma_macroblock_from_coeffs(&mut mb_general, &modes, &coeffs, 14);
+        reconstruct_intra_luma_macroblock_from_coeffs(&mut mb_general, &modes, &coeffs, 14)
+            .unwrap();
 
         assert_ne!(mb_intra.samples, mb_general.samples);
     }
@@ -1713,10 +1720,12 @@ mod tests {
         coeffs[3][6] = 5;
 
         let mut mb_intra = LumaMacroblock::new();
-        reconstruct_intra_luma_macroblock_from_coeffs_intra_dc(&mut mb_intra, &modes, &coeffs, 22);
+        reconstruct_intra_luma_macroblock_from_coeffs_intra_dc(&mut mb_intra, &modes, &coeffs, 22)
+            .unwrap();
 
         let mut mb_general = LumaMacroblock::new();
-        reconstruct_intra_luma_macroblock_from_coeffs(&mut mb_general, &modes, &coeffs, 22);
+        reconstruct_intra_luma_macroblock_from_coeffs(&mut mb_general, &modes, &coeffs, 22)
+            .unwrap();
 
         assert_eq!(mb_intra.samples, mb_general.samples);
     }
@@ -1728,7 +1737,8 @@ mod tests {
         let modes = [Svq3IntraMode::Dc; MB_LUMA_BLOCKS];
         let coeffs = [[0i32; PRED_4X4_SAMPLES]; MB_LUMA_BLOCKS];
         let mut mb = LumaMacroblock::new();
-        reconstruct_intra_luma_macroblock_from_coeffs_intra_dc(&mut mb, &modes, &coeffs, 20);
+        reconstruct_intra_luma_macroblock_from_coeffs_intra_dc(&mut mb, &modes, &coeffs, 20)
+            .unwrap();
         assert!(mb.samples.iter().all(|&s| s == 128));
     }
 

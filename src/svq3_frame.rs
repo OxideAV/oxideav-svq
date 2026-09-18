@@ -96,8 +96,8 @@ use crate::svq3_coeff::{
 };
 use crate::svq3_dequant::{luma_dc_secondary_transform, DEQUANT_COEFF_TABLE_LEN};
 use crate::svq3_mb::{
-    classify_mb_type, decode_intra_4x4_modes_with_context, IFrameMbType, Intra16x16Params,
-    IntraNeighbour, Svq3MbType,
+    classify_mb_type, decode_intra_4x4_modes_with_context, Intra16x16Params, IntraMbKind,
+    Svq3MbType, INTRA_4X4_CONTEXT_OTHER,
 };
 use crate::svq3_mv::read_quantiser_delta;
 use crate::svq3_picture::{ChromaSelect, Svq3Picture};
@@ -149,42 +149,24 @@ impl IntraFrameDecoder {
         }
     }
 
-    /// The wiki `pred_table` context rows for the current macroblock's
-    /// top-row / left-column sub-blocks: the actual decoded mode when
-    /// the neighbour macroblock is 4×4-intra-coded, the "value 2"
-    /// class when it exists but is not, `-1`/Outside when there is no
-    /// neighbour.
-    fn edge_contexts(
-        &self,
-        mb_index: usize,
-        pos: Svq3MacroblockPosition,
-    ) -> ([IntraNeighbour; 4], [IntraNeighbour; 4]) {
+    /// The `tables/08` context values for the current macroblock's
+    /// top-row / left-column blocks (spec/07 §10.2): the neighbour
+    /// block's `mode + 1` when that macroblock is intra 4×4, 1 when it
+    /// is any other decoded macroblock, 0 when there is none.
+    fn edge_contexts(&self, mb_index: usize, pos: Svq3MacroblockPosition) -> ([u8; 4], [u8; 4]) {
         let cols = self.mb_cols as usize;
-        let mut top = [IntraNeighbour::Outside; 4];
-        let mut left = [IntraNeighbour::Outside; 4];
+        let mut top = [0u8; 4];
+        let mut left = [0u8; 4];
         if pos.top_available {
             top = match self.mode_state[mb_index - cols] {
-                // Bottom row of the macroblock above: block indices 12..=15.
-                Some(grid) => [
-                    IntraNeighbour::Mode4x4(grid[12]),
-                    IntraNeighbour::Mode4x4(grid[13]),
-                    IntraNeighbour::Mode4x4(grid[14]),
-                    IntraNeighbour::Mode4x4(grid[15]),
-                ],
-                None => [IntraNeighbour::Intra16x16OrInter; 4],
+                Some(grid) => [grid[12] + 1, grid[13] + 1, grid[14] + 1, grid[15] + 1],
+                None => [INTRA_4X4_CONTEXT_OTHER; 4],
             };
         }
         if pos.left_available {
             left = match self.mode_state[mb_index - 1] {
-                // Rightmost column of the macroblock to the left:
-                // block indices 3, 7, 11, 15.
-                Some(grid) => [
-                    IntraNeighbour::Mode4x4(grid[3]),
-                    IntraNeighbour::Mode4x4(grid[7]),
-                    IntraNeighbour::Mode4x4(grid[11]),
-                    IntraNeighbour::Mode4x4(grid[15]),
-                ],
-                None => [IntraNeighbour::Intra16x16OrInter; 4],
+                Some(grid) => [grid[3] + 1, grid[7] + 1, grid[11] + 1, grid[15] + 1],
+                None => [INTRA_4X4_CONTEXT_OTHER; 4],
             };
         }
         (top, left)
@@ -255,37 +237,21 @@ impl IntraFrameDecoder {
     ) -> Result<()> {
         let pos = macroblock_position(mb_index as u32, self.mb_cols)?;
         let mb_type = match classify_mb_type(Svq3FrameType::Intra, read_universal_code(br)?)? {
-            Svq3MbType::IIntra(t) => t,
-            // classify_mb_type(Intra, _) only produces IIntra.
+            Svq3MbType::Intra(t) => t,
+            // classify_mb_type(Intra, _) only produces intra kinds.
             _ => return Err(Error::ReconstructFailed),
         };
 
         match mb_type {
-            IFrameMbType::Intra4x4 => {
+            IntraMbKind::Intra4x4 => {
                 self.decode_intra_4x4_mb(br, mb_index, pos, qp, delta_qp_present)
             }
-            IFrameMbType::Intra16x16(params) => {
+            IntraMbKind::Intra16x16(params) => {
                 self.mode_state[mb_index] = None;
                 self.decode_intra_16x16_mb(br, pos, qp, delta_qp_present, params)
             }
-            IFrameMbType::SeparateDcOnly => {
-                self.mode_state[mb_index] = None;
-                // The wiki list's "luma DCs coded in a separate 4×4
-                // block and no other blocks coded": grammar = the DC
-                // block only; predictor not pinned — decoded as the
-                // 16×16 DC-predictor reading (pred selector 2).
-                self.decode_intra_16x16_mb(
-                    br,
-                    pos,
-                    qp,
-                    delta_qp_present,
-                    Intra16x16Params {
-                        pred_mode: 2,
-                        cbp_chroma: 0,
-                        luma_ac: false,
-                    },
-                )
-            }
+            // Not an I-slice type (spec/07 §5).
+            IntraMbKind::Flat128 => Err(Error::ReconstructFailed),
         }
     }
 
@@ -354,7 +320,12 @@ impl IntraFrameDecoder {
         // dequantization" intra-luma inline-DC scale path.
         let mut mb = LumaMacroblock::new();
         self.picture.bind_luma_neighbours(pos, &mut mb);
-        reconstruct_intra_luma_macroblock_from_coeffs_intra_dc(&mut mb, &modes, &coeff_blocks, *qp);
+        reconstruct_intra_luma_macroblock_from_coeffs_intra_dc(
+            &mut mb,
+            &modes,
+            &coeff_blocks,
+            *qp,
+        )?;
         self.picture.blit_luma(pos, &mb);
         self.reconstruct_chroma(pos, *qp, &chroma);
         Ok(())
@@ -800,24 +771,18 @@ mod tests {
     }
 
     #[test]
-    fn separate_dc_only_type_decodes() {
+    fn i_slice_type_code_25_is_rejected() {
+        // spec/07 §5: I-slice type code numbers are 0…24 only.
         let seqh = seqh_32x32();
         let mut p = Packer::new();
         intra_slice_header(&mut p, 13, false);
-        p.ue(25); // separate-DC-only type
-        p.ue(15); // DC level +3
+        p.ue(25);
         p.ue(0);
-        for _ in 0..3 {
-            push_empty_i4_mb(&mut p);
-        }
         let au = wire_v1(p.into_bytes());
-        let pic = decode_intra_access_unit(&seqh, &au).unwrap();
-        let mut dc_block = [0i32; 16];
-        dc_block[0] = 3;
-        let v = luma_dc_secondary_transform(13, dc_block);
-        let expected =
-            crate::svq3_pred::reconstruct_sample(128, crate::svq3_dequant::finalise_dc(169 * v[0]));
-        assert_eq!(pic.luma_sample(0, 0), expected);
+        assert_eq!(
+            decode_intra_access_unit(&seqh, &au).unwrap_err(),
+            Error::InvalidFrameCode(25)
+        );
     }
 
     #[test]

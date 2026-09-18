@@ -299,77 +299,66 @@ pub const fn reconstruct_4x4(
     out
 }
 
-/// The five SVQ3 4×4 intra-prediction modes, numbered by the wire
-/// value the intra-mode VLC resolves to.
+/// The five SVQ3 4×4 intra-prediction modes, numbered by the value
+/// the `tables/08` context resolution produces and the decoder's
+/// five-way predictor dispatch consumes (spec/07 §10.2, spec/01 Gap 3):
 ///
-/// Per `docs/video/svq3/spec/01-reconstruction-composition.md` Gap 3
-/// the mode value (`0..=4`, plus `-1` = unavailable) maps to the
-/// H.264 intra-4×4 mode numbers:
+/// | Value | Predictor |
+/// | ----- | --------- |
+/// | 0 | DC |
+/// | 1 | Vertical (predict from top) |
+/// | 2 | Horizontal (predict from left) |
+/// | 3 | Diagonal-down-right (three-tap filtered) |
+/// | 4 | The averaged diagonal — SVQ3's `(top[k] + left[k]) >> 1` quirk |
 ///
-/// | Value | H.264 intra-4×4 mode |
-/// | ----- | -------------------- |
-/// | 0 | Vertical (predict from top) |
-/// | 1 | Horizontal (predict from left) |
-/// | 2 | DC |
-/// | 3 | Diagonal-Down-Left (SVQ3's `(left[k]+top[k])/2` quirk) |
-/// | 4 | Diagonal-Down-Right |
-///
-/// Gap 3 pins value 3 to SVQ3's documented diagonal-down quirk (the
-/// [`predict_diagonal_down_4x4`] predictor) and states modes 0/1/2/4
-/// "follow their standard H.264 definitions … unmodified". It also
-/// pins the default/fallback predictor used "for 16×16 intra and any
-/// inter blocks" as value 2 (DC) — surfaced as [`Svq3IntraMode::DEFAULT`].
+/// These are **not** H.264's mode numbers. DC is the only mode with a
+/// no-neighbour fallback (128); modes 1–4 require their neighbours and
+/// are a bitstream error otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Svq3IntraMode {
-    /// Mode value 0 — Vertical: each column copies the matching `top`
-    /// sample.
-    Vertical,
-    /// Mode value 1 — Horizontal: each row copies the matching `left`
-    /// sample.
-    Horizontal,
-    /// Mode value 2 — DC: every sample is the average of the available
-    /// neighbour samples. This is also the default/fallback predictor
-    /// per Gap 3.
+    /// Mode value 0 — DC over the available neighbours.
     Dc,
-    /// Mode value 3 — Diagonal-Down-Left, SVQ3's documented quirk:
-    /// `(left[k] + top[k]) / 2` per the wiki §"Intra prediction"
-    /// ([`predict_diagonal_down_4x4`]).
-    DiagonalDownLeft,
-    /// Mode value 4 — Diagonal-Down-Right (standard H.264).
+    /// Mode value 1 — Vertical: each column copies the `top` sample.
+    Vertical,
+    /// Mode value 2 — Horizontal: each row copies the `left` sample.
+    Horizontal,
+    /// Mode value 3 — Diagonal-down-right, the three-tap
+    /// `(a + 2b + c + 2) >> 2` filter over left column, corner and top
+    /// row.
     DiagonalDownRight,
+    /// Mode value 4 — the averaged diagonal of spec/01 Gap 3
+    /// ([`predict_diagonal_down_4x4`]).
+    AveragedDiagonal,
 }
 
 impl Svq3IntraMode {
-    /// The default/fallback intra-prediction mode — DC (value 2) — per
-    /// `docs/video/svq3/spec/01-reconstruction-composition.md` Gap 3:
-    /// "the default/fallback predictor is value 2 (DC)". The wiki
-    /// `pred_table` first entry is also `2`.
+    /// The default context predictor — DC (value 0): every neighbour
+    /// block that is not intra 4×4 contributes context value `0 + 1`
+    /// (spec/07 §10.2).
     pub const DEFAULT: Self = Self::Dc;
 
-    /// Map the resolved wire value (`0..=4`) to the typed mode. Returns
-    /// [`crate::Error::BadBitWidth`] for values outside `0..=4` (the
-    /// SVQ3 4×4 intra-mode space, per spec/01 Gap 3 + the wiki
-    /// `pred_table` range).
+    /// Map the resolved value (`0..=4`) to the typed mode. Returns
+    /// [`crate::Error::BadBitWidth`] for values outside `0..=4`.
     pub const fn from_value(value: u8) -> crate::Result<Self> {
         match value {
-            0 => Ok(Self::Vertical),
-            1 => Ok(Self::Horizontal),
-            2 => Ok(Self::Dc),
-            3 => Ok(Self::DiagonalDownLeft),
-            4 => Ok(Self::DiagonalDownRight),
+            0 => Ok(Self::Dc),
+            1 => Ok(Self::Vertical),
+            2 => Ok(Self::Horizontal),
+            3 => Ok(Self::DiagonalDownRight),
+            4 => Ok(Self::AveragedDiagonal),
             other => Err(crate::Error::BadBitWidth(other as u32)),
         }
     }
 
-    /// The wire value (`0..=4`) for this mode — the inverse of
+    /// The value (`0..=4`) for this mode — the inverse of
     /// [`Self::from_value`].
     pub const fn value(self) -> u8 {
         match self {
-            Self::Vertical => 0,
-            Self::Horizontal => 1,
-            Self::Dc => 2,
-            Self::DiagonalDownLeft => 3,
-            Self::DiagonalDownRight => 4,
+            Self::Dc => 0,
+            Self::Vertical => 1,
+            Self::Horizontal => 2,
+            Self::DiagonalDownRight => 3,
+            Self::AveragedDiagonal => 4,
         }
     }
 }
@@ -556,68 +545,43 @@ pub const fn predict_diagonal_down_right_4x4(nb: Intra4x4Neighbours) -> [u8; PRE
 }
 
 /// Predict one 4×4 intra block by dispatching on the resolved
-/// [`Svq3IntraMode`].
+/// [`Svq3IntraMode`] (spec/07 §10.2).
 ///
-/// This is the **mode-to-predictor binding** the README named as a
-/// lacks-tail item: spec/01 Gap 3 pins each mode value `0..=4` to a
-/// predictor, and this dispatcher routes a resolved mode to the
-/// matching block predictor, supplying the neighbour samples from
-/// `nb`.
+/// DC adapts its averaging set to the available neighbours (128 with
+/// neither). Vertical needs `top`, horizontal needs `left`, and both
+/// diagonals need both; a mode coded without its neighbour is a
+/// bitstream error, [`crate::Error::MissingIntraNeighbour`] — the
+/// decoder reads no substitute samples.
 ///
-/// Edge handling follows the standard H.264 fallback that Gap 3
-/// references: a directional predictor whose required neighbour is
-/// unavailable falls back to DC, which is also the documented default
-/// predictor ([`Svq3IntraMode::DEFAULT`]). Specifically:
-///
-/// * [`Svq3IntraMode::Vertical`] needs `top`; falls back to DC if
-///   `!top_available`.
-/// * [`Svq3IntraMode::Horizontal`] needs `left`; falls back to DC if
-///   `!left_available`.
-/// * [`Svq3IntraMode::DiagonalDownLeft`] (SVQ3's quirk) and
-///   [`Svq3IntraMode::DiagonalDownRight`] need both neighbours; they
-///   fall back to DC if either is missing.
-/// * [`Svq3IntraMode::Dc`] adapts its averaging set to whichever
-///   neighbours are available (and yields `128` with neither).
-///
-/// The diagonal-down-left quirk reads `left[1..=3]` / `top[1..=3]`
-/// (element 0 unused, per the wiki), so the dispatcher forwards
-/// `nb.left` / `nb.top` directly to [`predict_diagonal_down_4x4`].
-#[must_use]
+/// The averaged diagonal reads `left[1..=3]` / `top[1..=3]` (element
+/// 0 unused), so the dispatcher forwards `nb.left` / `nb.top` directly
+/// to [`predict_diagonal_down_4x4`].
 pub const fn predict_intra_4x4(
     mode: Svq3IntraMode,
     nb: Intra4x4Neighbours,
-) -> [u8; PRED_4X4_SAMPLES] {
-    match mode {
-        Svq3IntraMode::Vertical => {
-            if nb.top_available {
-                predict_vertical_4x4(nb.top)
-            } else {
-                predict_dc_4x4(nb.top, nb.left, nb.top_available, nb.left_available)
-            }
-        }
-        Svq3IntraMode::Horizontal => {
-            if nb.left_available {
-                predict_horizontal_4x4(nb.left)
-            } else {
-                predict_dc_4x4(nb.top, nb.left, nb.top_available, nb.left_available)
-            }
-        }
-        Svq3IntraMode::Dc => predict_dc_4x4(nb.top, nb.left, nb.top_available, nb.left_available),
-        Svq3IntraMode::DiagonalDownLeft => {
-            if nb.top_available && nb.left_available {
-                predict_diagonal_down_4x4(nb.left, nb.top)
-            } else {
-                predict_dc_4x4(nb.top, nb.left, nb.top_available, nb.left_available)
-            }
-        }
-        Svq3IntraMode::DiagonalDownRight => {
-            if nb.top_available && nb.left_available {
-                predict_diagonal_down_right_4x4(nb)
-            } else {
-                predict_dc_4x4(nb.top, nb.left, nb.top_available, nb.left_available)
-            }
-        }
+) -> crate::Result<[u8; PRED_4X4_SAMPLES]> {
+    let need_top = matches!(
+        mode,
+        Svq3IntraMode::Vertical
+            | Svq3IntraMode::DiagonalDownRight
+            | Svq3IntraMode::AveragedDiagonal
+    );
+    let need_left = matches!(
+        mode,
+        Svq3IntraMode::Horizontal
+            | Svq3IntraMode::DiagonalDownRight
+            | Svq3IntraMode::AveragedDiagonal
+    );
+    if (need_top && !nb.top_available) || (need_left && !nb.left_available) {
+        return Err(crate::Error::MissingIntraNeighbour(mode.value()));
     }
+    Ok(match mode {
+        Svq3IntraMode::Dc => predict_dc_4x4(nb.top, nb.left, nb.top_available, nb.left_available),
+        Svq3IntraMode::Vertical => predict_vertical_4x4(nb.top),
+        Svq3IntraMode::Horizontal => predict_horizontal_4x4(nb.left),
+        Svq3IntraMode::DiagonalDownRight => predict_diagonal_down_right_4x4(nb),
+        Svq3IntraMode::AveragedDiagonal => predict_diagonal_down_4x4(nb.left, nb.top),
+    })
 }
 
 /// Width / height of a 16×16 luma macroblock prediction block.
@@ -1168,28 +1132,28 @@ mod tests {
     }
 
     #[test]
-    fn intra_mode_binding_matches_gap3() {
-        // Gap 3: 0=Vertical, 1=Horizontal, 2=DC, 3=DiagDownLeft, 4=DiagDownRight.
+    fn intra_mode_binding_matches_spec07() {
+        // spec/07 §10.2: 0 = DC, 1 = vertical, 2 = horizontal,
+        // 3 = diagonal-down-right, 4 = averaged diagonal.
+        assert_eq!(Svq3IntraMode::from_value(0).unwrap(), Svq3IntraMode::Dc);
         assert_eq!(
-            Svq3IntraMode::from_value(0).unwrap(),
+            Svq3IntraMode::from_value(1).unwrap(),
             Svq3IntraMode::Vertical
         );
         assert_eq!(
-            Svq3IntraMode::from_value(1).unwrap(),
+            Svq3IntraMode::from_value(2).unwrap(),
             Svq3IntraMode::Horizontal
         );
-        assert_eq!(Svq3IntraMode::from_value(2).unwrap(), Svq3IntraMode::Dc);
         assert_eq!(
             Svq3IntraMode::from_value(3).unwrap(),
-            Svq3IntraMode::DiagonalDownLeft
+            Svq3IntraMode::DiagonalDownRight
         );
         assert_eq!(
             Svq3IntraMode::from_value(4).unwrap(),
-            Svq3IntraMode::DiagonalDownRight
+            Svq3IntraMode::AveragedDiagonal
         );
-        // Gap 3: default/fallback predictor is value 2 (DC).
         assert_eq!(Svq3IntraMode::DEFAULT, Svq3IntraMode::Dc);
-        assert_eq!(Svq3IntraMode::DEFAULT.value(), 2);
+        assert_eq!(Svq3IntraMode::DEFAULT.value(), 0);
     }
 
     #[test]
@@ -1275,69 +1239,85 @@ mod tests {
     fn dispatcher_routes_each_mode() {
         let n = nb([10, 20, 30, 40], [50, 60, 70, 80], 5);
         assert_eq!(
-            predict_intra_4x4(Svq3IntraMode::Vertical, n),
+            predict_intra_4x4(Svq3IntraMode::Vertical, n).unwrap(),
             predict_vertical_4x4(n.top)
         );
         assert_eq!(
-            predict_intra_4x4(Svq3IntraMode::Horizontal, n),
+            predict_intra_4x4(Svq3IntraMode::Horizontal, n).unwrap(),
             predict_horizontal_4x4(n.left)
         );
         assert_eq!(
-            predict_intra_4x4(Svq3IntraMode::Dc, n),
+            predict_intra_4x4(Svq3IntraMode::Dc, n).unwrap(),
             predict_dc_4x4(n.top, n.left, true, true)
         );
         assert_eq!(
-            predict_intra_4x4(Svq3IntraMode::DiagonalDownLeft, n),
+            predict_intra_4x4(Svq3IntraMode::AveragedDiagonal, n).unwrap(),
             predict_diagonal_down_4x4(n.left, n.top)
         );
         assert_eq!(
-            predict_intra_4x4(Svq3IntraMode::DiagonalDownRight, n),
+            predict_intra_4x4(Svq3IntraMode::DiagonalDownRight, n).unwrap(),
             predict_diagonal_down_right_4x4(n)
         );
     }
 
     #[test]
-    fn dispatcher_falls_back_to_dc_when_neighbour_missing() {
-        // Vertical with no top → DC over left only.
-        let n = Intra4x4Neighbours {
+    fn dispatcher_rejects_modes_without_their_neighbour() {
+        // spec/07 §10.2: modes 1–4 require their neighbours; only DC
+        // falls back.
+        let no_top = Intra4x4Neighbours {
             top: [99; 4],
             left: [10, 10, 10, 10],
             corner: 0,
             top_available: false,
             left_available: true,
         };
-        let got = predict_intra_4x4(Svq3IntraMode::Vertical, n);
-        assert_eq!(got, predict_dc_4x4(n.top, n.left, false, true));
-        assert_eq!(got, [10u8; 16]);
-
-        // Horizontal with no left → DC over top only.
-        let n2 = Intra4x4Neighbours {
+        assert_eq!(
+            predict_intra_4x4(Svq3IntraMode::Vertical, no_top).unwrap_err(),
+            crate::Error::MissingIntraNeighbour(1)
+        );
+        assert_eq!(
+            predict_intra_4x4(Svq3IntraMode::Horizontal, no_top).unwrap(),
+            [10u8; 16]
+        );
+        assert_eq!(
+            predict_intra_4x4(Svq3IntraMode::Dc, no_top).unwrap(),
+            [10u8; 16]
+        );
+        let no_left = Intra4x4Neighbours {
             top: [20, 20, 20, 20],
             left: [99; 4],
             corner: 0,
             top_available: true,
             left_available: false,
         };
-        let got2 = predict_intra_4x4(Svq3IntraMode::Horizontal, n2);
-        assert_eq!(got2, [20u8; 16]);
-
-        // Both diagonals with a missing neighbour → DC fallback.
+        assert_eq!(
+            predict_intra_4x4(Svq3IntraMode::Horizontal, no_left).unwrap_err(),
+            crate::Error::MissingIntraNeighbour(2)
+        );
         for mode in [
-            Svq3IntraMode::DiagonalDownLeft,
             Svq3IntraMode::DiagonalDownRight,
+            Svq3IntraMode::AveragedDiagonal,
         ] {
-            let n3 = Intra4x4Neighbours {
-                top: [30, 30, 30, 30],
-                left: [99; 4],
-                corner: 7,
-                top_available: true,
-                left_available: false,
-            };
             assert_eq!(
-                predict_intra_4x4(mode, n3),
-                predict_dc_4x4(n3.top, n3.left, true, false)
+                predict_intra_4x4(mode, no_left).unwrap_err(),
+                crate::Error::MissingIntraNeighbour(mode.value())
+            );
+            assert_eq!(
+                predict_intra_4x4(mode, no_top).unwrap_err(),
+                crate::Error::MissingIntraNeighbour(mode.value())
             );
         }
+        let none = Intra4x4Neighbours {
+            top: [0; 4],
+            left: [0; 4],
+            corner: 0,
+            top_available: false,
+            left_available: false,
+        };
+        assert_eq!(
+            predict_intra_4x4(Svq3IntraMode::Dc, none).unwrap(),
+            [128u8; 16]
+        );
     }
 
     #[test]
@@ -1352,7 +1332,10 @@ mod tests {
         const V: [u8; 16] = predict_vertical_4x4(N.top);
         const DC: [u8; 16] = predict_dc_4x4(N.top, N.left, true, true);
         const DDR: [u8; 16] = predict_diagonal_down_right_4x4(N);
-        const DISP: [u8; 16] = predict_intra_4x4(Svq3IntraMode::Dc, N);
+        const DISP: [u8; 16] = match predict_intra_4x4(Svq3IntraMode::Dc, N) {
+            Ok(b) => b,
+            Err(_) => [0; 16],
+        };
         assert_eq!(V[0], 1);
         assert_eq!(DC, [5u8; 16]); // (10+26+4)>>3 = 5
         assert_eq!(DISP, DC);

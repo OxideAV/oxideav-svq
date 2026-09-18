@@ -51,7 +51,7 @@ fn empty_coefficient_stream_reconstructs_flat_dc_plane() {
     let coeffs = place_all_blocks(&[], true, 12);
     let modes = [Svq3IntraMode::Dc; MB_LUMA_BLOCKS];
     let mut mb = LumaMacroblock::new();
-    reconstruct_intra_luma_macroblock_from_coeffs(&mut mb, &modes, &coeffs, 12);
+    reconstruct_intra_luma_macroblock_from_coeffs(&mut mb, &modes, &coeffs, 12).unwrap();
     assert!(
         mb.samples.iter().all(|&s| s == 128),
         "empty stream + DC + no neighbours must be flat 128"
@@ -70,7 +70,7 @@ fn dc_only_coefficient_lifts_the_whole_block_uniformly() {
     let modes = [Svq3IntraMode::Dc; MB_LUMA_BLOCKS];
 
     let mut mb = LumaMacroblock::new();
-    reconstruct_intra_luma_macroblock_from_coeffs(&mut mb, &modes, &coeffs, q);
+    reconstruct_intra_luma_macroblock_from_coeffs(&mut mb, &modes, &coeffs, q).unwrap();
 
     // Block 0 (pixel origin (0,0)) has no neighbours ⇒ DC predicts 128;
     // the flat residual lifts it to clip(128 + residual[0], 0, 255).
@@ -125,7 +125,7 @@ fn full_chain_with_run_value_stream_is_deterministic_and_clamped() {
     let modes = [Svq3IntraMode::Dc; MB_LUMA_BLOCKS];
 
     let mut mb = LumaMacroblock::new();
-    reconstruct_intra_luma_macroblock_from_coeffs(&mut mb, &modes, &coeffs, q);
+    reconstruct_intra_luma_macroblock_from_coeffs(&mut mb, &modes, &coeffs, q).unwrap();
 
     // Every sample is a valid u8 (saturation is implicit in the type) and
     // the plane is not the trivial flat-128 (the stream carries energy).
@@ -136,7 +136,7 @@ fn full_chain_with_run_value_stream_is_deterministic_and_clamped() {
 
     // Determinism: re-running yields byte-identical output.
     let mut mb2 = LumaMacroblock::new();
-    reconstruct_intra_luma_macroblock_from_coeffs(&mut mb2, &modes, &coeffs, q);
+    reconstruct_intra_luma_macroblock_from_coeffs(&mut mb2, &modes, &coeffs, q).unwrap();
     assert_eq!(mb.samples, mb2.samples);
 }
 
@@ -158,7 +158,7 @@ fn vertical_mode_with_neighbour_and_residual_composes_pred_plus_residual() {
     mb.above = above;
     mb.above_available = true;
 
-    reconstruct_intra_luma_macroblock_from_coeffs(&mut mb, &modes, &coeffs, q);
+    reconstruct_intra_luma_macroblock_from_coeffs(&mut mb, &modes, &coeffs, q).unwrap();
 
     // Block 0 top-left: vertical predicts above[0]; flat DC residual adds
     // residual[0]. (residual is flat for a pure-DC coefficient.)

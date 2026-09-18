@@ -413,17 +413,18 @@ impl Svq3Picture {
         cb: &ChromaPlaneCoeffs,
         cr: &ChromaPlaneCoeffs,
         q: u32,
-    ) {
+    ) -> crate::Result<()> {
         let mut mb = Svq3IntraMacroblock::new();
         self.bind_luma_neighbours(pos, &mut mb.luma);
         self.bind_chroma_neighbours(pos, ChromaSelect::Cb, &mut mb.cb);
         self.bind_chroma_neighbours(pos, ChromaSelect::Cr, &mut mb.cr);
 
-        reconstruct_intra_macroblock(&mut mb, luma, cb, cr, q);
+        reconstruct_intra_macroblock(&mut mb, luma, cb, cr, q)?;
 
         self.blit_luma(pos, &mb.luma);
         self.blit_chroma(pos, ChromaSelect::Cb, &mb.cb);
         self.blit_chroma(pos, ChromaSelect::Cr, &mb.cr);
+        Ok(())
     }
 
     /// Reconstruct a **whole intra picture** by walking every macroblock in
@@ -448,7 +449,11 @@ impl Svq3Picture {
     ///
     /// Panics if `macroblocks.len() != mb_cols · mb_rows` or if
     /// `q >= crate::svq3_dequant::DEQUANT_COEFF_TABLE_LEN`.
-    pub fn reconstruct_intra_frame(&mut self, macroblocks: &[Svq3IntraMacroblockInput], q: u32) {
+    pub fn reconstruct_intra_frame(
+        &mut self,
+        macroblocks: &[Svq3IntraMacroblockInput],
+        q: u32,
+    ) -> crate::Result<()> {
         let total = self.mb_cols * self.mb_rows;
         assert_eq!(
             macroblocks.len(),
@@ -461,8 +466,9 @@ impl Svq3Picture {
             // mb_cols > 0 is guaranteed by Self::new, so this never errs.
             let pos = crate::svq3::macroblock_position(mb_index as u32, mb_cols)
                 .expect("mb_cols is non-zero");
-            self.reconstruct_intra_macroblock_into(pos, &input.luma, &input.cb, &input.cr, q);
+            self.reconstruct_intra_macroblock_into(pos, &input.luma, &input.cb, &input.cr, q)?;
         }
+        Ok(())
     }
 
     /// Borrow this picture's reconstructed luma plane as a
@@ -816,7 +822,8 @@ mod tests {
             &zero_chroma(),
             &zero_chroma(),
             10,
-        );
+        )
+        .unwrap();
         assert!(pic.luma().iter().all(|&p| p == 128), "luma flat 128");
         assert!(pic.cb().iter().all(|&p| p == 128), "cb flat 128");
         assert!(pic.cr().iter().all(|&p| p == 128), "cr flat 128");
@@ -824,28 +831,17 @@ mod tests {
 
     #[test]
     fn into_driver_propagates_left_column_across_mb_boundary() {
-        // Two horizontally-adjacent 4×4-intra MBs, both Horizontal mode
-        // with zero residual.
-        //
-        // MB0 (top-left) has no left neighbour → each sub-block's DC
-        // fallback would normally fire, but Horizontal needs `left`. The
-        // dispatcher routes an unavailable-left Horizontal block to the DC
-        // fallback (128). So MB0 reconstructs flat 128, and its right
-        // column (picture col 15) is all 128.
-        //
-        // MB1 reads MB0's right column as its left neighbour. Horizontal
-        // mode with zero residual fills every sub-block from `left`, so
-        // MB1 also reconstructs flat 128 — verifying the bind→recon→blit
-        // chain carries the left-column pixels across the MB boundary.
+        // A Horizontal-mode 4×4-intra macroblock at the left picture
+        // edge has no left column: spec/07 §10.2 makes that a bitstream
+        // error (only DC falls back), which the driver propagates.
         let mut pic = Svq3Picture::new(2, 1);
         let luma = zero_residual_luma(Svq3IntraMode::Horizontal);
-        for idx in 0..2u32 {
-            let pos = macroblock_position(idx, 2).unwrap();
-            pic.reconstruct_intra_macroblock_into(pos, &luma, &zero_chroma(), &zero_chroma(), 10);
-        }
-        // Both MBs reconstruct flat 128 (DC fallback at MB0's left edge
-        // propagated rightward by Horizontal prediction).
-        assert!(pic.luma().iter().all(|&p| p == 128));
+        let pos0 = macroblock_position(0, 2).unwrap();
+        assert_eq!(
+            pic.reconstruct_intra_macroblock_into(pos0, &luma, &zero_chroma(), &zero_chroma(), 10)
+                .unwrap_err(),
+            crate::Error::MissingIntraNeighbour(2)
+        );
 
         // Now drive MB0 with a vertical luma gradient written directly,
         // then reconstruct MB1 in Horizontal mode and verify each MB1 row
@@ -866,7 +862,8 @@ mod tests {
             &zero_chroma(),
             &zero_chroma(),
             10,
-        );
+        )
+        .unwrap();
         // MB1 occupies picture columns 16..32. Each row y should be flat
         // equal to MB0's column-15 value at that picture row = 30 + y.
         for y in 0..MB_LUMA_DIM {
@@ -893,7 +890,7 @@ mod tests {
             cr: zero_chroma(),
         };
         let mbs = vec![input; 4];
-        pic.reconstruct_intra_frame(&mbs, 10);
+        pic.reconstruct_intra_frame(&mbs, 10).unwrap();
         assert!(pic.luma().iter().all(|&p| p == 128));
         assert!(pic.cb().iter().all(|&p| p == 128));
         assert!(pic.cr().iter().all(|&p| p == 128));
@@ -908,33 +905,35 @@ mod tests {
         let total = mb_cols * mb_rows;
 
         // Give each MB a distinct luma regime so cross-MB prediction has
-        // observable structure: alternate Vertical / Horizontal / DC.
-        let modes = [
-            Svq3IntraMode::Vertical,
-            Svq3IntraMode::Horizontal,
-            Svq3IntraMode::Dc,
-        ];
+        // observable structure: DC on the top-left, then Horizontal
+        // across the top row, Vertical down the second row (every mode
+        // where its neighbour exists — spec/07 §10.2).
         let inputs: Vec<Svq3IntraMacroblockInput> = (0..total)
-            .map(|i| Svq3IntraMacroblockInput {
-                luma: zero_residual_luma(modes[i % 3]),
-                cb: zero_chroma(),
-                cr: zero_chroma(),
+            .map(|i| {
+                let mode = if i == 0 {
+                    Svq3IntraMode::Dc
+                } else if i < mb_cols {
+                    Svq3IntraMode::Horizontal
+                } else {
+                    Svq3IntraMode::Vertical
+                };
+                Svq3IntraMacroblockInput {
+                    luma: zero_residual_luma(mode),
+                    cb: zero_chroma(),
+                    cr: zero_chroma(),
+                }
             })
             .collect();
 
         let mut frame_pic = Svq3Picture::new(mb_cols, mb_rows);
-        frame_pic.reconstruct_intra_frame(&inputs, 12);
+        frame_pic.reconstruct_intra_frame(&inputs, 12).unwrap();
 
         let mut manual_pic = Svq3Picture::new(mb_cols, mb_rows);
         for (i, input) in inputs.iter().enumerate() {
             let pos = macroblock_position(i as u32, mb_cols as u32).unwrap();
-            manual_pic.reconstruct_intra_macroblock_into(
-                pos,
-                &input.luma,
-                &input.cb,
-                &input.cr,
-                12,
-            );
+            manual_pic
+                .reconstruct_intra_macroblock_into(pos, &input.luma, &input.cb, &input.cr, 12)
+                .unwrap();
         }
 
         assert_eq!(frame_pic.luma(), manual_pic.luma());
@@ -952,7 +951,8 @@ mod tests {
             cr: zero_chroma(),
         };
         // 3 inputs for a 4-MB picture.
-        pic.reconstruct_intra_frame(&[input.clone(), input.clone(), input], 10);
+        pic.reconstruct_intra_frame(&[input.clone(), input.clone(), input], 10)
+            .unwrap();
     }
 
     #[test]
@@ -965,7 +965,7 @@ mod tests {
             cb: zero_chroma(),
             cr: zero_chroma(),
         };
-        pic.reconstruct_intra_frame(&vec![input; 4], 10);
+        pic.reconstruct_intra_frame(&vec![input; 4], 10).unwrap();
 
         let luma_ref = pic.luma_reference();
         assert_eq!(luma_ref.width(), 32);
@@ -1008,7 +1008,7 @@ mod tests {
             cb: zero_chroma(),
             cr: zero_chroma(),
         };
-        pic.reconstruct_intra_frame(&vec![input; 4], 10);
+        pic.reconstruct_intra_frame(&vec![input; 4], 10).unwrap();
 
         let frame = pic.to_video_frame(Some(42));
         assert_eq!(frame.pts, Some(42));

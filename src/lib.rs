@@ -174,6 +174,8 @@ pub mod svq3_pred;
 pub mod svq3_recon;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod svq3_scan;
+#[doc(hidden)]
+pub mod svq3_tables;
 #[cfg(test)]
 mod svq3_testutil;
 
