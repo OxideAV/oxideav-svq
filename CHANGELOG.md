@@ -6,6 +6,11 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Package metadata: the description now names the SVQ3 decoder;
+  `tests/` and `fuzz/` are excluded from the published package.
+
 ### Fixed
 
 - svq3: the intra 4×4 luma DC is an ordinary coefficient

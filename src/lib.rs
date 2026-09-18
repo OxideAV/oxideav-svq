@@ -23,8 +23,9 @@
 //!   [`svq1_reconstruct`], [`svq1_stage_indices`],
 //!   [`svq1_helper_luts`].
 //!
-//! **SVQ3** — parse + reconstruction layers driven from the staged
-//! spec chapters (`docs/video/svq3/spec/01`–`06`):
+//! **SVQ3** — the complete I/P decoder driven from the staged spec
+//! chapters (`docs/video/svq3/spec/01`–`09`), byte-exact on every
+//! access unit of the staged fixtures:
 //!
 //! * [`svq3`] — `SEQH` extradata, slice envelope/header parse, the
 //!   universal variable-length code (spec/06 §1), MB grid geometry.
@@ -44,12 +45,14 @@
 //!   plane/DC, chroma DC) and the `Clip1` writeback.
 //! * [`svq3_recon`] — per-macroblock reconstruction composition for
 //!   the 4×4-intra and 16×16-intra regimes + chroma planes.
-//! * [`svq3_mc`] — reference-plane views and the third-pel /
-//!   half-pel interpolation kernels (spec/05).
+//! * [`svq3_mc`] — reference-plane views and motion compensation
+//!   through the full / half / third-pel kernels (spec/05).
 //! * [`svq3_picture`] — the picture canvas, cross-MB neighbour
 //!   binding, and the `VideoFrame` output bridges.
-//! * [`svq3_frame`] — the slice-level intra access-unit decoder
-//!   (frame walk) composing all of the above.
+//! * [`svq3_filter`] — the intra-picture edge filter (spec/09).
+//! * [`svq3_frame`] — [`Svq3PictureDecoder`], the access-unit decoder
+//!   (spec/07 envelope + macroblock layer, spec/08 inter layer)
+//!   composing all of the above.
 //!
 //! ## Standalone vs registry-integrated
 //!
