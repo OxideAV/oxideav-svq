@@ -29,7 +29,8 @@ use oxideav_core::{
 };
 
 use crate::header::{parse_frame_header, Svq1FrameHeader};
-use crate::svq3::{parse_extradata, parse_wire_slice, Svq3SequenceHeader, Svq3SliceHeader};
+use crate::svq3::{parse_wire_slice, Svq3SequenceHeader, Svq3SliceHeader};
+use crate::svq3_frame::{Svq3DecodeOptions, Svq3PictureDecoder};
 use crate::{CODEC_ID_STR, SVQ3_CODEC_ID_STR};
 
 // ---- Error conversion --------------------------------------------------
@@ -696,60 +697,44 @@ pub fn probe_svq3(ctx: &ProbeContext) -> f32 {
 
 /// Factory function the framework calls to instantiate a fresh SVQ3
 /// decoder.
+///
+/// The `SEQH` stream header lives in `params.extradata` (bare, or
+/// inside the QuickTime `SMI ` wrapper — spec/02 §4). It is parsed
+/// eagerly so the picture geometry is known before the first packet; a
+/// missing or unparseable extradata is not fatal at construction —
+/// [`Svq3DecoderHandle::sequence_header`] returns `None` and the first
+/// `receive_frame` reports the missing header.
 pub fn make_svq3_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let codec_id = params.codec_id.clone();
-    // The SVQ3 sequence header lives in extradata; the factory
-    // tries to parse it eagerly so dimension lookups + the v2 mb-
-    // offset field width are available before the first packet
-    // arrives. A missing or unparseable extradata is **not** fatal
-    // at construction time — round 3 surfaces it via
-    // `Svq3DecoderHandle::sequence_header()` returning `None` and
-    // returning a structural error on the first `send_packet`.
-    let sequence_header = if params.extradata.is_empty() {
+    let decoder = if params.extradata.is_empty() {
         None
     } else {
-        parse_svq3_extradata_flexible(&params.extradata)
+        crate::svq3::parse_extradata_flexible(&params.extradata)
+            .ok()
+            .and_then(|seqh| Svq3PictureDecoder::new(seqh).ok())
     };
     Ok(Box::new(Svq3DecoderHandle {
         codec_id,
-        sequence_header,
+        decoder,
         pending: None,
         last_slice_header: None,
         eof: false,
     }))
 }
 
-/// Parse SVQ3 extradata that may carry the container-level `SMI `
-/// wrapper in front of the `SEQH` record.
-///
-/// QuickTime files deliver the sequence header inside an `SMI ` sample
-/// -entry extension atom — a 4-byte big-endian size plus the `SMI `
-/// tag — ahead of the `SEQH` marker + length + payload
-/// (`docs/video/svq3/wiki/Sorenson_Video_3.wiki` §"Sequence Header";
-/// the staged fixtures' `extradata.bin` files carry exactly this
-/// shape). Accept both the bare `SEQH…` form and the wrapped form by
-/// locating the marker.
-fn parse_svq3_extradata_flexible(extradata: &[u8]) -> Option<crate::svq3::Svq3SequenceHeader> {
-    let start = extradata
-        .windows(crate::svq3::SVQ3_SEQH_MAGIC.len())
-        .position(|w| w == crate::svq3::SVQ3_SEQH_MAGIC)?;
-    parse_extradata(&extradata[start..]).ok()
-}
-
 /// SVQ3 decoder handle bound to a single stream.
 ///
-/// Round 3 implements the structural parse path: `send_packet` walks
-/// the slice's 1-byte prefix + 1-3 byte size field + permuted body,
-/// reverses the permutation, then parses the slice header per the
-/// wiki spec's §"Slice Header". The parsed [`Svq3SliceHeader`] is
-/// recorded in [`Self::last_slice_header`]; `receive_frame` returns
-/// [`Error::Unsupported`] because the macroblock-layer Golomb decode
-/// is out of round-3 scope.
+/// `send_packet` sniffs the access unit's first slice header (so
+/// [`Self::last_slice_header`] reports the slice type / quantiser even
+/// before decode) and `receive_frame` runs the
+/// [`crate::svq3_frame::Svq3PictureDecoder`] over the whole access
+/// unit: I pictures (with the spec/09 edge filter) and P pictures
+/// against the previous picture, output as cropped `Yuv420P` frames.
+/// B pictures are not specified by the staged docs and are reported as
+/// unsupported.
 pub struct Svq3DecoderHandle {
     codec_id: CodecId,
-    /// Parsed SEQH extradata, if it was supplied at construction
-    /// time and parsed successfully.
-    sequence_header: Option<Svq3SequenceHeader>,
+    decoder: Option<Svq3PictureDecoder>,
     pending: Option<Packet>,
     last_slice_header: Option<Svq3SliceHeader>,
     eof: bool,
@@ -759,7 +744,7 @@ impl std::fmt::Debug for Svq3DecoderHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Svq3DecoderHandle")
             .field("codec_id", &self.codec_id)
-            .field("sequence_header", &self.sequence_header)
+            .field("sequence_header", &self.sequence_header())
             .field("pending", &self.pending.as_ref().map(|p| p.data.len()))
             .field("last_slice_header", &self.last_slice_header)
             .field("eof", &self.eof)
@@ -768,21 +753,27 @@ impl std::fmt::Debug for Svq3DecoderHandle {
 }
 
 impl Svq3DecoderHandle {
-    /// Returns the parsed SVQ3 sequence header, if any was supplied
-    /// via [`CodecParameters::extradata`] and successfully parsed at
-    /// construction time.
+    /// The parsed `SEQH` stream header, when the extradata carried one.
     pub fn sequence_header(&self) -> Option<&Svq3SequenceHeader> {
-        self.sequence_header.as_ref()
+        self.decoder.as_ref().map(|d| d.sequence_header())
     }
 
-    /// Returns the most recently parsed SVQ3 slice header, if any.
-    ///
-    /// Populated by [`Decoder::send_packet`] on every structurally
-    /// valid packet. Lets integrators inspect the per-slice frame-
-    /// type / quantiser / frame-number before the (currently
-    /// unsupported) macroblock-layer decode lands.
+    /// The header of the most recently sent access unit's first slice.
     pub fn last_slice_header(&self) -> Option<&Svq3SliceHeader> {
         self.last_slice_header.as_ref()
+    }
+
+    /// The decode options in force (the spec/09 intra edge filter is on
+    /// by default); `None` without a stream header.
+    pub fn options(&self) -> Option<Svq3DecodeOptions> {
+        self.decoder.as_ref().map(|d| d.options())
+    }
+
+    /// Change the decode options; a no-op without a stream header.
+    pub fn set_options(&mut self, options: Svq3DecodeOptions) {
+        if let Some(d) = self.decoder.as_mut() {
+            d.set_options(options);
+        }
     }
 }
 
@@ -797,29 +788,19 @@ impl Decoder for Svq3DecoderHandle {
                 "oxideav-svq: receive_frame must be called before sending another packet",
             ));
         }
-        // Per the wiki spec a packet starting with the 0xFF sentinel
-        // is a frame-data-end marker, not a slice. Surface it as a
-        // structural EOF-style signal via NeedMore so the caller
-        // knows the codec consumed it but no header was parsed.
+        // A packet that is only the 0xff end marker carries no slice.
         if !packet.data.is_empty() && packet.data[0] == crate::svq3::SVQ3_FRAME_END {
             self.pending = Some(packet.clone());
             return Ok(());
         }
-        let num_mbs = self
-            .sequence_header
-            .as_ref()
-            .map(crate::svq3::num_macroblocks)
-            .unwrap_or(1);
-        let protected = self
-            .sequence_header
-            .as_ref()
-            .map(|s| s.protected)
-            .unwrap_or(false);
-        let extended_mode = self
-            .sequence_header
-            .as_ref()
-            .map(|s| s.extended_mode)
-            .unwrap_or(false);
+        let (num_mbs, protected, extended_mode) = match self.sequence_header() {
+            Some(seqh) => (
+                crate::svq3::num_macroblocks(seqh),
+                seqh.protected,
+                seqh.extended_mode,
+            ),
+            None => (1, false, false),
+        };
         let slice = parse_wire_slice(&packet.data, num_mbs, protected, extended_mode)?;
         self.last_slice_header = Some(slice.header);
         self.pending = Some(packet.clone());
@@ -834,29 +815,30 @@ impl Decoder for Svq3DecoderHandle {
                 Err(Error::NeedMore)
             };
         };
-        // A pure frame-end-sentinel packet carries no picture.
         if !packet.data.is_empty() && packet.data[0] == crate::svq3::SVQ3_FRAME_END {
             return Err(Error::NeedMore);
         }
-        let Some(seqh) = self.sequence_header.as_ref() else {
+        let Some(decoder) = self.decoder.as_mut() else {
             return Err(Error::InvalidData(
                 "oxideav-svq: SVQ3 decode requires the SEQH sequence header in extradata".into(),
             ));
         };
-        match self.last_slice_header.as_ref().map(|h| h.frame_type) {
-            Some(crate::svq3::Svq3FrameType::Intra) => {
-                let picture = crate::svq3_frame::decode_intra_access_unit(seqh, &packet.data)?;
-                let video = picture.to_video_frame_cropped(
-                    usize::from(seqh.width),
-                    usize::from(seqh.height),
-                    packet.pts,
-                );
-                Ok(Frame::Video(video))
-            }
-            _ => Err(Error::unsupported(
-                "oxideav-svq: SVQ3 P/B macroblock-layer decode not yet implemented — see crates/oxideav-svq/README.md",
-            )),
-        }
+        let decoded =
+            match decoder.decode_access_unit(&packet.data) {
+                Ok(d) => d,
+                Err(crate::Error::NotImplemented) => return Err(Error::unsupported(
+                    "oxideav-svq: SVQ3 B slices and the extended macroblock-layer mode are not \
+                     specified by the staged docs — see crates/oxideav-svq/README.md",
+                )),
+                Err(e) => return Err(e.into()),
+            };
+        let seqh = decoder.sequence_header();
+        let video = decoded.picture.to_video_frame_cropped(
+            usize::from(seqh.width),
+            usize::from(seqh.height),
+            packet.pts,
+        );
+        Ok(Frame::Video(video))
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -868,6 +850,9 @@ impl Decoder for Svq3DecoderHandle {
         self.pending = None;
         self.last_slice_header = None;
         self.eof = false;
+        if let Some(d) = self.decoder.as_mut() {
+            d.reset();
+        }
         Ok(())
     }
 }
@@ -1508,7 +1493,9 @@ mod tests {
         params2.extradata = minimal_svq3_extradata();
         let handle = Svq3DecoderHandle {
             codec_id: CodecId::new(SVQ3_CODEC_ID_STR),
-            sequence_header: crate::svq3::parse_extradata(&params2.extradata).ok(),
+            decoder: crate::svq3::parse_extradata(&params2.extradata)
+                .ok()
+                .and_then(|seqh| Svq3PictureDecoder::new(seqh).ok()),
             pending: None,
             last_slice_header: None,
             eof: false,
@@ -1537,7 +1524,7 @@ mod tests {
     fn svq3_decoder_records_slice_header() {
         let mut handle = Svq3DecoderHandle {
             codec_id: CodecId::new(SVQ3_CODEC_ID_STR),
-            sequence_header: None,
+            decoder: None,
             pending: None,
             last_slice_header: None,
             eof: false,
@@ -1686,7 +1673,7 @@ mod tests {
     fn svq3_decoder_reset_clears_state() {
         let mut handle = Svq3DecoderHandle {
             codec_id: CodecId::new(SVQ3_CODEC_ID_STR),
-            sequence_header: None,
+            decoder: None,
             pending: None,
             last_slice_header: None,
             eof: true,

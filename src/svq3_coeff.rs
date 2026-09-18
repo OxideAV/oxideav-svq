@@ -40,15 +40,12 @@
 //! treats a violation as a bitstream error rather than wrapping or
 //! clamping.
 //!
-//! The alternate-scan block is read as **two independent half-scans**
-//! of up to eight coefficients each (scan positions `0..8` then
-//! `8..16`): the wiki snapshot §"Coefficient decoding" states the
-//! block "is coded in two parts of up to eight coefficients
-//! corresponding to each half-scan", the staged alternate scan order
-//! splits exactly into two 8-entry halves (spec/01 Gap 1), and the
-//! alternate book's escape run mask is 7 (tables/06 `.meta`) — a run
-//! can never span more than one 8-position half, which is only
-//! consistent with per-half coding.
+//! The alternate-scan block is **two consecutive lists, each ended by
+//! its own code number 0**, the first walked from alternate-scan
+//! position 0 and the second from position 8 (spec/06 §2, spec/07 §8,
+//! docs round 6). Neither list is capped at eight coefficients: a run
+//! may carry the first list past position 7, and any run that reaches
+//! position 16 is an error.
 
 use crate::bitreader::BitReader;
 use crate::error::{Error, Result};
@@ -279,9 +276,9 @@ pub fn resolve_level_run(book: ResidualBook, code: u32) -> Option<(i32, u32)> {
     Some((level, run))
 }
 
-/// Decode one residual 4×4 block through the `normal_scan` book,
-/// storing **raw levels** at the raster positions `scan` maps the
-/// reached scan positions to.
+/// Decode one residual list through the `normal_scan` book, storing
+/// **raw levels** at the raster positions `scan` maps the reached scan
+/// positions to (spec/06 §2).
 ///
 /// * `scan` — the destination map (scan position → raster index),
 ///   normally [`crate::svq3_scan::NORMAL_ZIGZAG_4X4_SCAN`].
@@ -291,11 +288,11 @@ pub fn resolve_level_run(book: ResidualBook, code: u32) -> Option<(i32, u32)> {
 /// * `out` — cleared to zero first (spec/06 §2: "each decoder clears
 ///   the destination block before it starts").
 ///
-/// Reads code numbers until the end-of-block symbol; a run that would
-/// carry the scan position past the end of the block is a bitstream
-/// error (spec/06 §5). Returns the scan position reached — `start`
-/// exactly when no coefficient was decoded, which is the "DC only"
-/// observable spec/04 §4.3 keys on.
+/// Reads code numbers until the code number 0 that ends every list;
+/// a run that would carry the scan position past the end of the block
+/// is a bitstream error (spec/06 §5). Returns the scan position
+/// reached — `start` exactly when no coefficient was decoded, which
+/// is the "DC only" observable spec/04 §4.3 keys on.
 pub fn decode_residual_4x4_normal(
     br: &mut BitReader<'_>,
     scan: &[usize; 16],
@@ -304,10 +301,22 @@ pub fn decode_residual_4x4_normal(
 ) -> Result<usize> {
     debug_assert!(start < 16);
     *out = [0; 16];
+    decode_list(br, ResidualBook::NormalScan, scan, start, out)
+}
+
+/// Walk one `(level, run)` list of `book` from scan position `start`
+/// until its terminating code number 0, placing levels through `scan`.
+fn decode_list(
+    br: &mut BitReader<'_>,
+    book: ResidualBook,
+    scan: &[usize; 16],
+    start: usize,
+    out: &mut [i32; 16],
+) -> Result<usize> {
     let mut pos = start;
     loop {
         let code = read_universal_code(br)?;
-        let Some((level, run)) = resolve_level_run(ResidualBook::NormalScan, code) else {
+        let Some((level, run)) = resolve_level_run(book, code) else {
             return Ok(pos);
         };
         pos = pos
@@ -318,22 +327,16 @@ pub fn decode_residual_4x4_normal(
         }
         out[scan[pos]] = level;
         pos += 1;
-        if pos == 16 {
-            return Ok(pos);
-        }
     }
 }
 
 /// Decode one intra-4×4 luma residual block through the
-/// `alternate_scan` book: **two independent half-scans** of up to
-/// eight coefficients each (see the module docs for why the block is
-/// two-part).
-///
-/// The first half covers scan positions `0..8`, the second `8..16`,
-/// both mapped through [`crate::svq3_scan::ALT_SCAN_4X4_SCAN`]-style
-/// destination maps; each half's runs are relative to that half and
-/// each half is terminated by its own end-of-block symbol (or by
-/// filling all eight of its positions). `out` is cleared first.
+/// `alternate_scan` book: **two consecutive lists, each terminated by
+/// its own code number 0** (spec/06 §2, spec/07 §8). The first list is
+/// walked from alternate-scan position 0 and the second from position
+/// 8; neither is capped at eight coefficients — a run may carry the
+/// first list past position 7 — and any run that reaches position 16
+/// is an error. `out` is cleared first.
 ///
 /// Returns the total number of non-zero coefficients decoded.
 pub fn decode_residual_4x4_alt(
@@ -343,25 +346,13 @@ pub fn decode_residual_4x4_alt(
 ) -> Result<usize> {
     *out = [0; 16];
     let mut count = 0usize;
-    for half in 0..2usize {
-        let base = half * 8;
-        let mut pos = 0usize;
-        loop {
-            let code = read_universal_code(br)?;
-            let Some((level, run)) = resolve_level_run(ResidualBook::AlternateScan, code) else {
-                break;
-            };
-            pos = pos
-                .checked_add(run as usize)
-                .ok_or(Error::BadBitWidth(run))?;
-            if pos >= 8 {
-                return Err(Error::BadBitWidth(pos as u32));
-            }
-            out[scan[base + pos]] = level;
-            count += 1;
-            pos += 1;
-            if pos == 8 {
-                break;
+    for start in [0usize, 8] {
+        let mut list = [0i32; 16];
+        decode_list(br, ResidualBook::AlternateScan, scan, start, &mut list)?;
+        for (dst, src) in out.iter_mut().zip(list.iter()) {
+            if *src != 0 {
+                *dst = *src;
+                count += 1;
             }
         }
     }
@@ -374,7 +365,9 @@ pub fn decode_residual_4x4_alt(
 /// run advances the position by one per skipped coefficient
 /// (spec/06 §3). The coded order is the 2×2 raster
 /// `[[c0, c1], [c2, c3]]` (spec/04 §2.2). `out` is cleared first;
-/// raw levels are stored. Returns the position reached.
+/// raw levels are stored; the list ends at its code number 0 and a
+/// run past the fourth position is an error. Returns the position
+/// reached.
 pub fn decode_chroma_dc_2x2(br: &mut BitReader<'_>, out: &mut [i32; 4]) -> Result<usize> {
     *out = [0; 4];
     let mut pos = 0usize;
@@ -391,9 +384,6 @@ pub fn decode_chroma_dc_2x2(br: &mut BitReader<'_>, out: &mut [i32; 4]) -> Resul
         }
         out[pos] = level;
         pos += 1;
-        if pos == 4 {
-            return Ok(pos);
-        }
     }
 }
 
@@ -605,10 +595,13 @@ mod tests {
     }
 
     #[test]
-    fn normal_block_fills_to_capacity_without_trailing_symbol() {
-        // Sixteen (+1, 0) codes fill positions 0..16; the decoder must
-        // stop at the bound without demanding a further symbol.
-        let items: Vec<(u32, u32)> = (0..16).map(|_| ue(1)).collect();
+    fn normal_block_full_list_still_ends_with_code_zero() {
+        // Sixteen (+1, 0) codes fill positions 0..16; the list still
+        // ends with its code number 0 (spec/06 §2: code 0 always ends a
+        // list), and a further coefficient after a full block is the
+        // §5 bound error.
+        let mut items: Vec<(u32, u32)> = (0..16).map(|_| ue(1)).collect();
+        items.push(ue(0));
         let bytes = pack(&items);
         let mut br = BitReader::new(&bytes);
         let mut out = [0i32; 16];
@@ -616,11 +609,23 @@ mod tests {
             .expect("decode");
         assert_eq!(pos, 16);
         assert_eq!(out, [1i32; 16]);
-        assert_eq!(br.bits_remaining(), 0, "no end-of-block symbol consumed");
+        assert_eq!(
+            br.bits_consumed(),
+            16 * 3 + 1,
+            "the end-of-list symbol was consumed"
+        );
+
+        let items: Vec<(u32, u32)> = (0..17).map(|_| ue(1)).collect();
+        let bytes = pack(&items);
+        let mut br = BitReader::new(&bytes);
+        assert!(matches!(
+            decode_residual_4x4_normal(&mut br, &NORMAL_ZIGZAG_4X4_SCAN, 0, &mut out),
+            Err(Error::BadBitWidth(16))
+        ));
     }
 
     #[test]
-    fn alt_block_two_halves_are_independent() {
+    fn alt_block_two_lists_start_at_positions_0_and_8() {
         // First half: code 1 = (+1, 0) at half-pos 0 → scan[0]; end.
         // Second half: code 3 = (+1, 1) skips half-pos 0, stores at
         // half-pos 1 → scan[8 + 1]; end.
@@ -636,29 +641,60 @@ mod tests {
     }
 
     #[test]
-    fn alt_block_half_overflow_errors() {
-        // code 17 = (+1, 4): pos 4, then again: 5+4=9 ≥ 8 → error.
-        let bytes = pack(&[ue(17), ue(17)]);
+    fn alt_block_first_list_may_run_past_position_7() {
+        // First list: (+1, 0) then a run of 8 → position 9 (past the
+        // former "half" boundary), then end; second list: (+1, 0) at
+        // position 8, end. Alternate book code for (+1, run 8) is an
+        // escape (run mask 7 … run 8 needs the escape form), so use two
+        // runs of 4 instead: positions 0, 5, 10.
+        let plus1_run4 = (1u32..64)
+            .find(|&c| resolve_level_run(ResidualBook::AlternateScan, c) == Some((1, 4)))
+            .expect("(+1, run 4) exists in the alternate book");
+        let bytes = pack(&[ue(1), ue(plus1_run4), ue(plus1_run4), ue(0), ue(1), ue(0)]);
+        let mut br = BitReader::new(&bytes);
+        let mut out = [0i32; 16];
+        let n = decode_residual_4x4_alt(&mut br, &ALT_SCAN_4X4_SCAN, &mut out).expect("decode");
+        assert_eq!(n, 4);
+        let mut expected = [0i32; 16];
+        expected[ALT_SCAN_4X4_SCAN[0]] = 1;
+        expected[ALT_SCAN_4X4_SCAN[5]] = 1;
+        expected[ALT_SCAN_4X4_SCAN[10]] = 1;
+        expected[ALT_SCAN_4X4_SCAN[8]] = 1;
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn alt_block_run_reaching_position_16_errors() {
+        // Second list from position 8: (+1, run 7) lands on 15 (legal),
+        // a following (+1, run 0) would be position 16 → error.
+        let plus1_run7 = (1u32..64)
+            .find(|&c| resolve_level_run(ResidualBook::AlternateScan, c) == Some((1, 7)))
+            .expect("(+1, run 7) exists in the alternate book");
+        let bytes = pack(&[ue(0), ue(plus1_run7), ue(1)]);
         let mut br = BitReader::new(&bytes);
         let mut out = [0i32; 16];
         assert!(matches!(
             decode_residual_4x4_alt(&mut br, &ALT_SCAN_4X4_SCAN, &mut out),
-            Err(Error::BadBitWidth(_))
+            Err(Error::BadBitWidth(16))
         ));
     }
 
     #[test]
-    fn alt_block_full_halves_consume_no_end_symbol() {
-        // Eight (+1, 0) codes fill the first half, eight more the
-        // second; no end-of-block symbols anywhere.
-        let items: Vec<(u32, u32)> = (0..16).map(|_| ue(1)).collect();
+    fn alt_block_full_lists_end_with_code_zero() {
+        // Eight (+1, 0) codes then end, twice: sixteen coefficients and
+        // two end symbols.
+        let mut items: Vec<(u32, u32)> = Vec::new();
+        for _ in 0..2 {
+            items.extend((0..8).map(|_| ue(1)));
+            items.push(ue(0));
+        }
         let bytes = pack(&items);
         let mut br = BitReader::new(&bytes);
         let mut out = [0i32; 16];
         let n = decode_residual_4x4_alt(&mut br, &ALT_SCAN_4X4_SCAN, &mut out).expect("decode");
         assert_eq!(n, 16);
         assert_eq!(out, [1i32; 16]);
-        assert_eq!(br.bits_remaining(), 0);
+        assert_eq!(br.bits_consumed(), 2 * (8 * 3 + 1));
     }
 
     #[test]
@@ -688,17 +724,25 @@ mod tests {
     }
 
     #[test]
-    fn chroma_dc_block_fills_without_end_symbol() {
-        let items: Vec<(u32, u32)> = (0..4).map(|_| ue(1)).collect();
+    fn chroma_dc_block_full_list_ends_with_code_zero() {
+        let mut items: Vec<(u32, u32)> = (0..4).map(|_| ue(1)).collect();
+        items.push(ue(0));
         let bytes = pack(&items);
         let mut br = BitReader::new(&bytes);
         let mut out = [0i32; 4];
         let pos = decode_chroma_dc_2x2(&mut br, &mut out).expect("decode");
         assert_eq!(pos, 4);
         assert_eq!(out, [1i32; 4]);
-        // Four 3-bit codewords were consumed and nothing else — no
-        // end-of-block symbol after the fill.
-        assert_eq!(br.bits_consumed(), 12, "no end-of-block symbol consumed");
+        // Four 3-bit codewords plus the 1-bit end symbol.
+        assert_eq!(br.bits_consumed(), 13);
+        // A fifth coefficient is the bound error.
+        let items: Vec<(u32, u32)> = (0..5).map(|_| ue(1)).collect();
+        let bytes = pack(&items);
+        let mut br = BitReader::new(&bytes);
+        assert!(matches!(
+            decode_chroma_dc_2x2(&mut br, &mut out),
+            Err(Error::BadBitWidth(4))
+        ));
     }
 
     #[test]

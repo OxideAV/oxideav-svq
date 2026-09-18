@@ -471,6 +471,48 @@ impl Svq3Picture {
         Ok(())
     }
 
+    /// Copy the macroblock at `pos` (16×16 luma, both 8×8 chroma blocks)
+    /// from `reference` at the same position — the zero-motion copy of a
+    /// P-slice skip macroblock (spec/08 §5) and of the macroblocks a P
+    /// slice leaves uncoded (spec/08 §7).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the two pictures differ in geometry or `pos` lies
+    /// outside the grid.
+    pub fn copy_macroblock_from(&mut self, reference: &Svq3Picture, pos: Svq3MacroblockPosition) {
+        assert_eq!(
+            (self.mb_cols, self.mb_rows),
+            (reference.mb_cols, reference.mb_rows)
+        );
+        assert!(
+            (pos.mb_x as usize) < self.mb_cols && (pos.mb_y as usize) < self.mb_rows,
+            "macroblock position out of picture grid"
+        );
+        let lw = self.luma_width();
+        let (ox, oy) = (
+            pos.mb_x as usize * MB_LUMA_DIM,
+            pos.mb_y as usize * MB_LUMA_DIM,
+        );
+        for y in 0..MB_LUMA_DIM {
+            let base = (oy + y) * lw + ox;
+            self.luma[base..base + MB_LUMA_DIM]
+                .copy_from_slice(&reference.luma[base..base + MB_LUMA_DIM]);
+        }
+        let cw = self.chroma_width();
+        let (cx, cy) = (
+            pos.mb_x as usize * CHROMA_PLANE_DIM,
+            pos.mb_y as usize * CHROMA_PLANE_DIM,
+        );
+        for y in 0..CHROMA_PLANE_DIM {
+            let base = (cy + y) * cw + cx;
+            self.cb[base..base + CHROMA_PLANE_DIM]
+                .copy_from_slice(&reference.cb[base..base + CHROMA_PLANE_DIM]);
+            self.cr[base..base + CHROMA_PLANE_DIM]
+                .copy_from_slice(&reference.cr[base..base + CHROMA_PLANE_DIM]);
+        }
+    }
+
     /// Borrow this picture's reconstructed luma plane as a
     /// [`crate::svq3_mc::ReferencePlane`] for inter motion compensation.
     ///

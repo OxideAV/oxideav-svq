@@ -8,6 +8,35 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- svq3: the intra 4×4 luma DC is an ordinary coefficient
+  (`level × dequant[q]`, spec/06 §4 — its worked instance, +1 at
+  quantiser 13 adding 3 to the block, is a test); the wiki-era fixed
+  `13·13·1538` inline intra DC scale is removed
+  (`dequantize_transform_intra_luma_block`, `dequantize_intra_luma_dc`,
+  `INTRA_LUMA_DC_SCALE*`, `reconstruct_intra_luma_macroblock_from_coeffs_intra_dc`).
+- svq3: every residual list ends at its code number 0 (spec/06 §2) —
+  a full block still carries the terminator and a further coefficient
+  is the §5 bound error; the alternate-scan block is two consecutive
+  lists from positions 0 and 8, neither capped at eight coefficients
+  (spec/07 §8).
+- svq3: the chroma section is Cb DC, Cr DC, then the eight AC blocks
+  (spec/07 §6 items 5–6, §7 items 6–7, spec/08 §6) — not per plane.
+- svq3: an I-slice intra 4×4 macroblock carries no quantiser delta; the
+  intra 16×16 delta is always present, in every slice type (spec/07
+  §9); the delta updates the running quantiser in place.
+- svq3: `intra16x16_pred_mode` binds 0 = DC, 1 = vertical,
+  2 = horizontal, 3 = plane (spec/07 §10.1); directional modes at the
+  picture edge are `Error::MissingIntraNeighbour`.
+- svq3: the 16×16 plane predictor is fixture-pinned: H.264's eight-tap
+  gradients including the above-left corner, transposed (top gradient
+  down `y`, left gradient across `x`), at half H.264's scale
+  (`(G + 16) >> 5`); the spec/01 Gap 4 prose formula (seven taps, no
+  corner, `(5G + 32) >> 6`) mis-predicts three of the 240×128 sync
+  frame's seven plane macroblocks.
+- svq3: the chroma DC predictor follows H.264's per-quadrant rule —
+  the top-right quadrant prefers the top row, the bottom-left the
+  left column (spec/01 Gap 4 "exactly as H.264 chroma DC";
+  fixture-pinned, 2016 Cb samples of the 240×128 sync frame).
 - svq3: macroblock type code numbers are per slice type (spec/07 §5):
   I slices carry only 0 (intra 4×4) and 1…24 (intra 16×16, record
   `c − 1`); P slices 0…7 inter, 8 intra 4×4, 9…32 intra 16×16 and 33
@@ -56,6 +85,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- svq3: `Svq3PictureDecoder` (`svq3_frame`) — the stateful access-unit
+  decoder: the spec/07 §2 packet walk (slices, zero packets, the end
+  marker), the §4 macroblock loop with its byte-boundary end test,
+  the per-slice 4×4-block availability / context map (§10.2), the
+  I-slice grammar of §6–§9 and the reference picture for the P path;
+  `decode_intra_access_unit` remains as the filter-off intra
+  convenience. `Svq3Picture::copy_macroblock_from` (zero-motion copy),
+  `svq3::parse_extradata_flexible` (bare or `SMI `-wrapped `SEQH`),
+  and prediction-taking residual helpers in `svq3_recon`.
+- svq3: `tests/svq3_fixture_conformance.rs` — the AU-by-AU scorecard
+  against `docs/video/svq3/fixtures/*/expected.yuv` (located through
+  `OXIDEAV_SVQ3_FIXTURES` or the umbrella docs checkout; skipped when
+  absent). **All three I access units decode byte-exact on every
+  plane**: `real-sample-240x128` AU0 (120 macroblocks, 92 intra 4×4 +
+  28 intra 16×16 at quantiser 0–1) and `real-sample-320x240-short-seqh`
+  AU0 and AU2 — including the leading macroblock that blocked
+  r446–r450.
 - svq3: `tables/07` (intra 4×4 prediction-mode pairs), `tables/08`
   (the `6 × 6 × 5` neighbour-context resolution) and `tables/09` (the
   intra-picture edge-filter limit) are mirrored bit-exact under

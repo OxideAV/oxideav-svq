@@ -590,70 +590,53 @@ pub const PRED_16X16_DIM: usize = 16;
 /// Number of samples in one 16×16 predicted block.
 pub const PRED_16X16_SAMPLES: usize = PRED_16X16_DIM * PRED_16X16_DIM;
 
-/// The SVQ3 16×16 luma **plane** predictor — the standard H.264 plane
-/// prediction "but transposed", per
-/// `docs/video/svq3/spec/01-reconstruction-composition.md` Gap 4.
+/// The 16×16 luma **plane** predictor (`intra16x16_pred_mode` 3,
+/// spec/07 §10.1; spec/01 Gap 4 "the same as H.264 but transposed").
 ///
-/// Gap 4 pins the decode-side equations. With the top row `top[0..=15]`
-/// (`top[x]`, x = 0..15) and left column `left[0..=15]` (`left[y]`,
-/// y = 0..15):
-///
-/// ```text
-///   H = Σ_{x'=1..7} x' · ( top[7+x']  − top[7−x']  )
-///   V = Σ_{y'=1..7} y' · ( left[7+y'] − left[7−y'] )
-///   a = 16 · ( top[15] + left[15] )
-///   b = (5·H + 32) >> 6
-///   c = (5·V + 32) >> 6
-/// ```
-///
-/// Standard H.264 writes the plane back as
-/// `Clip1( (a + b·(x−7) + c·(y−7) + 16) >> 5 )`; SVQ3's documented
-/// **transpose** swaps the per-pixel coordinate roles so `b` is applied
-/// along `y` and `c` along `x`:
+/// Fixture-pinned form (r459, `real-sample-240x128` sync frame: all
+/// seven plane macroblocks byte-exact, including three that the
+/// spec/01 prose formula gets wrong):
 ///
 /// ```text
-///   pred[x, y] = Clip1( (a + b·(y−7) + c·(x−7) + 16) >> 5 )
+/// H = Σ_{k=1..7} k · (top[7+k] − top[7−k])  + 8 · (top[15]  − corner)
+/// V = Σ_{k=1..7} k · (left[7+k] − left[7−k]) + 8 · (left[15] − corner)
+/// a = 16 · (top[15] + left[15])
+/// b = (H + 16) >> 5
+/// c = (V + 16) >> 5
+/// pred[x, y] = Clip1( (a + b · (y − 7) + c · (x − 7) + 16) >> 5 )
 /// ```
 ///
-/// (`x` = col, `y` = row). All constants (`5`, `32`, `>>6`, `16`,
-/// `>>5`) are the standard H.264 plane constants per Gap 4. The output
-/// is row-major (`out[y * 16 + x]`). The `Clip1` clamp is the same
-/// 8-bit `[0, 255]` saturation as [`reconstruct_sample`]
-/// ([`RECON_SAMPLE_MIN`] / [`RECON_SAMPLE_MAX`]).
-///
-/// This predictor requires both the top row and the left column. The
-/// caller (macroblock loop) only selects the plane predictor for an
-/// interior macroblock where both are available; for an edge macroblock
-/// the 16×16 DC predictor [`predict_dc_16x16`] is used instead.
+/// i.e. H.264's eight-tap gradients including the above-left corner
+/// sample, **transposed** (the top-row gradient runs down `y`, the
+/// left-column gradient across `x`), at **half** H.264's
+/// `(5·G + 32) >> 6` scale. The fixtures cannot separate `(G + 16) >> 5`
+/// from `(5·G + 48) >> 7` (they agree for `|G| < 100`); the former is
+/// carried and the constant is a standing docs ask.
 #[must_use]
 pub const fn predict_plane_16x16(
     top: [u8; PRED_16X16_DIM],
     left: [u8; PRED_16X16_DIM],
+    corner: u8,
 ) -> [u8; PRED_16X16_SAMPLES] {
-    // H = Σ_{x'=1..7} x' · (top[7+x'] − top[7−x'])
     let mut h: i32 = 0;
+    let mut v: i32 = 0;
     let mut k = 1;
     while k <= 7 {
         h += (k as i32) * (top[7 + k] as i32 - top[7 - k] as i32);
-        k += 1;
-    }
-    // V = Σ_{y'=1..7} y' · (left[7+y'] − left[7−y'])
-    let mut v: i32 = 0;
-    k = 1;
-    while k <= 7 {
         v += (k as i32) * (left[7 + k] as i32 - left[7 - k] as i32);
         k += 1;
     }
+    h += 8 * (top[15] as i32 - corner as i32);
+    v += 8 * (left[15] as i32 - corner as i32);
     let a = 16 * (top[15] as i32 + left[15] as i32);
-    let b = (5 * h + 32) >> 6;
-    let c = (5 * v + 32) >> 6;
+    let b = (h + 16) >> 5;
+    let c = (v + 16) >> 5;
 
     let mut out = [0u8; PRED_16X16_SAMPLES];
-    let mut y = 0; // row
+    let mut y = 0;
     while y < PRED_16X16_DIM {
-        let mut x = 0; // col
+        let mut x = 0;
         while x < PRED_16X16_DIM {
-            // SVQ3 transpose: b along y, c along x.
             let raw = (a + b * (y as i32 - 7) + c * (x as i32 - 7) + 16) >> 5;
             let clamped = if raw < RECON_SAMPLE_MIN {
                 RECON_SAMPLE_MIN
@@ -759,31 +742,24 @@ pub const PRED_CHROMA_DIM: usize = 8;
 /// Number of samples in one 8×8 chroma predicted block.
 pub const PRED_CHROMA_SAMPLES: usize = PRED_CHROMA_DIM * PRED_CHROMA_DIM;
 
-/// The SVQ3 8×8 chroma predictor — **DC mode only**, per
-/// `docs/video/svq3/spec/01-reconstruction-composition.md` Gap 4
-/// ("SVQ3 forces chroma to DC mode only (no chroma plane / vertical /
-/// horizontal selection)").
+/// The 8×8 chroma **DC** predictor — SVQ3's only chroma mode (spec/01
+/// Gap 4, spec/07 §10.3), one DC value per 4×4 quadrant "exactly as
+/// H.264 chroma DC":
 ///
-/// Gap 4 pins the per-4×4-quadrant DC value via the standard H.264
-/// chroma-DC averaging over available neighbours. Each of the four 4×4
-/// quadrants of the 8×8 block averages its own 4 top samples and 4
-/// left samples:
+/// * quadrant (0, 0) and quadrant (1, 1): both neighbours available →
+///   `(Σ top₄ + Σ left₄ + 4) >> 3`; only top → `(Σ top₄ + 2) >> 2`;
+///   only left → `(Σ left₄ + 2) >> 2`; neither → 128;
+/// * quadrant (1, 0) (top-right): the top row when available, else
+///   the left column, else 128;
+/// * quadrant (0, 1) (bottom-left): the left column when available,
+///   else the top row, else 128;
 ///
-/// ```text
-///   if both top and left available:  dc = (Σ top[0..3] + Σ left[0..3] + 4) >> 3
-///   elif only top available:         dc = (Σ top[0..3] + 2) >> 2
-///   elif only left available:        dc = (Σ left[0..3] + 2) >> 2
-///   else:                            dc = 128
-/// ```
-///
-/// applied per the four 4×4 chroma-DC quadrants exactly as H.264
-/// chroma DC. `top[0..=7]` / `left[0..=7]` are the 8 reconstructed
-/// neighbour samples above / to the left of the 8×8 chroma block.
-/// For quadrant `(qr, qc)` (qr, qc ∈ {0, 1}) the top group is
-/// `top[qc*4 .. qc*4+4]` and the left group is
-/// `left[qr*4 .. qr*4+4]`. The single quadrant DC value fills the
-/// quadrant's 4×4 samples; the four quadrant values are written into
-/// the row-major 8×8 output (`out[y * 8 + x]`).
+/// where `top₄` / `left₄` are the four neighbour samples spanning the
+/// quadrant (`top[qc·4 .. qc·4+4]`, `left[qr·4 .. qr·4+4]`). The
+/// off-diagonal preference is fixture-pinned (r459: the crate's earlier
+/// symmetric average differed from the reference on 2016 Cb samples of
+/// the 240×128 sync frame). `top_available` / `left_available` are the
+/// picture-edge tests of spec/07 §10.1.
 #[must_use]
 pub fn predict_chroma_dc_8x8(
     top: [u8; PRED_CHROMA_DIM],
@@ -791,32 +767,34 @@ pub fn predict_chroma_dc_8x8(
     top_available: bool,
     left_available: bool,
 ) -> [u8; PRED_CHROMA_SAMPLES] {
-    // Per-quadrant DC: sum the 4 top samples / 4 left samples of the
-    // quadrant, then the availability-driven rounding.
-    let quad_dc = |top4: i32, left4: i32| -> u8 {
-        let dc = if top_available && left_available {
-            (top4 + left4 + 4) >> 3
-        } else if top_available {
-            (top4 + 2) >> 2
-        } else if left_available {
-            (left4 + 2) >> 2
-        } else {
-            128
-        };
-        dc as u8
-    };
     let group_sum = |arr: &[u8; PRED_CHROMA_DIM], base: usize| -> i32 {
         arr[base] as i32 + arr[base + 1] as i32 + arr[base + 2] as i32 + arr[base + 3] as i32
     };
+    let both = |top4: i32, left4: i32| (top4 + left4 + 4) >> 3;
+    let one = |sum4: i32| (sum4 + 2) >> 2;
 
     let mut out = [0u8; PRED_CHROMA_SAMPLES];
-    for y in 0..PRED_CHROMA_DIM {
-        let qr = y / 4; // quadrant row
-        let left4 = group_sum(&left, qr * 4);
-        for x in 0..PRED_CHROMA_DIM {
-            let qc = x / 4; // quadrant col
+    for qr in 0..2usize {
+        for qc in 0..2usize {
             let top4 = group_sum(&top, qc * 4);
-            out[y * PRED_CHROMA_DIM + x] = quad_dc(top4, left4);
+            let left4 = group_sum(&left, qr * 4);
+            let dc = match (qr, qc, top_available, left_available) {
+                // Off-diagonal quadrants prefer one neighbour.
+                (0, 1, true, _) => one(top4),
+                (0, 1, false, true) => one(left4),
+                (1, 0, _, true) => one(left4),
+                (1, 0, true, false) => one(top4),
+                // Diagonal quadrants average what is available.
+                (_, _, true, true) => both(top4, left4),
+                (_, _, true, false) => one(top4),
+                (_, _, false, true) => one(left4),
+                (_, _, false, false) => 128,
+            };
+            for y in 0..4 {
+                for x in 0..4 {
+                    out[(qr * 4 + y) * PRED_CHROMA_DIM + qc * 4 + x] = dc as u8;
+                }
+            }
         }
     }
     out
@@ -1350,7 +1328,7 @@ mod tests {
         // pred = (32v + 16) >> 5 = v (for v in 0..=255, the +16 rounds
         // 32v/32 exactly to v).
         for &v in [0u8, 1, 50, 100, 128, 200, 255].iter() {
-            let out = predict_plane_16x16([v; 16], [v; 16]);
+            let out = predict_plane_16x16([v; 16], [v; 16], v);
             assert_eq!(out, [v; 256], "uniform {v}");
         }
     }
@@ -1363,31 +1341,64 @@ mod tests {
 
     #[test]
     fn plane16_transpose_b_along_y_c_along_x() {
-        // Construct neighbours that give a known H, V and verify the
-        // transposed application: b applied along y, c along x.
-        // Use a horizontal ramp in `top` and flat `left`.
+        // A ramp in `top` and a flat `left`: the top gradient must run
+        // down y (transposed), with the eight-tap H.264 window
+        // including the corner and the half-scale (H + 16) >> 5.
         let mut top = [0u8; 16];
         for (i, t) in top.iter_mut().enumerate() {
             *t = (8 * i) as u8; // 0,8,16,...,120
         }
         let left = [60u8; 16];
-        let out = predict_plane_16x16(top, left);
+        let corner = 4u8;
+        let out = predict_plane_16x16(top, left, corner);
 
-        // Recompute b, c the same way the function does.
         let mut h = 0i32;
         for k in 1..=7i32 {
             h += k * (top[7 + k as usize] as i32 - top[7 - k as usize] as i32);
         }
-        let v = 0i32; // left flat
+        h += 8 * (top[15] as i32 - corner as i32);
+        let v = 8 * (left[15] as i32 - corner as i32); // left flat
         let a = 16 * (top[15] as i32 + left[15] as i32);
-        let b = (5 * h + 32) >> 6;
-        let c = (5 * v + 32) >> 6;
-        // c == 0 (V == 0), so prediction varies only along y (via b).
-        assert_eq!(c, 0);
-        // Spot-check (x=3, y=5): (a + b*(5-7) + c*(3-7) + 16) >> 5.
-        let raw = (a + b * (5 - 7) + c * (3 - 7) + 16) >> 5;
-        let expected = raw.clamp(0, 255) as u8;
-        assert_eq!(out[5 * 16 + 3], expected);
+        let b = (h + 16) >> 5;
+        let c = (v + 16) >> 5;
+        assert_ne!(b, 0);
+        for y in 0..16 {
+            for x in 0..16 {
+                let raw = (a + b * (y as i32 - 7) + c * (x as i32 - 7) + 16) >> 5;
+                assert_eq!(out[y * 16 + x], raw.clamp(0, 255) as u8, "({x},{y})");
+            }
+        }
+        // Rows vary with y through b; along x only through c.
+        assert_ne!(out[0], out[15 * 16]);
+    }
+
+    #[test]
+    fn plane16_fixture_pinned_blocks() {
+        // real-sample-240x128 sync frame, macroblocks (2,1) and (1,2)
+        // (neighbours read from the reference decode): the first is
+        // flat 102 in the reference, the second steps from 101 to 102 at
+        // x = 7 — the spec/01 prose formula (seven taps, no corner,
+        // H.264's scale) gives a gradient for the first and the
+        // fixture-pinned form gives both.
+        let top = [
+            102, 102, 102, 102, 101, 101, 101, 101, 102, 102, 102, 102, 102, 102, 102, 102,
+        ];
+        let left = [
+            101, 101, 101, 101, 101, 101, 101, 101, 102, 102, 102, 102, 101, 101, 101, 101,
+        ];
+        assert_eq!(predict_plane_16x16(top, left, 101), [102u8; 256]);
+        let top = [
+            102, 102, 102, 102, 101, 101, 101, 101, 101, 101, 101, 101, 102, 102, 102, 101,
+        ];
+        let left = [
+            101, 102, 101, 102, 101, 101, 101, 101, 101, 101, 101, 101, 102, 102, 102, 102,
+        ];
+        let out = predict_plane_16x16(top, left, 101);
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(out[y * 16 + x], if x < 7 { 101 } else { 102 }, "({x},{y})");
+            }
+        }
     }
 
     #[test]
@@ -1435,10 +1446,9 @@ mod tests {
         // Quadrant (qr=0,qc=0): top4 = 0, left4 = 320 →
         //   (0 + 320 + 4) >> 3 = 40.
         assert_eq!(out[0], 40);
-        // Quadrant (qr=0,qc=1): top4 = 160, left4 = 320 →
-        //   (160 + 320 + 4) >> 3 = 60.
-        assert_eq!(out[4], 60);
-        // Quadrant (qr=1,qc=0): top4 = 0, left4 = 0 → 0.
+        // Quadrant (qr=0,qc=1) prefers the top row: (160 + 2) >> 2 = 40.
+        assert_eq!(out[4], 40);
+        // Quadrant (qr=1,qc=0) prefers the left column: (0 + 2) >> 2 = 0.
         assert_eq!(out[4 * 8], 0);
         // Quadrant (qr=1,qc=1): top4 = 160, left4 = 0 →
         //   (160 + 0 + 4) >> 3 = 20.
@@ -1449,6 +1459,31 @@ mod tests {
                 assert_eq!(out[y * 8 + x], 40, "Q00 ({y},{x})");
             }
         }
+    }
+
+    #[test]
+    fn chroma_dc_off_diagonal_quadrants_fall_back_to_the_other_neighbour() {
+        let top = [0, 0, 0, 0, 40, 40, 40, 40];
+        let left = [80, 80, 80, 80, 20, 20, 20, 20];
+        // Only the left column: the top-right quadrant takes left[0..4].
+        let out = predict_chroma_dc_8x8(top, left, false, true);
+        assert_eq!(out[4], 80);
+        assert_eq!(out[0], 80);
+        assert_eq!(out[4 * 8], 20);
+        assert_eq!(out[4 * 8 + 4], 20);
+        // Only the top row: the bottom-left quadrant takes top[0..4].
+        let out = predict_chroma_dc_8x8(top, left, true, false);
+        assert_eq!(out[4 * 8], 0);
+        assert_eq!(out[0], 0);
+        assert_eq!(out[4], 40);
+        assert_eq!(out[4 * 8 + 4], 40);
+        // Fixture-pinned instance (240×128 sync frame, chroma macroblock
+        // (3,3)): flat top 70, left [70,74,81,84,72,69,70,70] → the
+        // top-right quadrant is 70 (top only), not the 74 of a
+        // symmetric average.
+        let out = predict_chroma_dc_8x8([70; 8], [70, 74, 81, 84, 72, 69, 70, 70], true, true);
+        assert_eq!(out[4], 70);
+        assert_eq!(out[0], ((280 + 309 + 4) >> 3) as u8);
     }
 
     #[test]

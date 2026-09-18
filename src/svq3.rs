@@ -369,6 +369,19 @@ pub fn parse_extradata(extradata: &[u8]) -> Result<Svq3SequenceHeader> {
     parse_sequence_header(payload)
 }
 
+/// Locate the `SEQH` block inside container-flavoured extradata (the
+/// QuickTime `SMI ` wrapper of spec/02 §4, or bare `SEQH` bytes) and
+/// parse it. Returns [`Error::InvalidFrameCode`] when no tag is found.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub fn parse_extradata_flexible(extradata: &[u8]) -> Result<Svq3SequenceHeader> {
+    let start = extradata
+        .windows(SVQ3_SEQH_MAGIC.len())
+        .position(|w| w == SVQ3_SEQH_MAGIC)
+        .ok_or(Error::InvalidFrameCode(0))?;
+    parse_extradata(&extradata[start..])
+}
+
 /// Undo the envelope's byte relocation (spec/07 §2): the payload is
 /// `packet[length+2 : length+1+L] ++ packet[1+L : length+2]`, i.e.
 /// the last `L − 1` bytes of the on-wire body move to the front.
