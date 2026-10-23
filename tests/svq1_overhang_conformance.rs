@@ -12,7 +12,7 @@
 //! the visible crop matches the reference decode byte-exact across
 //! an I + 2 P chain.
 
-use oxideav_svq::svq1_plane::{decode_frame, Svq1DecodedFrame};
+use oxideav_svq::svq1_plane::{Svq1DecodedFrame, decode_frame};
 
 const CHAIN: &[u8] = include_bytes!("fixtures/chain_160x120_3f.svq1");
 const CHAIN_REF: &[u8] = include_bytes!("fixtures/chain_160x120_3f.yuv410p");

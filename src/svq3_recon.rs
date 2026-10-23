@@ -61,10 +61,10 @@ use crate::svq3_dequant::{
     dequantize_transform_luma_block_with_dc,
 };
 use crate::svq3_pred::{
-    predict_chroma_dc_8x8, predict_dc_16x16, predict_horizontal_16x16, predict_intra_4x4,
-    predict_plane_16x16, predict_vertical_16x16, reconstruct_4x4, reconstruct_sample,
-    Intra4x4Neighbours, Svq3IntraMode, PRED_16X16_DIM, PRED_4X4_DIM, PRED_4X4_SAMPLES,
-    PRED_CHROMA_DIM, PRED_CHROMA_SAMPLES,
+    Intra4x4Neighbours, PRED_4X4_DIM, PRED_4X4_SAMPLES, PRED_16X16_DIM, PRED_CHROMA_DIM,
+    PRED_CHROMA_SAMPLES, Svq3IntraMode, predict_chroma_dc_8x8, predict_dc_16x16,
+    predict_horizontal_16x16, predict_intra_4x4, predict_plane_16x16, predict_vertical_16x16,
+    reconstruct_4x4, reconstruct_sample,
 };
 
 /// Side length of a luma macroblock in pixels.
@@ -1086,7 +1086,7 @@ mod tests {
     #[test]
     fn edge_subblock_availability_follows_out_of_mb_flags() {
         let mb = LumaMacroblock::new(); // both neighbours unavailable
-                                        // Top-left sub-block: neither neighbour available.
+        // Top-left sub-block: neither neighbour available.
         let nb = mb.neighbours_at(0, 0);
         assert!(!nb.top_available);
         assert!(!nb.left_available);

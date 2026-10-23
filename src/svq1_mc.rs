@@ -39,7 +39,7 @@
 
 use crate::svq1_blocktree::Svq1Level;
 use crate::svq1_motion_predictor::Svq1Mv;
-use crate::svq1_reconstruct::{reconstruct_leaf, LeafStage, ReconstructError};
+use crate::svq1_reconstruct::{LeafStage, ReconstructError, reconstruct_leaf};
 
 /// A borrowed read-only view of an SVQ1 reference picture plane (Y, U,
 /// or V component) for half-pel motion compensation.

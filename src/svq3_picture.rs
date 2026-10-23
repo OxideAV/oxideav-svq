@@ -39,8 +39,8 @@
 
 use crate::svq3::Svq3MacroblockPosition;
 use crate::svq3_recon::{
-    reconstruct_intra_macroblock, ChromaPlane, ChromaPlaneCoeffs, LumaMacroblock,
-    Svq3IntraMacroblock, Svq3LumaIntra, CHROMA_PLANE_DIM, MB_LUMA_DIM,
+    CHROMA_PLANE_DIM, ChromaPlane, ChromaPlaneCoeffs, LumaMacroblock, MB_LUMA_DIM,
+    Svq3IntraMacroblock, Svq3LumaIntra, reconstruct_intra_macroblock,
 };
 
 /// A full decoded SVQ3 picture: three row-major sample planes (luma + two

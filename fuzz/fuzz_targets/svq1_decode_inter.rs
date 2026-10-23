@@ -8,9 +8,9 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_svq::svq1_enc::{encode_intra_frame, Svq1EncoderMode, Svq1PlaneRef};
+use oxideav_svq::svq1_enc::{Svq1EncoderMode, Svq1PlaneRef, encode_intra_frame};
 use oxideav_svq::svq1_plane::{
-    chroma_dim, decode_frame, decode_frame_with_stats, Svq1DecodedFrame,
+    Svq1DecodedFrame, chroma_dim, decode_frame, decode_frame_with_stats,
 };
 use std::sync::OnceLock;
 

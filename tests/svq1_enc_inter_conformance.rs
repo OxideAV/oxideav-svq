@@ -23,9 +23,9 @@
 //! reference decode — a regression on either side of the wire breaks
 //! CI.
 
-use oxideav_svq::svq1_enc::{encode_intra_frame, Svq1EncoderMode, Svq1PlaneRef};
-use oxideav_svq::svq1_enc_inter::{encode_inter_frame, Svq1InterParams};
-use oxideav_svq::svq1_plane::{chroma_dim, decode_frame, decode_intra_frame, Svq1DecodedFrame};
+use oxideav_svq::svq1_enc::{Svq1EncoderMode, Svq1PlaneRef, encode_intra_frame};
+use oxideav_svq::svq1_enc_inter::{Svq1InterParams, encode_inter_frame};
+use oxideav_svq::svq1_plane::{Svq1DecodedFrame, chroma_dim, decode_frame, decode_intra_frame};
 
 const CHAIN: &[u8] = include_bytes!("fixtures/enc_4mv_176x144_4f.svq1");
 const REF_YUV: &[u8] = include_bytes!("fixtures/enc_4mv_176x144_4f.yuv410p");

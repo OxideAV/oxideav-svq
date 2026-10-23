@@ -33,10 +33,10 @@ use crate::error::{Error, Result};
 use crate::header::FRAME_SIZE_TABLE;
 use crate::svq1_blocktree::Svq1Level;
 use crate::svq1_codebook::{
-    codebook_half, vector_byte_to_raster, SVQ1_ENTRIES_PER_STAGE, SVQ1_VLC_INTRA_MEAN,
+    SVQ1_ENTRIES_PER_STAGE, SVQ1_VLC_INTRA_MEAN, codebook_half, vector_byte_to_raster,
 };
-use crate::svq1_plane::{chroma_dim, MB_DIM};
-use crate::svq1_vlc::{intra_stage_count_table, Svq1Half};
+use crate::svq1_plane::{MB_DIM, chroma_dim};
+use crate::svq1_vlc::{Svq1Half, intra_stage_count_table};
 
 /// MSB-first bit writer, the mirror of [`crate::BitReader`].
 #[derive(Debug, Default)]

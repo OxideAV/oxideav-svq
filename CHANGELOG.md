@@ -8,6 +8,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- edition 2024, MSRV 1.95
 - Package metadata: the description now names the SVQ3 decoder;
   `tests/` and `fuzz/` are excluded from the published package.
 

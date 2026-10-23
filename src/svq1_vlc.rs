@@ -506,7 +506,7 @@ mod tests {
             let shortest = intra
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, &(_, l))| l)
+                .min_by_key(|&(_, &(_, l))| l)
                 .unwrap()
                 .0;
             assert_eq!(shortest, 1, "intra {level:?} shortest-code position");
@@ -515,7 +515,7 @@ mod tests {
             let shortest = inter
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, &(_, l))| l)
+                .min_by_key(|&(_, &(_, l))| l)
                 .unwrap()
                 .0;
             assert_eq!(shortest, 0, "inter {level:?} shortest-code position");

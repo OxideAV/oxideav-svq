@@ -475,11 +475,12 @@ mod tests {
                 // Smallest escape code with this run: scan upward.
                 let mut first: Option<(u32, i32)> = None;
                 for code in escape..escape + 64 {
-                    if let Some((level, r)) = resolve_level_run(book, code) {
-                        if r == run && level > 0 {
-                            first = Some((code, level));
-                            break;
-                        }
+                    if let Some((level, r)) = resolve_level_run(book, code)
+                        && r == run
+                        && level > 0
+                    {
+                        first = Some((code, level));
+                        break;
                     }
                 }
                 let (code, level) = first.expect("escape range covers every run class");

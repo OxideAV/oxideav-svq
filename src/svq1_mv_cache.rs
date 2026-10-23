@@ -61,7 +61,7 @@
 //! unambiguous and shared by both T02 readings, so they are the safe
 //! increment on top of [`crate::svq1_motion_predictor::predict`].
 
-use crate::svq1_motion_predictor::{predict, Neighbours, Svq1Mv};
+use crate::svq1_motion_predictor::{Neighbours, Svq1Mv, predict};
 
 /// The per-plane MV cache of `docs/video/svq1/spec/06-motion-vectors.md`
 /// §6.8: a 2-D grid of 8×8-block motion vectors, sized
@@ -351,12 +351,12 @@ mod tests {
         // MB [1 2 / 3 4] top-left slot = (row=2, col=2).
         // §6.4.3: pl=N=(2,1), pt=C=(0,2), ptr=E=(0,4).
         let mut c = Svq1MvCache::new(3, 2); // 6×4 grid covers cols 0..6, rows 0..4
-                                            // Plant distinct MVs at N, C, E so we can confirm selection.
+        // Plant distinct MVs at N, C, E so we can confirm selection.
         c.set(2, 1, mv(11, 12)); // N
         c.set(0, 2, mv(21, 22)); // C
         c.set(0, 4, mv(31, 32)); // E
-                                 // Plant decoys at the INTER_4MV positions (I, K) to ensure
-                                 // INTER does NOT pick them.
+        // Plant decoys at the INTER_4MV positions (I, K) to ensure
+        // INTER does NOT pick them.
         c.set(1, 2, mv(91, 92)); // I (row-1) — must NOT be pt
         c.set(1, 4, mv(93, 94)); // K (row-1) — must NOT be ptr
         let n = c.inter_neighbours(2, 2);
@@ -393,7 +393,7 @@ mod tests {
         c.set(1, 3, mv(3, 3)); // J
         c.set(1, 4, mv(4, 4)); // K
         c.set(3, 1, mv(5, 5)); // T
-                               // Within-MB slots: 1=(2,2), 2=(2,3), 3=(3,2), 4=(3,3).
+        // Within-MB slots: 1=(2,2), 2=(2,3), 3=(3,2), 4=(3,3).
         c.set(2, 2, mv(101, 101)); // block 1
         c.set(2, 3, mv(102, 102)); // block 2
         c.set(3, 2, mv(103, 103)); // block 3
@@ -485,7 +485,7 @@ mod tests {
         c.set(2, 1, mv(0, 0)); // pl = N
         c.set(0, 2, mv(5, 17)); // pt = C
         c.set(0, 4, mv(-9, 12)); // ptr = E
-                                 // differential (0, 0) → final = predictor = (0, 12).
+        // differential (0, 0) → final = predictor = (0, 12).
         let result = c.decode_inter(2, 2, 0, 0);
         assert_eq!(result, mv(0, 12));
         // broadcast to all four slots of the MB.
@@ -515,12 +515,12 @@ mod tests {
         // lone available one so sub-block 1 = a known vector.
         // sub-block 1 neighbours: N=(2,1), I=(1,2), K=(1,4).
         c.set(2, 1, mv(10, 20)); // N present
-                                 // I and K left at (0,0) (in-bounds present) → predictor =
-                                 // MEDIAN over {N=(10,20), I=(0,0), K=(0,0)} = (0,0).
-                                 // To make sub-block 1 deterministic & non-trivial, also clear
-                                 // I/K influence by checking the actual median below.
-                                 // differentials: sub-block 1 gets (0,0); we just want its
-                                 // stored MV to flow into sub-block 2's pl=(2,2).
+        // I and K left at (0,0) (in-bounds present) → predictor =
+        // MEDIAN over {N=(10,20), I=(0,0), K=(0,0)} = (0,0).
+        // To make sub-block 1 deterministic & non-trivial, also clear
+        // I/K influence by checking the actual median below.
+        // differentials: sub-block 1 gets (0,0); we just want its
+        // stored MV to flow into sub-block 2's pl=(2,2).
         let out = c.decode_inter_4mv(2, 2, [(0, 0), (0, 0), (0, 0), (0, 0)]);
         // sub-block 1 predictor = median((10,20),(0,0),(0,0)) = (0,0).
         assert_eq!(out[0], mv(0, 0));

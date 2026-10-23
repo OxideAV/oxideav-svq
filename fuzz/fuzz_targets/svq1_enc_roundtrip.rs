@@ -16,8 +16,8 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_svq::svq1_enc::{encode_intra_frame, Svq1EncoderMode, Svq1PlaneRef};
-use oxideav_svq::svq1_enc_inter::{encode_inter_frame, Svq1InterParams};
+use oxideav_svq::svq1_enc::{Svq1EncoderMode, Svq1PlaneRef, encode_intra_frame};
+use oxideav_svq::svq1_enc_inter::{Svq1InterParams, encode_inter_frame};
 use oxideav_svq::svq1_plane::{chroma_dim, decode_frame};
 
 fn plane(width: usize, height: usize, payload: &[u8], salt: u32) -> Vec<u8> {

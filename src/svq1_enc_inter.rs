@@ -53,11 +53,11 @@ use crate::error::{Error, Result};
 use crate::svq1_codebook::SVQ1_VLC_MB_MODE;
 use crate::svq1_codebook::SVQ1_VLC_MV_COMPONENT;
 use crate::svq1_enc::{BitWriter, Svq1PlaneRef};
-use crate::svq1_enc_tree::{emit_macroblock, plan_macroblock, MbPlan};
-use crate::svq1_mc::{motion_compensate_block, Svq1ReferencePlane, MC_BLOCK_DIM};
-use crate::svq1_motion_predictor::{predict, Svq1Mv, MV_COMPONENT_MAX, MV_COMPONENT_MIN};
-use crate::svq1_mv_cache::{Svq1MvCache, SUBBLOCK_ORDER};
-use crate::svq1_plane::{chroma_dim, decode_frame, Svq1DecodedFrame, Svq1PlaneCanvas, MB_DIM};
+use crate::svq1_enc_tree::{MbPlan, emit_macroblock, plan_macroblock};
+use crate::svq1_mc::{MC_BLOCK_DIM, Svq1ReferencePlane, motion_compensate_block};
+use crate::svq1_motion_predictor::{MV_COMPONENT_MAX, MV_COMPONENT_MIN, Svq1Mv, predict};
+use crate::svq1_mv_cache::{SUBBLOCK_ORDER, Svq1MvCache};
+use crate::svq1_plane::{MB_DIM, Svq1DecodedFrame, Svq1PlaneCanvas, chroma_dim, decode_frame};
 use crate::svq1_vlc::Svq1Half;
 
 /// P-frame encoder tuning.
@@ -609,7 +609,7 @@ pub fn encode_inter_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::svq1_enc::{encode_intra_frame, Svq1EncoderMode};
+    use crate::svq1_enc::{Svq1EncoderMode, encode_intra_frame};
     use crate::svq1_plane::decode_intra_frame;
 
     const W: usize = 64;

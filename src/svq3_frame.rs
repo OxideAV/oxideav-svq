@@ -53,33 +53,32 @@
 use crate::bitreader::BitReader;
 use crate::error::{Error, Result};
 use crate::svq3::{
+    Svq3FrameType, Svq3MacroblockPosition, Svq3PacketKind, Svq3SequenceHeader, Svq3SliceHeader,
     classify_packet_byte, macroblock_position, mb_grid_dims, num_macroblocks, parse_wire_slice,
-    read_universal_code, Svq3FrameType, Svq3MacroblockPosition, Svq3PacketKind, Svq3SequenceHeader,
-    Svq3SliceHeader,
+    read_universal_code,
 };
-use crate::svq3_cbp::{read_cbp_inter, read_cbp_intra, CodedBlockPattern};
+use crate::svq3_cbp::{CodedBlockPattern, read_cbp_inter, read_cbp_intra};
 use crate::svq3_coeff::{
     decode_chroma_dc_2x2, decode_residual_4x4_alt, decode_residual_4x4_normal,
 };
 use crate::svq3_dequant::{
-    dequantize_transform_luma_block, luma_dc_secondary_transform, DEQUANT_COEFF_TABLE_LEN,
+    DEQUANT_COEFF_TABLE_LEN, dequantize_transform_luma_block, luma_dc_secondary_transform,
 };
 use crate::svq3_mb::{
-    classify_mb_type, decode_intra_4x4_modes_with_context, read_inter_mv_precision_p_frame,
-    Intra16x16Params, IntraMbKind, PFrameInterMode, Svq3MbType, Svq3MvPrecision,
-    INTRA_4X4_BLOCK_RASTER, INTRA_4X4_CONTEXT_OTHER,
+    INTRA_4X4_BLOCK_RASTER, INTRA_4X4_CONTEXT_OTHER, Intra16x16Params, IntraMbKind,
+    PFrameInterMode, Svq3MbType, Svq3MvPrecision, classify_mb_type,
+    decode_intra_4x4_modes_with_context, read_inter_mv_precision_p_frame,
 };
 use crate::svq3_mc::{motion_compensate_block, motion_compensate_chroma_block};
 use crate::svq3_mv::{read_mv_difference, read_quantiser_delta};
 use crate::svq3_picture::{ChromaSelect, Svq3Picture};
 use crate::svq3_pred::{
-    predict_chroma_dc_8x8, predict_intra_4x4, reconstruct_4x4, Svq3IntraMode, PRED_4X4_DIM,
-    PRED_CHROMA_SAMPLES,
+    PRED_4X4_DIM, PRED_CHROMA_SAMPLES, Svq3IntraMode, predict_chroma_dc_8x8, predict_intra_4x4,
+    reconstruct_4x4,
 };
 use crate::svq3_recon::{
-    add_luma_residual_blocks, reconstruct_chroma_plane_with_prediction,
-    reconstruct_intra_16x16_luma_macroblock_with_dc, ChromaPlane, LumaMacroblock,
-    Svq3Luma16x16Mode,
+    ChromaPlane, LumaMacroblock, Svq3Luma16x16Mode, add_luma_residual_blocks,
+    reconstruct_chroma_plane_with_prediction, reconstruct_intra_16x16_luma_macroblock_with_dc,
 };
 use crate::svq3_scan::{ALT_SCAN_4X4_SCAN, ALT_SCAN_QUANTISER_THRESHOLD, NORMAL_ZIGZAG_4X4_SCAN};
 
@@ -193,7 +192,7 @@ fn slice_ends(br: &BitReader<'_>, payload: &[u8]) -> bool {
     if pos + 7 < limit {
         return false;
     }
-    if pos % 8 == 0 {
+    if pos.is_multiple_of(8) {
         return true;
     }
     let byte = payload.get(pos / 8).copied().unwrap_or(0);
@@ -227,11 +226,7 @@ const fn convert_predictor(p: i32, precision: Svq3MvPrecision) -> i32 {
 }
 
 const fn round_to_sixths(v: i32) -> i32 {
-    if v >= 0 {
-        (v + 3) / 6
-    } else {
-        (v - 2) / 6
-    }
+    if v >= 0 { (v + 3) / 6 } else { (v - 2) / 6 }
 }
 
 /// The stored-vector multiplier of a coded unit: ×6 full, ×3 half,
@@ -881,7 +876,7 @@ pub fn decode_intra_access_unit(seqh: &Svq3SequenceHeader, au: &[u8]) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::svq3::{parse_extradata, SVQ3_FRAME_END};
+    use crate::svq3::{SVQ3_FRAME_END, parse_extradata};
     use crate::svq3_testutil::Packer;
 
     /// A 32×32 (2×2 macroblock) SEQH via the explicit-dimension escape.
@@ -1555,8 +1550,8 @@ mod tests {
             p.ue(0);
         }
         p.ue(29); // pattern 1
-                  // tables/05 alternate book: code 11 = (+1, run 4)? Resolve via
-                  // the book at runtime instead of hard-coding.
+        // tables/05 alternate book: code 11 = (+1, run 4)? Resolve via
+        // the book at runtime instead of hard-coding.
         let code_plus1_run4 = (1u32..31)
             .find(|&c| {
                 crate::svq3_coeff::resolve_level_run(

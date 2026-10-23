@@ -32,15 +32,15 @@
 
 use crate::bitreader::BitReader;
 use crate::error::{Error, Result};
-use crate::header::{parse_frame_header, Svq1FrameHeader, Svq1PictureType};
-use crate::svq1_blocktree::{read_block_decision, subdivide, Svq1BlockDecision, Svq1Level};
+use crate::header::{Svq1FrameHeader, Svq1PictureType, parse_frame_header};
+use crate::svq1_blocktree::{Svq1BlockDecision, Svq1Level, read_block_decision, subdivide};
 use crate::svq1_codebook::codebook_half;
-use crate::svq1_mc::{motion_compensate_block, Svq1ReferencePlane, MC_BLOCK_DIM};
+use crate::svq1_mc::{MC_BLOCK_DIM, Svq1ReferencePlane, motion_compensate_block};
 use crate::svq1_motion_predictor::Svq1Mv;
 use crate::svq1_mv_cache::Svq1MvCache;
-use crate::svq1_reconstruct::{reconstruct_leaf, LeafStage};
+use crate::svq1_reconstruct::{LeafStage, reconstruct_leaf};
 use crate::svq1_stage_indices::read_stage_indices;
-use crate::svq1_vlc::{read_intra_mean, read_stage_count, Svq1Half};
+use crate::svq1_vlc::{Svq1Half, read_intra_mean, read_stage_count};
 
 /// Macroblock (level-5 block) edge length in samples, per
 /// `docs/video/svq1/spec/02-bitstream-organisation.md` §2.3.
@@ -897,7 +897,7 @@ mod tests {
         w.push_bits(1, 1); // L=4 bottom subdivide
         for _ in 0..4 {
             w.push_bits(1, 0); // L=3 leaf
-                               // stage count 0 (mean-only) = alphabet position 1
+            // stage count 0 (mean-only) = alphabet position 1
             w.push_code(&intra_stage_count_table(Svq1Level::L3).0, 1);
             w.push_code(&SVQ1_VLC_INTRA_MEAN.0, usize::from(mean));
         }
@@ -956,10 +956,10 @@ mod tests {
         w.push_bits(1, 1); // L=5 subdivide
         w.push_bits(1, 1); // L=4 top
         w.push_bits(1, 1); // L=4 bottom
-                           // Top-left L=3: subdivide all the way to a pair of L=0
-                           // leaves on the first L=1 block.
+        // Top-left L=3: subdivide all the way to a pair of L=0
+        // leaves on the first L=1 block.
         w.push_bits(1, 1); // L=3 tl subdivide → two L=2
-                           // Remaining three L=3 leaves: mean-only 0.
+        // Remaining three L=3 leaves: mean-only 0.
         for _ in 0..3 {
             w.push_bits(1, 0);
             w.push_code(&intra_stage_count_table(Svq1Level::L3).0, 1);

@@ -10,7 +10,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_svq::svq3::{num_macroblocks, parse_extradata, Svq3SequenceHeader};
+use oxideav_svq::svq3::{Svq3SequenceHeader, num_macroblocks, parse_extradata};
 use oxideav_svq::svq3_frame::decode_intra_access_unit;
 
 /// Build a structurally valid explicit-dimension SEQH from two fuzz

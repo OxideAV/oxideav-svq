@@ -32,8 +32,8 @@
 //! agreement with the independent census" a CI-conformance fact.
 
 use oxideav_svq::svq1_plane::{
-    chroma_dim, decode_frame_with_stats, decode_intra_frame, Svq1DecodedFrame, Svq1FrameModeStats,
-    Svq1PlaneModeStats,
+    Svq1DecodedFrame, Svq1FrameModeStats, Svq1PlaneModeStats, chroma_dim, decode_frame_with_stats,
+    decode_intra_frame,
 };
 
 const CHAIN: &[u8] = include_bytes!("fixtures/enc_4mv_176x144_4f.svq1");

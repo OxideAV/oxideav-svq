@@ -190,15 +190,15 @@ mod registry;
 pub use crate::bitreader::BitReader;
 pub use crate::error::{Error, Result};
 pub use crate::header::{
-    parse_frame_header, ChecksumTrailer, EmbeddedString, Svq1FrameHeader, Svq1PictureType,
-    FRAME_SIZE_TABLE,
+    ChecksumTrailer, EmbeddedString, FRAME_SIZE_TABLE, Svq1FrameHeader, Svq1PictureType,
+    parse_frame_header,
 };
 pub use crate::svq3_frame::{Svq3DecodeOptions, Svq3DecodedPicture, Svq3PictureDecoder};
 
 #[cfg(feature = "registry")]
 pub use crate::registry::{
-    __oxideav_entry, make_decoder, make_encoder, make_svq3_decoder, probe_svq1, probe_svq3,
-    register, register_codecs, Svq1DecoderHandle, Svq1EncoderHandle, Svq3DecoderHandle,
+    __oxideav_entry, Svq1DecoderHandle, Svq1EncoderHandle, Svq3DecoderHandle, make_decoder,
+    make_encoder, make_svq3_decoder, probe_svq1, probe_svq3, register, register_codecs,
 };
 
 /// Stable codec id used in the framework registry for SVQ1.

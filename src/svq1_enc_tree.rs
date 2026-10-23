@@ -31,11 +31,11 @@
 //! payload inline right after its decision bit — exactly where
 //! [`crate::svq1_plane::decode_mb_block_tree`] consumes them.
 
-use crate::svq1_blocktree::{subdivide, Svq1Level};
+use crate::svq1_blocktree::{Svq1Level, subdivide};
 use crate::svq1_codebook::{SVQ1_VLC_INTER_MEAN, SVQ1_VLC_INTRA_MEAN};
 use crate::svq1_enc::BitWriter;
-use crate::svq1_enc_leaf::{search_leaf, LeafChoice, LeafCode};
-use crate::svq1_vlc::{inter_stage_count_table, intra_stage_count_table, Svq1Half};
+use crate::svq1_enc_leaf::{LeafChoice, LeafCode, search_leaf};
+use crate::svq1_vlc::{Svq1Half, inter_stage_count_table, intra_stage_count_table};
 
 /// One decided block-tree node.
 #[derive(Debug, Clone)]
@@ -269,7 +269,7 @@ pub fn plan_reconstruction(plan: &MbPlan) -> [u8; 256] {
 mod tests {
     use super::*;
     use crate::bitreader::BitReader;
-    use crate::svq1_plane::{decode_mb_block_tree, Svq1PlaneCanvas};
+    use crate::svq1_plane::{Svq1PlaneCanvas, decode_mb_block_tree};
 
     fn pseudo_mb(seed: u32) -> [u8; 256] {
         let mut out = [0u8; 256];

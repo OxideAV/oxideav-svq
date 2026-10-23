@@ -10,7 +10,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{CodecId, CodecParameters, Decoder, Packet, TimeBase};
-use oxideav_svq::{make_decoder, make_svq3_decoder, CODEC_ID_STR, SVQ3_CODEC_ID_STR};
+use oxideav_svq::{CODEC_ID_STR, SVQ3_CODEC_ID_STR, make_decoder, make_svq3_decoder};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 3 {

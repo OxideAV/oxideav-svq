@@ -12,7 +12,7 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_svq::svq3_filter::filter_plane;
 use oxideav_svq::svq3_mc::{
-    motion_compensate_block, motion_compensate_chroma_block, ReferencePlane,
+    ReferencePlane, motion_compensate_block, motion_compensate_chroma_block,
 };
 
 fuzz_target!(|data: &[u8]| {

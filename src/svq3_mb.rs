@@ -35,7 +35,7 @@
 
 use crate::bitreader::BitReader;
 use crate::error::{Error, Result};
-use crate::svq3::{read_universal_code, Svq3FrameType};
+use crate::svq3::{Svq3FrameType, read_universal_code};
 use crate::svq3_tables::{
     SVQ3_INTRA4X4_PRED_MODE_CONTEXT, SVQ3_INTRA4X4_PRED_MODE_ILLEGAL, SVQ3_INTRA4X4_PRED_MODE_PAIRS,
 };
@@ -541,7 +541,7 @@ pub fn read_inter_mv_precision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::svq3_testutil::{pack, uvlc as ue, Packer};
+    use crate::svq3_testutil::{Packer, pack, uvlc as ue};
 
     #[test]
     fn i_slice_type_numbering() {
@@ -574,9 +574,11 @@ mod tests {
 
     #[test]
     fn p_slice_type_numbering() {
-        assert!(classify_mb_type(Svq3FrameType::Predicted, 0)
-            .unwrap()
-            .is_skip());
+        assert!(
+            classify_mb_type(Svq3FrameType::Predicted, 0)
+                .unwrap()
+                .is_skip()
+        );
         assert_eq!(
             classify_mb_type(Svq3FrameType::Predicted, 7).unwrap(),
             Svq3MbType::PInter(PFrameInterMode::Inter4x4)

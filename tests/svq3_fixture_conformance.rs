@@ -19,7 +19,7 @@
 
 use std::path::PathBuf;
 
-use oxideav_svq::svq3::{parse_extradata_flexible, Svq3FrameType, Svq3SequenceHeader};
+use oxideav_svq::svq3::{Svq3FrameType, Svq3SequenceHeader, parse_extradata_flexible};
 use oxideav_svq::svq3_frame::{Svq3DecodeOptions, Svq3PictureDecoder};
 use oxideav_svq::svq3_picture::Svq3Picture;
 

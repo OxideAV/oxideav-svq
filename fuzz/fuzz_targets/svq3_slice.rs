@@ -7,7 +7,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_svq::svq3::{
-    parse_slice_header, parse_wire_slice, unpermute_slice_payload, SliceVersion,
+    SliceVersion, parse_slice_header, parse_wire_slice, unpermute_slice_payload,
 };
 
 fuzz_target!(|data: &[u8]| {

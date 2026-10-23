@@ -28,8 +28,8 @@ use oxideav_core::{
     Encoder, Error, Frame, Packet, ProbeContext, Result, RuntimeContext,
 };
 
-use crate::header::{parse_frame_header, Svq1FrameHeader};
-use crate::svq3::{parse_wire_slice, Svq3SequenceHeader, Svq3SliceHeader};
+use crate::header::{Svq1FrameHeader, parse_frame_header};
+use crate::svq3::{Svq3SequenceHeader, Svq3SliceHeader, parse_wire_slice};
 use crate::svq3_frame::{Svq3DecodeOptions, Svq3PictureDecoder};
 use crate::{CODEC_ID_STR, SVQ3_CODEC_ID_STR};
 
@@ -70,12 +70,11 @@ impl From<crate::Error> for Error {
                     .into(),
             ),
             crate::Error::UnexpectedIntraSkip => Error::InvalidData(
-                "oxideav-svq: SVQ1 stage-count VLC decoded to SKIP on an intra-coded leaf"
-                    .into(),
+                "oxideav-svq: SVQ1 stage-count VLC decoded to SKIP on an intra-coded leaf".into(),
             ),
-            crate::Error::ReconstructFailed => Error::InvalidData(
-                "oxideav-svq: SVQ1 leaf-block reconstruction failed".into(),
-            ),
+            crate::Error::ReconstructFailed => {
+                Error::InvalidData("oxideav-svq: SVQ1 leaf-block reconstruction failed".into())
+            }
             crate::Error::MissingReference => Error::InvalidData(
                 "oxideav-svq: SVQ1 P/B frame requires the previous I- or P-frame as reference"
                     .into(),
@@ -511,14 +510,16 @@ impl Encoder for Svq1EncoderHandle {
             height: ch,
         };
 
-        let intra_due =
-            self.reference.is_none() || self.frame_index % self.keyframe_interval.max(1) == 0;
+        let intra_due = self.reference.is_none()
+            || self
+                .frame_index
+                .is_multiple_of(self.keyframe_interval.max(1));
         // Droppable (B) cadence: inter frames whose index is not a
         // multiple of the period are emitted as picture type 2 and
         // never become the reference (see `set_droppable_period`).
         let droppable = !intra_due
             && self.droppable_period > 0
-            && self.frame_index % self.droppable_period != 0;
+            && !self.frame_index.is_multiple_of(self.droppable_period);
         let temporal_reference = (self.frame_index & 0xff) as u8;
         let encode_once = |lambda: u64| -> Result<(Vec<u8>, crate::svq1_plane::Svq1DecodedFrame)> {
             if intra_due {
@@ -823,15 +824,16 @@ impl Decoder for Svq3DecoderHandle {
                 "oxideav-svq: SVQ3 decode requires the SEQH sequence header in extradata".into(),
             ));
         };
-        let decoded =
-            match decoder.decode_access_unit(&packet.data) {
-                Ok(d) => d,
-                Err(crate::Error::NotImplemented) => return Err(Error::unsupported(
+        let decoded = match decoder.decode_access_unit(&packet.data) {
+            Ok(d) => d,
+            Err(crate::Error::NotImplemented) => {
+                return Err(Error::unsupported(
                     "oxideav-svq: SVQ3 B slices and the extended macroblock-layer mode are not \
                      specified by the staged docs — see crates/oxideav-svq/README.md",
-                )),
-                Err(e) => return Err(e.into()),
-            };
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        };
         let seqh = decoder.sequence_header();
         let video = decoded.picture.to_video_frame_cropped(
             usize::from(seqh.width),
@@ -1628,10 +1630,12 @@ mod tests {
         assert_eq!(video.planes[2].data.len(), 16 * 16);
         // All-empty intra-4×4 macroblocks: the DC prediction chain
         // stays at the 128 fallback on every plane.
-        assert!(video
-            .planes
-            .iter()
-            .all(|p| p.data.iter().all(|&s| s == 128)));
+        assert!(
+            video
+                .planes
+                .iter()
+                .all(|p| p.data.iter().all(|&s| s == 128))
+        );
     }
 
     #[test]

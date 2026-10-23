@@ -37,7 +37,7 @@
 //! a future change which keeps the unit tests green but breaks the
 //! end-to-end contract surfaces here.
 
-use oxideav_svq::svq1_blocktree::{read_block_decision, Svq1Level};
+use oxideav_svq::svq1_blocktree::{Svq1Level, read_block_decision};
 use oxideav_svq::svq1_codebook::{SVQ1_L4_ABSENCE, SVQ1_L5_ABSENCE, SVQ1_VLC_INTRA_MEAN};
 use oxideav_svq::svq1_plane::decode_intra_plane;
 use oxideav_svq::svq1_vlc::intra_stage_count_table;

@@ -42,7 +42,7 @@
 //!   stream and are excluded empirically.
 
 use oxideav_svq::svq1_plane::{
-    decode_frame_with_stats, decode_intra_frame, Svq1DecodedFrame, Svq1FrameModeStats,
+    Svq1DecodedFrame, Svq1FrameModeStats, decode_frame_with_stats, decode_intra_frame,
 };
 
 const FRAMES: &[u8] = include_bytes!("fixtures/inter4mv_176x144_25f.svq1");

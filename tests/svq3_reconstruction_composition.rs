@@ -25,10 +25,10 @@ use oxideav_svq::svq3_coeff::Coefficient;
 use oxideav_svq::svq3_dequant::dequantize_transform_luma_block;
 use oxideav_svq::svq3_pred::Svq3IntraMode;
 use oxideav_svq::svq3_recon::{
-    reconstruct_intra_luma_macroblock_from_coeffs, LumaMacroblock, MB_LUMA_BLOCKS,
+    LumaMacroblock, MB_LUMA_BLOCKS, reconstruct_intra_luma_macroblock_from_coeffs,
 };
 use oxideav_svq::svq3_scan::{
-    place_4x4, ALT_SCAN_4X4_SCAN, ALT_SCAN_QUANTISER_THRESHOLD, NORMAL_ZIGZAG_4X4_SCAN,
+    ALT_SCAN_4X4_SCAN, ALT_SCAN_QUANTISER_THRESHOLD, NORMAL_ZIGZAG_4X4_SCAN, place_4x4,
 };
 
 /// Build a `[i32; 16]` coefficient grid for every luma sub-block by

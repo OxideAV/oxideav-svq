@@ -18,7 +18,7 @@
 //! reference decode — so a regression on EITHER side of the wire
 //! breaks CI.
 
-use oxideav_svq::svq1_enc::{encode_intra_frame, Svq1EncoderMode, Svq1PlaneRef};
+use oxideav_svq::svq1_enc::{Svq1EncoderMode, Svq1PlaneRef, encode_intra_frame};
 use oxideav_svq::svq1_plane::{chroma_dim, decode_intra_frame};
 
 const ENCODED: &[u8] = include_bytes!("fixtures/encoded_176x144_stage.svq1");

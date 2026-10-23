@@ -705,7 +705,7 @@ pub fn parse_wire_slice(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::svq3_testutil::{pack, uvlc, Packer};
+    use crate::svq3_testutil::{Packer, pack, uvlc};
 
     #[test]
     fn ceil_log2_known_values() {

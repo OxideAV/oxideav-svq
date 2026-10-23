@@ -44,11 +44,11 @@
 
 use crate::svq1_blocktree::Svq1Level;
 use crate::svq1_codebook::{
-    codebook_half, vector_byte_to_raster, SVQ1_ENTRIES_PER_STAGE, SVQ1_VLC_INTER_MEAN,
-    SVQ1_VLC_INTRA_MEAN,
+    SVQ1_ENTRIES_PER_STAGE, SVQ1_VLC_INTER_MEAN, SVQ1_VLC_INTRA_MEAN, codebook_half,
+    vector_byte_to_raster,
 };
-use crate::svq1_mean::{saturate_u8, INTER_MEAN_MAX, INTER_MEAN_MIN};
-use crate::svq1_vlc::{inter_stage_count_table, intra_stage_count_table, Svq1Half};
+use crate::svq1_mean::{INTER_MEAN_MAX, INTER_MEAN_MIN, saturate_u8};
+use crate::svq1_vlc::{Svq1Half, inter_stage_count_table, intra_stage_count_table};
 
 /// The coded content of one leaf, as chosen by [`search_leaf`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,32 +200,32 @@ pub fn search_leaf(
     let mut stages: Vec<u8> = Vec::new();
 
     // Greedy ascending-stage descent (spec/04 §4.2 ordering).
-    if max_stages > 0 {
-        if let Some(page) = raster_page(level, half) {
-            let mut scratch = vec![0i32; v_l];
-            for stage_idx in 0..max_stages {
-                let mut best: Option<(u8, u64)> = None;
-                for vec_idx in 0..SVQ1_ENTRIES_PER_STAGE {
-                    let vector = &page[stage_idx * SVQ1_ENTRIES_PER_STAGE + vec_idx];
-                    for (pos, s) in scratch.iter_mut().enumerate() {
-                        *s = acc[pos] + i32::from(vector[pos]);
-                    }
-                    let candidate = acc_sse(target, &scratch);
-                    if best.map_or(true, |(_, b)| candidate < b) {
-                        best = Some((vec_idx as u8, candidate));
-                    }
+    if max_stages > 0
+        && let Some(page) = raster_page(level, half)
+    {
+        let mut scratch = vec![0i32; v_l];
+        for stage_idx in 0..max_stages {
+            let mut best: Option<(u8, u64)> = None;
+            for vec_idx in 0..SVQ1_ENTRIES_PER_STAGE {
+                let vector = &page[stage_idx * SVQ1_ENTRIES_PER_STAGE + vec_idx];
+                for (pos, s) in scratch.iter_mut().enumerate() {
+                    *s = acc[pos] + i32::from(vector[pos]);
                 }
-                let (vec_idx, best_sse) = best.expect("sixteen vectors per stage");
-                if best_sse >= sse {
-                    break; // no strict improvement — stop the descent
+                let candidate = acc_sse(target, &scratch);
+                if best.is_none_or(|(_, b)| candidate < b) {
+                    best = Some((vec_idx as u8, candidate));
                 }
-                let vector = &page[stage_idx * SVQ1_ENTRIES_PER_STAGE + usize::from(vec_idx)];
-                for (pos, a) in acc.iter_mut().enumerate() {
-                    *a += i32::from(vector[pos]);
-                }
-                sse = best_sse;
-                stages.push(vec_idx);
             }
+            let (vec_idx, best_sse) = best.expect("sixteen vectors per stage");
+            if best_sse >= sse {
+                break; // no strict improvement — stop the descent
+            }
+            let vector = &page[stage_idx * SVQ1_ENTRIES_PER_STAGE + usize::from(vec_idx)];
+            for (pos, a) in acc.iter_mut().enumerate() {
+                *a += i32::from(vector[pos]);
+            }
+            sse = best_sse;
+            stages.push(vec_idx);
         }
     }
 
@@ -266,7 +266,7 @@ pub fn search_leaf(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::svq1_reconstruct::{reconstruct_leaf, LeafStage};
+    use crate::svq1_reconstruct::{LeafStage, reconstruct_leaf};
 
     fn decode_choice(
         level: Svq1Level,

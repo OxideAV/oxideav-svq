@@ -1198,12 +1198,16 @@ mod tests {
     fn interpolate_v_and_2d_on_uniform_plane_are_identity() {
         let buf = vec![77u8; 8 * 8];
         let plane = ReferencePlane::new(&buf, 8, 8).unwrap();
-        assert!(interpolate_block_thirdpel_v(&plane, 1, 1, 4, 4)
-            .iter()
-            .all(|&s| s == 77));
-        assert!(interpolate_block_thirdpel_2d(&plane, 1, 1, 4, 4)
-            .iter()
-            .all(|&s| s == 77));
+        assert!(
+            interpolate_block_thirdpel_v(&plane, 1, 1, 4, 4)
+                .iter()
+                .all(|&s| s == 77)
+        );
+        assert!(
+            interpolate_block_thirdpel_2d(&plane, 1, 1, 4, 4)
+                .iter()
+                .all(|&s| s == 77)
+        );
     }
 
     #[test]

@@ -42,8 +42,8 @@
 
 use crate::bitreader::BitReader;
 use crate::error::Result;
-use crate::svq3::{read_universal_code, Svq3FrameType};
-use crate::svq3_mb::{read_inter_mv_precision, Svq3MbType, Svq3MvPrecision};
+use crate::svq3::{Svq3FrameType, read_universal_code};
+use crate::svq3_mb::{Svq3MbType, Svq3MvPrecision, read_inter_mv_precision};
 
 /// Read one signed universal-code codeword.
 ///
@@ -345,9 +345,11 @@ mod tests {
         let diffs =
             read_mb_mv_differences(&mut br, Svq3MbType::PInter(PFrameInterMode::Inter8x8)).unwrap();
         assert_eq!(diffs.len(), 4);
-        assert!(diffs
-            .iter()
-            .all(|d| *d == MotionVectorDifference::default()));
+        assert!(
+            diffs
+                .iter()
+                .all(|d| *d == MotionVectorDifference::default())
+        );
     }
 
     #[test]
