@@ -111,6 +111,7 @@ impl Svq1PictureType {
 /// Optional checksum-trailer field group. Present iff
 /// `checksum_present` is set in the header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChecksumTrailer {
     /// Per-chunk packet checksum flag.
     pub use_packet_checksum: bool,
@@ -128,6 +129,7 @@ pub struct ChecksumTrailer {
 /// embedded run, before XOR is applied — per the wiki spec the
 /// length byte is itself unobfuscated).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EmbeddedString {
     /// Declared length in bytes (the value of `string[0]`, the
     /// unobfuscated length byte). Maximum 255 since the length is a
@@ -146,6 +148,7 @@ pub struct EmbeddedString {
 /// `unknown_flag_1` trailer are captured raw so a future round can
 /// pin their semantics without re-walking the bitstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Svq1FrameHeader {
     /// Raw 22-bit frame-code field at the start of the chunk.
     pub frame_code: u32,

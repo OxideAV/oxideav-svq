@@ -187,6 +187,8 @@ mod svq3_testutil;
 #[cfg(feature = "registry")]
 mod registry;
 
+// internal — the bit reader is exposed for tests/fuzz only
+#[doc(hidden)]
 pub use crate::bitreader::BitReader;
 pub use crate::error::{Error, Result};
 pub use crate::header::{

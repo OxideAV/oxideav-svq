@@ -57,9 +57,7 @@ fuzz_target!(|data: &[u8]| {
     let mbs = num_macroblocks(&seqh) as usize;
     let mut dec = Svq3PictureDecoder::new(seqh)
         .expect("non-empty grid")
-        .with_options(Svq3DecodeOptions {
-            intra_edge_filter: data[2] & 1 != 0,
-        });
+        .with_options(Svq3DecodeOptions::default().with_intra_edge_filter(data[2] & 1 != 0));
     // Cut the rest into access units: each is prefixed by one length
     // byte (0 = the remainder).
     let mut rest = &data[3..];

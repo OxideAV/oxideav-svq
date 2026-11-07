@@ -312,9 +312,7 @@ fn every_access_unit_decodes_byte_exact_against_the_unfiltered_reference() {
         let f = load_fixture(name).expect("fixture files present");
         let decoded = decode_all(
             &f,
-            Svq3DecodeOptions {
-                intra_edge_filter: false,
-            },
+            Svq3DecodeOptions::default().with_intra_edge_filter(false),
         );
         assert!(
             scorecard(&f, &decoded, |_| true),
@@ -333,9 +331,7 @@ fn sync_access_units_decode_byte_exact_against_the_unfiltered_reference() {
         let f = load_fixture(name).expect("fixture files present");
         let decoded = decode_all(
             &f,
-            Svq3DecodeOptions {
-                intra_edge_filter: false,
-            },
+            Svq3DecodeOptions::default().with_intra_edge_filter(false),
         );
         assert!(
             scorecard(&f, &decoded, |sync| sync),

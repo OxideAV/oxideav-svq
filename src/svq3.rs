@@ -58,6 +58,7 @@ pub const SVQ3_FRAME_SIZE_TABLE: [(u16, u16); 7] = [
 
 /// The parsed `SEQH` stream header (spec/02).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Svq3SequenceHeader {
     /// `u(3) frame_size_code`; 7 = explicit dimensions follow.
     pub frame_size_code: u8,
@@ -136,6 +137,7 @@ impl Svq3FrameType {
 /// decoder's sequence when the header's `mode` bit is 1. Their meaning
 /// is not established; the names are the chapter's placeholders.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Svq3ExtendedModeFields {
     /// `u(2) a`; a value of 3 is a stream error.
     pub a: u8,
@@ -165,6 +167,7 @@ pub struct Svq3ExtendedModeFields {
 
 /// A parsed slice header (spec/07 §3).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Svq3SliceHeader {
     /// Packet type (1 or 2).
     pub version: SliceVersion,

@@ -84,6 +84,7 @@ use crate::svq3_scan::{ALT_SCAN_4X4_SCAN, ALT_SCAN_QUANTISER_THRESHOLD, NORMAL_Z
 
 /// Decoder-side options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Svq3DecodeOptions {
     /// Run the spec/09 edge filter over every I picture (the vendor
     /// decoder's behaviour; the filtered picture is displayed and is
@@ -91,6 +92,15 @@ pub struct Svq3DecodeOptions {
     /// unfiltered reconstruction, which is what the fixtures'
     /// black-box `expected.yuv` holds.
     pub intra_edge_filter: bool,
+}
+
+impl Svq3DecodeOptions {
+    /// Builder: set [`intra_edge_filter`](Self::intra_edge_filter).
+    #[must_use]
+    pub fn with_intra_edge_filter(mut self, v: bool) -> Self {
+        self.intra_edge_filter = v;
+        self
+    }
 }
 
 impl Default for Svq3DecodeOptions {
@@ -103,6 +113,7 @@ impl Default for Svq3DecodeOptions {
 
 /// One decoded access unit.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Svq3DecodedPicture {
     /// The reconstructed picture (macroblock-aligned canvas).
     pub picture: Svq3Picture,

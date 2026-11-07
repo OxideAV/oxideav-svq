@@ -10,6 +10,7 @@
 
 /// Errors produced by the SVQ1 frame-header parser.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// The 22-bit `frame code` at the start of the chunk has both bit
     /// 6 and bit 5 clear (i.e. `frame_code & 0x60 == 0`). Per

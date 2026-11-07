@@ -8,6 +8,14 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- API hygiene: `Error` and the records `ChecksumTrailer`,
+  `EmbeddedString`, `Svq1FrameHeader`, `svq3::{Svq3SequenceHeader,
+  Svq3ExtendedModeFields, Svq3SliceHeader}`, `Svq3DecodeOptions` and
+  `Svq3DecodedPicture` are now `#[non_exhaustive]`; build
+  `Svq3DecodeOptions` with `Default` + `with_intra_edge_filter`. The
+  `BitReader` re-export is now `#[doc(hidden)]` (internal, kept for
+  tests / fuzz). The spec-fixed code enums `Svq1PictureType`,
+  `SliceVersion` and `Svq3FrameType` stay exhaustive.
 - edition 2024, MSRV 1.95
 - Package metadata: the description now names the SVQ3 decoder;
   `tests/` and `fuzz/` are excluded from the published package.
@@ -91,6 +99,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `Svq3DecodeOptions::with_intra_edge_filter`.
 - fuzz: `svq3_access_units` (I + P access-unit chains through
   `Svq3PictureDecoder`, filter on and off, every partition shape and
   sub-pel phase) and `svq3_filter_mc` (the edge filter and motion
